@@ -44,29 +44,23 @@ from aqt import (
 )
 from PyQt6.QtCore import Qt
 
-from ..app_state import AppState, app_state, is_capacity_remaining
 from ..config import config
-from ..constants import GLOBAL_DECK_ID, UNPAID_PROVIDER_ERROR
+from ..constants import GLOBAL_DECK_ID
 from ..decks import deck_id_to_name_map, deck_name_to_id_map
 from ..logger import logger
 from ..models import (
     PromptMap,
     SmartFieldType,
-    legacy_openai_chat_models,
-    openai_reasoning_efforts_for_model,
 )
 from ..note_proccessor import NoteProcessor
 from ..prompts import get_all_prompts, get_extras, get_prompts_for_note, remove_prompt
 from ..utils import get_fields, get_version
-from .account_options import AccountOptions
 from .chat_options import ChatOptions
 from .image_options import ImageOptions
 from .prompt_dialog import PromptDialog
 from .reactive_check_box import ReactiveCheckBox
-from .reactive_combo_box import ReactiveComboBox
 from .reactive_line_edit import ReactiveLineEdit
 from .state_manager import StateManager
-from .subscription_box import SubscriptionBox
 from .tts_options import TTSOptions
 from .ui_utils import default_form_layout, font_large, font_small, show_message_box
 
@@ -83,16 +77,16 @@ class State(TypedDict):
     allow_empty_fields: bool
     debug: bool
 
-    # Legacy OpenAI
+    # API Keys
     openai_api_key: Optional[str]
-    legacy_openai_model: str
-    legacy_openai_models: list[str]
-    legacy_openai_reasoning_effort: str
-    legacy_openai_reasoning_efforts: list[str]
+    anthropic_api_key: Optional[str]
+    deepseek_api_key: Optional[str]
+    google_api_key: Optional[str]
+    elevenlabs_api_key: Optional[str]
+    replicate_api_key: Optional[str]
 
 
 class AddonOptionsDialog(QDialog):
-    api_key_edit: ReactiveLineEdit[State]
     table_buttons: QHBoxLayout
     remove_button: QPushButton
     table: QTableWidget
@@ -105,25 +99,10 @@ class AddonOptionsDialog(QDialog):
         self.processor = processor
         self.state = StateManager[State](self.make_initial_state())
         self.setup_ui()
-        app_state.bind(self)
 
     def setup_ui(self) -> None:
         self.setWindowTitle("Smart Notes ✨")
         self.setMinimumWidth(OPTIONS_MIN_WIDTH)
-
-        # Form
-
-        self.openai_legacy_combo_box = ReactiveComboBox(
-            self.state, "legacy_openai_models", "legacy_openai_model"
-        )
-        self.openai_legacy_combo_box.on_change.connect(
-            self._sync_openai_reasoning_efforts
-        )
-        self.openai_reasoning_effort_combo_box = ReactiveComboBox(
-            self.state,
-            "legacy_openai_reasoning_efforts",
-            "legacy_openai_reasoning_effort",
-        )
 
         # Buttons
         table_buttons = QHBoxLayout()
@@ -176,9 +155,6 @@ class AddonOptionsDialog(QDialog):
         explanation.setFont(font_small)
         layout = QVBoxLayout()
 
-        subscription_box = SubscriptionBox()
-
-        layout.addWidget(subscription_box)
         layout.addSpacing(24)
         layout.addWidget(QLabel("<h3>✨ Smart Fields</h3>"))
         layout.addWidget(explanation)
@@ -189,14 +165,13 @@ class AddonOptionsDialog(QDialog):
         general_tab = QWidget()
         general_tab.setLayout(layout)
         tabs.addTab(general_tab, "General")
+        tabs.addTab(self.render_providers_tab(), "Providers")
         tabs.addTab(self.render_chat_tab(), "Text")
-        # Store a ref so we can enable/disable it
         self.tts_tab = self.render_tts_tab()
         tabs.addTab(self.tts_tab, "TTS")
         self.images_tab = self.render_images_tab()
         tabs.addTab(self.images_tab, "Images")
         tabs.addTab(self.render_plugin_tab(), "Advanced")
-        tabs.addTab(self.render_account_tab(), "Account")
 
         tab_layout = QVBoxLayout()
 
@@ -279,31 +254,47 @@ class AddonOptionsDialog(QDialog):
                     if clipboard:
                         clipboard.setText(prompt_text)
 
-    def render_openai_api_key_box(self) -> QWidget:
-        get_api_key_label = QLabel(
-            "A paid OpenAI API key is required. <a href='https://platform.openai.com/account/api-keys/'>Get an API key.</a>"
-        )
-        get_api_key_label.setOpenExternalLinks(True)
-        get_api_key_label.setFont(font_small)
-
-        self.api_key_edit = ReactiveLineEdit(self.state, "openai_api_key")
-        self.api_key_edit.setPlaceholderText("sk-proj-1234...")
-        self.api_key_edit.setMinimumWidth(500)
-        self.api_key_edit.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
-        )
-        self.api_key_edit.on_change.connect(
-            lambda text: self.state.update({"openai_api_key": text})
-        )
-
+    def render_providers_tab(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout()
+        container.setLayout(layout)
+        
         form = default_form_layout()
-        form.addRow("<b>🔑 OpenAI API Key:</b>", self.api_key_edit)
-        form.addRow(get_api_key_label)
+        
+        def add_key_field(label: str, key: str, placeholder: str):
+            edit = ReactiveLineEdit(self.state, key)  # type: ignore
+            edit.setPlaceholderText(placeholder)
+            edit.setMinimumWidth(400)
+            edit.on_change.connect(
+                lambda text, key=key: self._on_api_key_change(key, text)
+            )
+            form.addRow(f"<b>{label}:</b>", edit)
 
-        group_box = QGroupBox()
+        add_key_field("🔑 OpenAI API Key", "openai_api_key", "sk-proj-...")
+        add_key_field("🔑 Anthropic API Key", "anthropic_api_key", "sk-ant-...")
+        add_key_field("🔑 DeepSeek API Key", "deepseek_api_key", "sk-...")
+        add_key_field("🔑 Google Cloud API Key (TTS)", "google_api_key", "AIzaSy...")
+        add_key_field("🔑 ElevenLabs API Key (TTS)", "elevenlabs_api_key", "...")
+        add_key_field("🔑 Replicate API Key (Images)", "replicate_api_key", "r8_...")
+
+        # OpenAI Endpoint
+        self.openai_endpoint_edit = ReactiveLineEdit(self.state, "openai_endpoint")
+        self.openai_endpoint_edit.setPlaceholderText("https://api.openai.com")
+        self.openai_endpoint_edit.setMinimumWidth(400)
+        self.openai_endpoint_edit.on_change.connect(
+            lambda text: self.state.update({"openai_endpoint": text})
+        )
+        endpoint_info = QLabel("Provide an alternative endpoint to the OpenAI API.")
+        endpoint_info.setFont(font_small)
+        form.addRow("OpenAI Host:", self.openai_endpoint_edit)
+        form.addRow(endpoint_info)
+
+        group_box = QGroupBox("API Configuration")
         group_box.setLayout(form)
+        layout.addWidget(group_box)
+        layout.addStretch()
 
-        return group_box
+        return container
 
     def render_ui(self) -> None:
         self.render_table()
@@ -360,35 +351,6 @@ class AddonOptionsDialog(QDialog):
         if selected_row is not None and selected_row < self.table.rowCount():
             self.table.selectRow(selected_row)
 
-    def render_legacy_options(self) -> QGroupBox:
-        models_group_box = QGroupBox("Legacy OpenAI Settings")
-        models_form = default_form_layout()
-        models_form.addRow(self.render_openai_api_key_box())
-        models_form.addRow("OpenAI Model:", self.openai_legacy_combo_box)
-        models_form.addRow("Reasoning Effort:", self.openai_reasoning_effort_combo_box)
-
-        learn_more_about_models = QLabel(
-            'Newer models (GPT-5, etc) will perform better with lower rate limits and higher cost. <a href="https://platform.openai.com/docs/models/">Learn more.</a>'
-        )
-        learn_more_about_models.setOpenExternalLinks(True)
-        learn_more_about_models.setFont(font_small)
-        models_form.addRow(learn_more_about_models)
-        models_form.addRow("", QLabel(""))
-
-        self.openai_endpoint_edit = ReactiveLineEdit(self.state, "openai_endpoint")
-        self.openai_endpoint_edit.setPlaceholderText("https://api.openai.com")
-        self.openai_endpoint_edit.setMinimumWidth(400)
-        self.openai_endpoint_edit.on_change.connect(
-            lambda text: self.state.update({"openai_endpoint": text})
-        )
-        endpoint_info = QLabel("Provide an alternative endpoint to the OpenAI API.")
-        endpoint_info.setFont(font_small)
-        models_form.addRow("OpenAI Host:", self.openai_endpoint_edit)
-        models_form.addRow(endpoint_info)
-
-        models_group_box.setLayout(models_form)
-        return models_group_box
-
     def render_plugin_tab(self) -> QWidget:
         plugin_box = QGroupBox("✨Smart Field Generation")
         plugin_form = default_form_layout()
@@ -432,10 +394,6 @@ class AddonOptionsDialog(QDialog):
         plugin_tab_layout = default_form_layout()
         plugin_tab_layout.addRow(plugin_box)
 
-        if config.legacy_support:
-            plugin_tab_layout.addRow(QLabel(""))
-            plugin_tab_layout.addRow(self.render_legacy_options())
-
         self.debug_checkbox = ReactiveCheckBox(self.state, "debug")
         plugin_tab_layout.addRow(QLabel(""))
         plugin_tab_layout.addRow("Debug mode", self.debug_checkbox)
@@ -444,9 +402,6 @@ class AddonOptionsDialog(QDialog):
         plugin_settings_tab.setLayout(plugin_tab_layout)
 
         return plugin_settings_tab
-
-    def render_account_tab(self) -> QWidget:
-        return AccountOptions()
 
     def render_chat_tab(self) -> QWidget:
         container = QWidget()
@@ -546,10 +501,6 @@ class AddonOptionsDialog(QDialog):
         field = self.table.item(row, 2).text()  # type: ignore
         logger.debug(f"Editing {note_type}, {field}")
 
-        # Save out API key jic
-        if hasattr(self, "api_key_edit"):
-            config.openai_api_key = self.api_key_edit.text()
-
         # Get type
         extras = get_extras(note_type=note_type, field=field, deck_id=deck_id)
         if not extras:
@@ -578,6 +529,7 @@ class AddonOptionsDialog(QDialog):
             field=field,
             field_type=field_type,
             prompt=prompts[field.lower()],
+            parent=self,
         )
 
         if prompt_dialog.exec() == QDialog.DialogCode.Accepted:
@@ -589,26 +541,17 @@ class AddonOptionsDialog(QDialog):
         self.edit_button.setEnabled(is_enabled)
 
     def on_add(self, field_type: SmartFieldType) -> None:
-        # Save out the API key in case it's been updated this run
-        if hasattr(self, "api_key_edit"):
-            config.openai_api_key = self.api_key_edit.text()
-
         prompt_dialog = PromptDialog(
             self.state.s["prompts_map"],
             self.processor,
             self.on_update_prompts,
             field_type=field_type,
             deck_id=GLOBAL_DECK_ID,
+            parent=self,
         )
 
         if prompt_dialog.exec() == QDialog.DialogCode.Accepted:
             self.render_table()
-
-    # When appstate updates
-    def update_from_state(self, _: AppState) -> None:
-        is_unlocked = is_capacity_remaining()
-        self.voice_button.setEnabled(is_unlocked)
-        self.tts_tab.setEnabled(is_unlocked)
 
     def on_remove(self):
         row = self.state.s["selected_row"]
@@ -629,8 +572,8 @@ class AddonOptionsDialog(QDialog):
         self.state.update({"prompts_map": new_map, "selected_row": None})
 
     def on_accept(self) -> None:
-        self.write_config()
-        self.accept()
+        if self.write_config():
+            self.accept()
 
     def on_reject(self) -> None:
         self.reject()
@@ -646,17 +589,11 @@ class AddonOptionsDialog(QDialog):
             and config.tts_provider != "elevenLabs"
         ):
             did_click_ok = show_message_box(
-                "Are you sure you want to set your default voice provider to a premium model? These voices may consume your plan quickly.",
+                "Are you sure you want to set your default voice provider to a premium model?",
                 show_cancel=True,
             )
             if not did_click_ok:
                 return False
-
-        is_unlocked = is_capacity_remaining()
-
-        if not is_unlocked and self.chat_options.state.s["chat_provider"] != "openai":
-            show_message_box(UNPAID_PROVIDER_ERROR)
-            return False
 
         valid_config_attrs = config.__annotations__.keys()
 
@@ -681,6 +618,13 @@ class AddonOptionsDialog(QDialog):
 
         return True
 
+    def _on_api_key_change(self, key: str, value: str) -> None:
+        self.state.update({key: value})
+        try:
+            setattr(config, key, value)
+        except Exception as e:
+            logger.error(f"Error persisting {key}: {e}")
+
     def on_update_prompts(self, prompts_map: PromptMap) -> None:
         self.state.update({"prompts_map": prompts_map})
         self.write_config()
@@ -688,6 +632,11 @@ class AddonOptionsDialog(QDialog):
     def make_initial_state(self) -> State:
         return {
             "openai_api_key": config.openai_api_key,
+            "anthropic_api_key": config.anthropic_api_key,
+            "deepseek_api_key": config.deepseek_api_key,
+            "google_api_key": config.google_api_key,
+            "elevenlabs_api_key": config.elevenlabs_api_key,
+            "replicate_api_key": config.replicate_api_key,
             "prompts_map": config.prompts_map,
             "selected_row": None,
             "generate_at_review": config.generate_at_review,
@@ -695,30 +644,7 @@ class AddonOptionsDialog(QDialog):
             "openai_endpoint": config.openai_endpoint,
             "allow_empty_fields": config.allow_empty_fields,
             "debug": config.debug,
-            # Legacy OpenAI
-            "legacy_openai_model": config.legacy_openai_model,
-            "legacy_openai_models": legacy_openai_chat_models,
-            "legacy_openai_reasoning_effort": config.legacy_openai_reasoning_effort
-            or "medium",
-            "legacy_openai_reasoning_efforts": openai_reasoning_efforts_for_model(
-                config.legacy_openai_model or "gpt-4o-mini"
-            ),
         }
-
-    def _sync_openai_reasoning_efforts(self, model: str) -> None:
-        efforts = openai_reasoning_efforts_for_model(model)
-        current_effort = self.state.s["legacy_openai_reasoning_effort"]
-        if current_effort not in efforts:
-            current_effort = (
-                "medium" if "medium" in efforts else efforts[0]
-            )  # Default to medium if available
-
-        self.state.update(
-            {
-                "legacy_openai_reasoning_efforts": efforts,
-                "legacy_openai_reasoning_effort": current_effort,
-            }
-        )
 
     def on_restore_defaults(self) -> None:
         config.restore_defaults()

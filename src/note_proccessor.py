@@ -29,14 +29,8 @@ from anki.notes import Note, NoteId
 from aqt import mw
 from aqt.qt import QDialog, QLabel, QProgressBar, QPushButton, Qt, QVBoxLayout
 
-from .app_state import (
-    app_state,
-    has_api_key,
-    is_capacity_remaining,
-    is_capacity_remaining_or_legacy,
-)
 from .config import Config, bump_usage_counter
-from .constants import GENERIC_CREDITS_MESSAGE, STANDARD_BATCH_LIMIT
+from .constants import STANDARD_BATCH_LIMIT
 from .dag import generate_fields_dag
 from .field_processor import FieldProcessor
 from .logger import logger
@@ -46,11 +40,6 @@ from .prompts import get_prompts_for_note
 from .sentry import run_async_in_background_with_sentry
 from .ui.ui_utils import show_message_box
 from .utils import run_on_main
-
-# OPEN_AI rate limits
-NEW_OPEN_AI_MODEL_REQ_PER_MIN = 500
-OLD_OPEN_AI_MODEL_REQ_PER_MIN = 3500
-
 
 class ProgressDialog(QDialog):
     def __init__(self, label: str, max_val: int, on_cancel: Callable[[], None]):
@@ -116,20 +105,8 @@ class NoteProcessor:
 
         logger.debug("Processing notes...")
 
-        if not is_capacity_remaining_or_legacy(show_box=False):
-            return
-
-        # TODO: this logic should be re-addressed when I revisit batch limits (ANK-28)
-        if is_capacity_remaining():
-            limit = STANDARD_BATCH_LIMIT
-        else:
-            model = self.config.chat_model
-            limit = (
-                OLD_OPEN_AI_MODEL_REQ_PER_MIN
-                if model == "gpt-4o-mini"
-                else NEW_OPEN_AI_MODEL_REQ_PER_MIN
-            )
-        logger.debug(f"Rate limit: {limit}")
+        limit = STANDARD_BATCH_LIMIT
+        logger.debug(f"Batch limit: {limit}")
 
         # Only show fancy progress meter for large batches
         cancellation_state = {"cancelled": False}
@@ -288,7 +265,7 @@ class NoteProcessor:
         tasks = []
         for note in to_process:
 
-            async def wrapped(n: Note = note) -> bool | None:
+            async def wrapped(n: Note = note) -> Optional[bool]:
                 if cancellation_state and cancellation_state["cancelled"]:
                     return None
                 try:
@@ -318,7 +295,7 @@ class NoteProcessor:
                 # But we can just proceed to gather below
                 break
 
-            done, pending = await asyncio.wait(
+            _, pending = await asyncio.wait(
                 tasks, timeout=0.1, return_when=asyncio.ALL_COMPLETED
             )
             if not pending:
@@ -486,53 +463,26 @@ class NoteProcessor:
 
     def _handle_failure(self, e: Exception) -> None:
         logger.debug("Handling failure")
-
-        openai_failure_map = {
-            401: "Smart Notes Error: OpenAI returned 401, meaning there's an issue with your API key.",
-            404: "Smart Notes Error: OpenAI returned 404 - did you pay for an API key? Paying for ChatGPT premium alone will not work (this is an OpenAI limitation).",
-            429: "Smart Notes error: OpenAI rate limit exceeded. Ensure you have a paid API key (this plugin will not work with free API tier). Wait a few minutes and try again.",
-        }
-
+        
+        # Simplified error handling for BYOK
         if isinstance(e, aiohttp.ClientResponseError):
             status = e.status
             logger.debug(f"Got status: {status}")
-            unknown_error = f"Smart Notes Error: Unknown error: {e}"
-
-            # First time we see a 4xx error, update subscription state
-            if is_capacity_remaining():
-                logger.debug(f"Got API error: {e}")
-                if status >= 400 and status < 500:
-                    logger.debug(
-                        "Saw 4xx error, something wrong with some subscription"
-                    )
-                    app_state.update_subscription_state()
-                    return
-                else:
-                    logger.error(f"Got 500 error: {e}")
-                    show_message_box(unknown_error)
-            elif has_api_key():
-                if status in openai_failure_map:
-                    show_message_box(openai_failure_map[status])
-                else:
-                    show_message_box(unknown_error)
-            else:
-                if status == 402:
-                    # Shouldn't get here; requests should be blocked if you're
-                    # out of credits.
-                    logger.debug("Got 402 error but app is locked & no API key")
-                    show_message_box(GENERIC_CREDITS_MESSAGE)
-                else:
-                    logger.error("Got 4xx error but app is locked & no API key")
-                    show_message_box(unknown_error)
+            
+            error_map = {
+                401: "Smart Notes Error: 401 Unauthorized. Please check your API Key in settings.",
+                404: "Smart Notes Error: 404 Not Found. Please check your model configuration.",
+                429: "Smart Notes Error: 429 Rate Limit Exceeded. You are sending too many requests too quickly.",
+                402: "Smart Notes Error: 402 Payment Required. Please check your provider's billing status.",
+            }
+            
+            msg = error_map.get(status, f"Smart Notes Error: HTTP {status} - {e.message}")
+            show_message_box(msg)
         else:
             logger.error(f"Got non-HTTP error: {e}")
-            show_message_box(f"Smart Notes Error: Unknown error: {e}")
+            show_message_box(f"Smart Notes Error: {e}")
 
     def _assert_preconditions(self) -> bool:
-        valid_app_mode = self._assert_valid_app_mode()
-        if not valid_app_mode:
-            logger.error("Invalid app mode")
-            return False
         no_existing_req = self.assert_no_req_in_process()
         return no_existing_req
 
@@ -546,9 +496,6 @@ class NoteProcessor:
 
     def _reqlinquish_req_in_process(self) -> None:
         self.req_in_progress = False
-
-    def _assert_valid_app_mode(self) -> bool:
-        return is_capacity_remaining() or has_api_key()
 
     async def _process_node(
         self, node: FieldNode, note: Note, show_error_message_box: bool

@@ -42,13 +42,8 @@ from aqt import (
     mw,
 )
 
-from ..app_state import (
-    is_app_legacy,
-    is_capacity_remaining,
-    is_capacity_remaining_or_legacy,
-)
 from ..config import config, key_or_config_val
-from ..constants import GLOBAL_DECK_ID, UNPAID_PROVIDER_ERROR
+from ..constants import API_KEY_MISSING_MESSAGE, GLOBAL_DECK_ID
 from ..dag import prompt_has_error
 from ..decks import deck_id_to_name_map, get_all_deck_ids
 from ..logger import logger
@@ -82,6 +77,16 @@ from .reactive_edit_text import ReactiveEditText
 from .state_manager import StateManager
 from .tts_options import TTSOptions
 from .ui_utils import default_form_layout, font_bold, font_small, show_message_box
+
+PROVIDER_API_KEY_ATTRS: dict[str, str] = {
+    "openai": "openai_api_key",
+    "anthropic": "anthropic_api_key",
+    "deepseek": "deepseek_api_key",
+    "google": "google_api_key",
+    "elevenLabs": "elevenlabs_api_key",
+    "replicate": "replicate_api_key",
+}
+
 
 explanation = """Write a prompt to help the chat model generate your Smart Field.
 
@@ -142,8 +147,9 @@ class PromptDialog(QDialog):
         card_type: Optional[str] = None,
         field: Optional[str] = None,
         prompt: Optional[str] = None,
+        parent: Optional[QWidget] = None,
     ):
-        super().__init__()
+        super().__init__(parent)
 
         self.processor = processor
         self.on_accept_callback = on_accept_callback
@@ -406,11 +412,6 @@ class PromptDialog(QDialog):
             self.deck_combo_box.setEnabled(False)
             if hasattr(self, "tts_source_combo_box"):
                 self.tts_source_combo_box.setEnabled(False)
-        if is_app_legacy():
-            self.deck_combo_box.setEnabled(False)
-            self.deck_subtitle.setText(
-                "🔒 Deck based Smart Fields are only available on paid plans!"
-            )
         return container
 
     def render_options_tab(self) -> QWidget:
@@ -428,12 +429,7 @@ class PromptDialog(QDialog):
         models_layout.addWidget(override_box)
         models_layout.addWidget(self.model_options)
         model_box = QGroupBox("⚙️ Model Settings")
-        is_legacy = is_app_legacy()
-        model_box.setEnabled(not is_legacy)
-        if is_legacy:
-            model_box.setToolTip(
-                "Model settings are only available in the full version."
-            )
+        model_box.setEnabled(True)
 
         model_box.setLayout(models_layout)
         model_box.setContentsMargins(0, 24, 0, 24)
@@ -606,13 +602,6 @@ class PromptDialog(QDialog):
             self.test_button.setText("Test With Random Note✨")
 
     def on_test(self) -> None:
-        if self.state.s["type"] == "chat":
-            if not is_capacity_remaining_or_legacy(True):
-                return
-        else:
-            if not is_capacity_remaining(True):
-                return
-
         prompt = self.state.s["prompt"]
 
         if not mw or not self.state.s["prompt"]:
@@ -640,37 +629,50 @@ class PromptDialog(QDialog):
             show_message_box(f"Invalid prompt: {error}")
             return
 
-        self.state["is_loading_prompt"] = True
-
-        # TODO: this part could use some simplification
+        use_custom_model = self.state.s["use_custom_model"]
         chat_provider = (
             self.chat_options.state.s["chat_provider"]
-            if self.state.s["use_custom_model"]
+            if use_custom_model
             else config.chat_provider
-        )
+        ) or config.chat_provider
         chat_model = (
             self.chat_options.state.s["chat_model"]
-            if self.state.s["use_custom_model"]
+            if use_custom_model
             else config.chat_model
-        )
+        ) or config.chat_model
 
         tts_provider = (
             self.tts_options.state.s["tts_provider"]
-            if self.state.s["use_custom_model"]
+            if use_custom_model
             else config.tts_provider
         ) or config.tts_provider
-
         tts_voice = (
             self.tts_options.state.s["tts_voice"]
-            if self.state.s["use_custom_model"]
+            if use_custom_model
             else config.tts_voice
         ) or config.tts_voice
-
         tts_model = (
             self.tts_options.state.s["tts_model"]
-            if self.state.s["use_custom_model"]
+            if use_custom_model
             else config.tts_model
         ) or config.tts_model
+
+        if self.state.s["type"] == "chat":
+            if not self._ensure_api_key(chat_provider):
+                return
+        elif self.state.s["type"] == "tts":
+            if not self._ensure_api_key(tts_provider):
+                return
+        else:
+            image_provider = (
+                self.image_options.state.s["image_provider"]
+                if self.state.s["use_custom_model"]
+                else config.image_provider
+            )
+            if not self._ensure_api_key(image_provider):
+                return
+
+        self.state["is_loading_prompt"] = True
 
         def on_success(arg: Union[str, bytes, None]):
             prompt = self.state.s["prompt"]
@@ -749,14 +751,29 @@ class PromptDialog(QDialog):
         else:
 
             def img_fn():
+                provider = (
+                    self.image_options.state.s["image_provider"]
+                    if self.state.s["use_custom_model"]
+                    else config.image_provider
+                )
+                model = self.image_options.state.s["image_model"]
                 return self.processor.field_processor.get_image_response(
                     input_text=prompt,
                     note=sample_note,
-                    model="flux-dev",
-                    provider="replicate",
+                    model=model,
+                    provider=provider,
                 )
 
             run_async_in_background_with_sentry(img_fn, on_success, on_failure)
+
+    def _ensure_api_key(self, provider: str) -> bool:
+        key_attr = PROVIDER_API_KEY_ATTRS.get(provider)
+        if not key_attr:
+            return True
+        if getattr(config, key_attr, None):
+            return True
+        show_message_box(API_KEY_MISSING_MESSAGE.format(provider))
+        return False
 
     def render_automatic_button(self) -> None:
         self.enabled_box.setChecked(self.state.s["generate_automatically"])
@@ -865,14 +882,6 @@ class PromptDialog(QDialog):
             return
 
         # Ensure only openai for legacy
-        if (
-            not is_capacity_remaining()
-            and self.state.s["use_custom_model"]
-            and self.chat_options.state.s["chat_provider"] != "openai"
-        ):
-            show_message_box(UNPAID_PROVIDER_ERROR)
-            return
-
         self.on_accept_callback(new_prompts_map)
         self.accept()
 

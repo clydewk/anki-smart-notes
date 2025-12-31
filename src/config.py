@@ -33,6 +33,8 @@ from .models import (
     ChatProviders,
     ImageModels,
     ImageProviders,
+    ImageAspectRatio,
+    ImageResolution,
     NoteTypeMap,
     OpenAIModels,
     OpenAIReasoningEffort,
@@ -48,23 +50,27 @@ class Config:
     """Fancy config class that uses the Anki addon manager to store config values."""
 
     openai_api_key: Optional[str]
+    anthropic_api_key: Optional[str]
+    deepseek_api_key: Optional[str]
+    google_api_key: Optional[str]
+    elevenlabs_api_key: Optional[str]
+    replicate_api_key: Optional[str]
+
     prompts_map: PromptMap
     generate_at_review: bool
     times_used: int
     last_seen_version: Optional[str]
-    uuid: str
     openai_endpoint: Optional[str]
     regenerate_notes_when_batching: bool
     allow_empty_fields: bool
     last_message_id: int
     debug: bool
-    auth_token: Optional[str]
-    legacy_support: Optional[bool]
 
     # Chat
     chat_provider: ChatProviders
     chat_model: ChatModels
     chat_temperature: int
+    chat_reasoning_effort: Optional[OpenAIReasoningEffort]
     chat_markdown_to_html: bool
 
     # TTS
@@ -76,6 +82,8 @@ class Config:
     # Images
     image_provider: ImageProviders
     image_model: ImageModels
+    image_aspect_ratio: Optional[ImageAspectRatio]
+    image_resolution: Optional[ImageResolution]
 
     # Dialogs / Migrations
     did_show_chained_error_dialog: bool

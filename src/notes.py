@@ -27,7 +27,7 @@ from aqt import mw
 from .constants import GLOBAL_DECK_ID
 from .decks import deck_id_to_name_map
 from .models import DEFAULT_EXTRAS, PromptMap
-from .prompts import get_extras, get_prompt_fields, get_prompts_for_note
+from .prompts import get_extras, get_prompts_for_note
 from .ui.ui_utils import show_message_box
 from .utils import get_fields
 
@@ -106,31 +106,6 @@ def is_ai_field(current_field_num: Optional[int], card: Card) -> Optional[str]:
     return sorted_fields[current_field_num] if is_ai else None
 
 
-def has_chained_ai_fields(card: Card) -> bool:
-    """Check if a card has any AI fields that depend on other AI fields."""
-    return bool(get_chained_ai_fields(get_note_type(card.note()), card.did))
-
-
-def get_chained_ai_fields(note_type: str, deck_id: DeckId) -> set[str]:
-    """Check if a note has any AI fields that depend on other AI fields."""
-    res: set[str] = set()
-    prompts = get_prompts_for_note(note_type, deck_id, to_lower=True)
-
-    if not prompts:
-        return res
-
-    for field, prompt in prompts.items():
-        smart_fields = prompts.keys() - {field.lower()}
-        input_fields = get_prompt_fields(prompt)
-
-        for input_field in input_fields:
-            if input_field in smart_fields:
-                res.add(field)
-                break
-
-    return res
-
-
 def get_random_note(note_type: str, deck_id: DeckId) -> Optional[Note]:
     if not mw or not mw.col:
         return None
@@ -166,15 +141,5 @@ def get_valid_fields_for_prompt(
         field
         for field in fields
         if field != selected_note_field
-        and (
-            get_extras(
-                note_type=selected_note_type,
-                field=field,
-                prompts=prompts_map,
-                deck_id=deck_id,
-                fallback_to_global_deck=False,
-            )
-            or {"type": "chat"}  # Should never happen
-        )["type"]
-        == "chat"
     ]
+

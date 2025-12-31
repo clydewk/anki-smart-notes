@@ -22,9 +22,8 @@ Setup the hooks for the Anki plugin
 """
 
 
-import logging
-from collections.abc import Callable, Sequence
-from typing import Any, Optional
+from collections.abc import Sequence
+from typing import Any, Callable, Optional
 
 from anki.cards import Card
 from anki.notes import Note
@@ -32,22 +31,19 @@ from aqt import QAction, QMenu, browser, editor, gui_hooks, mw
 from aqt.addcards import AddCards
 from aqt.browser.sidebar.item import SidebarItemType
 
-from .app_state import app_state, is_capacity_remaining_or_legacy
-from .config import bump_usage_counter, config
+from .config import config
 from .decks import deck_id_to_name_map
 from .logger import logger, setup_logger
-from .message_polling import start_polling_for_messages
 from .migrations import migrate_models
 from .note_proccessor import NoteProcessor
 from .notes import get_field_from_index, is_ai_field, is_card_fully_processed
-from .sentry import pinger, sentry, with_sentry
+from .sentry import with_sentry
 from .tasks import run_async_in_background
 from .ui.addon_options_dialog import AddonOptionsDialog
 from .ui.changelog import perform_update_check
 from .ui.field_menu import FieldMenu
 from .ui.sparkle import Sparkle
 from .ui.ui_utils import show_message_box
-from .utils import make_uuid
 
 
 def with_processor(fn: Any):
@@ -66,7 +62,6 @@ def with_processor(fn: Any):
 
 @with_processor  # type: ignore
 def on_options(processor: NoteProcessor):
-    app_state.update_subscription_state()
     dialog = AddonOptionsDialog(processor)
     dialog.exec()
 
@@ -78,9 +73,6 @@ def add_editor_top_button(
     @with_sentry
     def fn(editor: editor.Editor):
         if not mw:
-            return
-
-        if not is_capacity_remaining_or_legacy(show_box=True):
             return
 
         card = editor.card
@@ -192,7 +184,7 @@ def make_on_batch_success(
             return f"{count} {word}{'s' if count != 1 else ''}"
 
         if not len(updated) and len(errors):
-            show_message_box("All notes failed. Try again soon.")
+            show_message_box("All notes failed. Check your API keys and configuration.")
         elif len(errors) or len(skipped):
             parts = [f"Processed {pluralize('note', len(updated))} successfully"]
             if len(errors):
@@ -217,12 +209,6 @@ def on_browser_context(processor: NoteProcessor, browser: browser.Browser, menu:
     cards = browser.selected_cards()
 
     def wrapped():
-        if not is_capacity_remaining_or_legacy(show_box=True):
-            return
-
-        if not prevent_batches_on_free_trial(cards):
-            return
-
         processor.process_cards_with_progress(
             cards,
             on_success=make_on_batch_success(browser),
@@ -233,18 +219,9 @@ def on_browser_context(processor: NoteProcessor, browser: browser.Browser, menu:
 
 
 def on_start_actions() -> None:
-    # Make UUID if necessary
-    if not config.uuid:
-        config.uuid = make_uuid()
-
-    run_async_in_background(pinger("session_start"), use_collection=False)
     perform_update_check()
-    start_polling_for_messages()
-
-    app_state.update_subscription_state()
-    if sentry:
-        sentry.configure_scope()
-
+    
+    # Cache decks for autocomplete
     async def cache_leaf_decks_map():
         deck_id_to_name_map()
 
@@ -328,8 +305,6 @@ def on_editor_context(
 @with_processor  # type: ignore
 def on_review(processor: NoteProcessor, card: Card):
     logger.debug("Reviewing...")
-    if not is_capacity_remaining_or_legacy(show_box=False):
-        return
 
     if not config.generate_at_review:
         return
@@ -350,8 +325,6 @@ def on_review(processor: NoteProcessor, card: Card):
         card.load()
         Sparkle()
 
-        # NOTE: Calling this inside processor causes a crash with
-        # Suppressing invocation of -[NSApplication runModalSession:]. -[NSApplication runModalSession:] cannot run inside a transaction begin/commit pair, or inside a transaction commit. Consider switching to an asynchronous equivalent.
         bump_usage_counter()
 
     processor.process_card(
@@ -384,11 +357,6 @@ def add_deck_option(
     menu.addAction(item)
 
     def wrapped():
-        if not is_capacity_remaining_or_legacy(show_box=True):
-            return
-        if not prevent_batches_on_free_trial(cards):
-            return
-
         processor.process_cards_with_progress(
             cards,
             on_success=make_on_batch_success(tree_view.browser),
@@ -401,27 +369,7 @@ def add_deck_option(
 @with_sentry
 def cleanup() -> None:
     logger.debug("Shutting down loggers")
-    # Ridiculous hack to fix this sentry logger error:
-    # I don't quite understand it but the stream handler setup in sentry_sdk
-    # isn't torn down correctly.
-    #   Traceback (most recent call last):
-    #   File "logging", line 2141, in shutdown
-    #   File "logging", line 1066, in flush
-    # RuntimeError: wrapped C/C++ object of type ErrorHandler has been deleted
-
-    sentry_logger = logging.getLogger("sentry_sdk.errors")
-    sentry_logger.handlers.clear()
     logger.handlers.clear()
-
-
-def prevent_batches_on_free_trial(notes: Any) -> bool:
-    if app_state.is_free_trial() and len(notes) > 50:
-        did_accept: bool = show_message_box(
-            "Warning: your free trial allows a limited number of cards. Continue?",
-            show_cancel=True,
-        )
-        return did_accept
-    return True
 
 
 @with_sentry

@@ -25,7 +25,9 @@ from ..config import key_or_config_val
 from ..models import (
     ChatModels,
     ChatProviders,
+    OpenAIReasoningEffort,
     OverridableChatOptionsDict,
+    openai_reasoning_efforts_for_model,
     overridable_chat_options,
     provider_model_map,
 )
@@ -42,6 +44,8 @@ class ChatOptionsState(TypedDict):
     chat_models: list[ChatModels]
     chat_model: ChatModels
     chat_temperature: int
+    chat_reasoning_effort: Optional[OpenAIReasoningEffort]
+    chat_reasoning_efforts: list[OpenAIReasoningEffort]
     chat_markdown_to_html: bool
 
 
@@ -60,6 +64,15 @@ models_map: dict[str, str] = {
 providers_map = {"openai": "OpenAI", "anthropic": "Anthropic", "deepseek": "DeepSeek"}
 
 all_chat_providers: list[ChatProviders] = ["openai", "anthropic", "deepseek"]
+
+reasoning_efforts_map: dict[str, str] = {
+    "none": "None (Use Temperature)",
+    "minimal": "Minimal",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "xhigh": "Extra High",
+}
 
 
 class ChatOptions(QWidget):
@@ -100,6 +113,16 @@ class ChatOptions(QWidget):
             self.state, "chat_models", "chat_model", models_map
         )
         self.chat_model.setMinimumWidth(350)
+        self.chat_model.on_change.connect(self._on_model_change)
+
+        self.reasoning_effort = ReactiveComboBox(
+            self.state,
+            "chat_reasoning_efforts",
+            "chat_reasoning_effort",
+            reasoning_efforts_map,
+        )
+        self.reasoning_effort.on_change.connect(self._on_reasoning_effort_change)
+
         chat_box = QGroupBox("✨ Language Model")
         chat_form = default_form_layout()
         chat_box.setLayout(chat_form)
@@ -126,6 +149,13 @@ class ChatOptions(QWidget):
         )
         temp_desc.setFont(font_small)
         advanced_layout.addRow(temp_desc)
+        
+        advanced_layout.addRow("Reasoning Effort:", self.reasoning_effort)
+        reasoning_desc = QLabel(
+            "Controls how hard the model thinks. Only available for some models. Disables temperature when active."
+        )
+        reasoning_desc.setFont(font_small)
+        advanced_layout.addRow(reasoning_desc)
 
         chat_layout = default_form_layout()
         chat_layout.addRow(chat_box)
@@ -137,6 +167,10 @@ class ChatOptions(QWidget):
         chat_layout.setContentsMargins(0, 0, 0, 0)
 
         self.setLayout(chat_layout)
+        
+        # Initial check for enabled/disabled state
+        self._on_reasoning_effort_change(self.state.s.get("chat_reasoning_effort"))
+        self._on_model_change(self.state.s["chat_model"])
 
     def get_initial_state(
         self, chat_options: OverridableChatOptionsDict
@@ -148,4 +182,32 @@ class ChatOptions(QWidget):
 
         ret["chat_providers"] = all_chat_providers
         ret["chat_models"] = provider_model_map[ret["chat_provider"]]
+        
+        # Ensure reasoning effort is initialized properly
+        current_model = ret.get("chat_model")
+        efforts = openai_reasoning_efforts_for_model(current_model) if current_model else []
+        ret["chat_reasoning_efforts"] = efforts
+        
+        if not ret.get("chat_reasoning_effort") and efforts:
+             # Default to "none" if available, else first option
+             ret["chat_reasoning_effort"] = "none" if "none" in efforts else efforts[0] if efforts else None
+
         return ret
+
+    def _on_model_change(self, model: str) -> None:
+        # Update available reasoning efforts for the new model
+        efforts = openai_reasoning_efforts_for_model(model)
+        self.state.update({"chat_reasoning_efforts": efforts})
+        
+        # If current selection is not valid for new model, reset
+        current_effort = self.state.s.get("chat_reasoning_effort")
+        if current_effort not in efforts:
+             new_effort = "none" if "none" in efforts else (efforts[0] if efforts else None)
+             self.state.update({"chat_reasoning_effort": new_effort})
+
+    def _on_reasoning_effort_change(self, effort: Optional[str]) -> None:
+        self.state.update({"chat_reasoning_effort": effort}) # type: ignore
+        
+        # Disable temperature if reasoning effort is set to something other than "none" or None
+        is_reasoning = effort and effort != "none"
+        self.temperature.setEnabled(not is_reasoning)

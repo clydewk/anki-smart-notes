@@ -23,10 +23,9 @@ from anki.decks import DeckId
 from anki.notes import Note
 from aqt import mw
 
-from .app_state import has_api_key, is_capacity_remaining
 from .chat_provider import ChatProvider, chat_provider
-from .config import key_or_config_val
-from .constants import GENERIC_CREDITS_MESSAGE
+from .config import key_or_config_val, config
+from .constants import API_KEY_MISSING_MESSAGE
 from .image_provider import ImageProvider, image_provider
 from .logger import logger
 from .markdown import convert_markdown_to_html
@@ -36,16 +35,18 @@ from .models import (
     ChatModels,
     ChatProviders,
     ElevenVoices,
+    ImageAspectRatio,
     ImageModels,
     ImageProviders,
+    ImageResolution,
+    OpenAIReasoningEffort,
     OpenAIVoices,
     SmartFieldType,
     TTSModels,
     TTSProviders,
 )
 from .nodes import FieldNode
-from .notes import get_chained_ai_fields, get_note_type
-from .open_ai_client import OpenAIClient, openai_provider
+from .notes import get_note_type
 from .prompts import get_extras, interpolate_prompt
 from .tts_provider import TTSProvider, tts_provider
 from .ui.ui_utils import show_message_box
@@ -55,12 +56,10 @@ from .utils import run_on_main
 class FieldProcessor:
     def __init__(
         self,
-        openai_provider: OpenAIClient,
         chat_provider: ChatProvider,
         tts_provider: TTSProvider,
         image_provider: ImageProvider,
     ):
-        self.openai_provider = openai_provider
         self.chat_provider = chat_provider
         self.tts_provider = tts_provider
         self.image_provider = image_provider
@@ -83,10 +82,6 @@ class FieldProcessor:
         )
 
         if field_type == "tts":
-            if not is_capacity_remaining():
-                logger.debug("Skipping TTS field for locked app")
-                return None
-
             if not mw or not mw.col:
                 return None
             media = mw.col.media
@@ -123,6 +118,9 @@ class FieldProcessor:
             chat_model: ChatModels = key_or_config_val(extras, "chat_model")
             chat_provider: ChatProviders = key_or_config_val(extras, "chat_provider")
             chat_temperature: float = key_or_config_val(extras, "chat_temperature")
+            chat_reasoning_effort: Optional[OpenAIReasoningEffort] = key_or_config_val(
+                extras, "chat_reasoning_effort"
+            )
             should_convert: bool = key_or_config_val(extras, "chat_markdown_to_html")
 
             return await self.get_chat_response(
@@ -132,6 +130,7 @@ class FieldProcessor:
                 model=chat_model,
                 provider=chat_provider,
                 temperature=chat_temperature,
+                reasoning_effort=chat_reasoning_effort,
                 field_lower=node.field,
                 should_convert_to_html=should_convert,
                 show_error_box=show_error_box,
@@ -148,12 +147,20 @@ class FieldProcessor:
 
             image_model: ImageModels = key_or_config_val(extras, "image_model")
             image_provider: ImageProviders = key_or_config_val(extras, "image_provider")
+            image_aspect_ratio: Optional[ImageAspectRatio] = key_or_config_val(
+                extras, "image_aspect_ratio"
+            )
+            image_resolution: Optional[ImageResolution] = key_or_config_val(
+                extras, "image_resolution"
+            )
 
             image_response = await self.get_image_response(
                 note=note,
                 input_text=input,
                 model=image_model,
                 provider=image_provider,
+                aspect_ratio=image_aspect_ratio,
+                resolution=image_resolution,
                 show_error_box=show_error_box,
             )
             if not image_response:
@@ -175,6 +182,7 @@ class FieldProcessor:
         field_lower: str,
         temperature: float,
         should_convert_to_html: bool,
+        reasoning_effort: Optional[OpenAIReasoningEffort] = None,
         show_error_box: bool = True,
     ) -> Optional[str]:
         interpolated_prompt = interpolate_prompt(prompt, note)
@@ -182,35 +190,18 @@ class FieldProcessor:
         if not interpolated_prompt:
             return None
 
-        resp: Optional[str] = None
-
-        if is_capacity_remaining():
-            resp = await self.chat_provider.async_get_chat_response(
-                interpolated_prompt,
-                model=model,
-                provider=provider,
-                temperature=temperature,
-                note_id=note.id,
-            )
-        elif has_api_key():
-            logger.debug("On legacy path....")
-            # Check that this isn't a chained smart field
-            chained_fields = get_chained_ai_fields(
-                note_type=get_note_type(note), deck_id=deck_id
-            )
-            logger.debug(f"Chained fields: {chained_fields}")
-            if field_lower in chained_fields:
-                logger.debug(f"Skipping chained field: ${field_lower}")
-                return None
-
-            resp = await self.openai_provider.async_get_chat_response(
-                interpolated_prompt, temperature=temperature, retry_count=0
-            )
-        else:
-            logger.error("App is at capacity + no API key")
-            if show_error_box:
-                run_on_main(lambda: show_message_box(GENERIC_CREDITS_MESSAGE))
+        # Check for API key
+        if not self._check_api_key(provider, show_error_box):
             return None
+
+        resp = await self.chat_provider.async_get_chat_response(
+            interpolated_prompt,
+            model=model,
+            provider=provider,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            note_id=note.id,
+        )
 
         if resp and should_convert_to_html:
             resp = convert_markdown_to_html(resp)
@@ -232,12 +223,7 @@ class FieldProcessor:
         if not interpolated_prompt:
             return None
 
-        logger.debug(f"Resolving: {interpolated_prompt}")
-
-        if not is_capacity_remaining():
-            logger.debug("App at capacity, returning early")
-            if show_error_box:
-                run_on_main(lambda: show_message_box(GENERIC_CREDITS_MESSAGE))
+        if not self._check_api_key(provider, show_error_box):
             return None
 
         return await self.tts_provider.async_get_tts_response(
@@ -255,26 +241,56 @@ class FieldProcessor:
         input_text: str,
         model: ImageModels,
         provider: ImageProviders,
+        aspect_ratio: Optional[ImageAspectRatio] = None,
+        resolution: Optional[ImageResolution] = None,
         show_error_box: bool = True,
     ) -> Optional[bytes]:
-        if not is_capacity_remaining():
-            logger.debug("App at capacity, returning early")
-            if show_error_box:
-                run_on_main(lambda: show_message_box(GENERIC_CREDITS_MESSAGE))
-            return None
-
         interpolated_prompt = interpolate_prompt(input_text, note)
 
         if not interpolated_prompt:
             return None
 
+        if not self._check_api_key(provider, show_error_box):
+            return None
+
         return await self.image_provider.async_get_image_response(
-            prompt=interpolated_prompt, model=model, provider=provider, note_id=note.id
+            prompt=interpolated_prompt,
+            model=model,
+            provider=provider,
+            note_id=note.id,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
         )
+
+    def _check_api_key(self, provider: str, show_error_box: bool) -> bool:
+        has_key = False
+        if provider == "openai":
+            has_key = bool(config.openai_api_key)
+        elif provider == "anthropic":
+            has_key = bool(config.anthropic_api_key)
+        elif provider == "deepseek":
+            has_key = bool(config.deepseek_api_key)
+        elif provider == "google":
+            has_key = bool(config.google_api_key)
+        elif provider == "elevenLabs":
+            has_key = bool(config.elevenlabs_api_key)
+        elif provider == "replicate":
+            has_key = bool(config.replicate_api_key)
+
+        if not has_key:
+            logger.error(f"Missing API key for {provider}")
+            if show_error_box:
+                run_on_main(
+                    lambda: show_message_box(
+                        API_KEY_MISSING_MESSAGE.format(provider)
+                    )
+                )
+            return False
+
+        return True
 
 
 field_processor = FieldProcessor(
-    openai_provider=openai_provider,
     chat_provider=chat_provider,
     tts_provider=tts_provider,
     image_provider=image_provider,

@@ -23,7 +23,6 @@ from typing import Optional
 from anki.cards import Card
 from aqt import QAction, QMenu, browser, editor, mw
 
-from ..app_state import is_capacity_remaining_or_legacy
 from ..note_proccessor import NoteProcessor
 from .custom_prompt import CustomImagePrompt, CustomTextPrompt, CustomTTSPrompt
 
@@ -71,8 +70,6 @@ class FieldMenu:
         generate_item = QAction("✨ Generate Smart Field", self.menu)
 
         def wrapped() -> None:
-            if not is_capacity_remaining_or_legacy(show_box=True):
-                return
 
             def on_success(_: bool):
                 self.editor.loadNote()

@@ -132,10 +132,12 @@ SmartFieldType = Literal["chat", "tts", "image"]
 # Image Models
 
 ReplicateImageModels = Literal["flux-dev", "flux-schnell"]
-ImageModels = ReplicateImageModels
+GoogleImageModels = Literal["gemini-3-pro-image-preview"]
+ImageModels = Union[ReplicateImageModels, GoogleImageModels]
 
-ImageProviders = Literal["replicate"]
-
+ImageProviders = Literal["replicate", "google"]
+ImageAspectRatio = Literal["1:1", "16:9", "4:3", "3:4", "9:16"]
+ImageResolution = Literal["1024x1024", "2048x2048"] # Simplified
 
 class FieldExtras(TypedDict):
     automatic: bool
@@ -146,6 +148,7 @@ class FieldExtras(TypedDict):
     chat_model: Optional[ChatModels]
     chat_provider: Optional[ChatProviders]
     chat_temperature: Optional[int]
+    chat_reasoning_effort: Optional[OpenAIReasoningEffort]
     chat_markdown_to_html: Optional[bool]
 
     # TTS
@@ -157,6 +160,8 @@ class FieldExtras(TypedDict):
     # Images
     image_provider: Optional[ImageProviders]
     image_model: Optional[ImageModels]
+    image_aspect_ratio: Optional[ImageAspectRatio]
+    image_resolution: Optional[ImageResolution]
 
 
 # Any non-mandatory fields should default to none, and will be displayed from global config instead
@@ -169,6 +174,7 @@ DEFAULT_EXTRAS: FieldExtras = {
     "chat_model": None,
     "chat_provider": None,
     "chat_temperature": None,
+    "chat_reasoning_effort": None,
     # Overridable TTS Options
     "tts_model": None,
     "tts_provider": None,
@@ -177,6 +183,8 @@ DEFAULT_EXTRAS: FieldExtras = {
     # Overridable Image Options
     "image_provider": None,
     "image_model": None,
+    "image_aspect_ratio": None,
+    "image_resolution": None,
 }
 
 
@@ -195,6 +203,7 @@ OverridableChatOptions = Union[
     Literal["chat_provider"],
     Literal["chat_model"],
     Literal["chat_temperature"],
+    Literal["chat_reasoning_effort"],
     Literal["chat_markdown_to_html"],
 ]
 
@@ -202,6 +211,7 @@ overridable_chat_options: list[OverridableChatOptions] = [
     "chat_provider",
     "chat_model",
     "chat_temperature",
+    "chat_reasoning_effort",
     "chat_markdown_to_html",
 ]
 
@@ -210,6 +220,7 @@ class OverridableChatOptionsDict(TypedDict):
     chat_provider: Optional[ChatProviders]
     chat_model: Optional[ChatModels]
     chat_temperature: Optional[int]
+    chat_reasoning_effort: Optional[OpenAIReasoningEffort]
     chat_markdown_to_html: Optional[bool]
 
 
@@ -235,13 +246,23 @@ class OverrideableTTSOptionsDict(TypedDict):
     tts_strip_html: Optional[bool]
 
 
-OverridableImageOptions = Union[Literal["image_provider"], Literal["image_model"]]
+OverridableImageOptions = Union[
+    Literal["image_provider"],
+    Literal["image_model"],
+    Literal["image_aspect_ratio"],
+    Literal["image_resolution"],
+]
+
 overridable_image_options: list[OverridableImageOptions] = [
     "image_model",
     "image_provider",
+    "image_aspect_ratio",
+    "image_resolution",
 ]
 
 
 class OverridableImageOptionsDict(TypedDict):
     image_model: Optional[ImageModels]
     image_provider: Optional[ImageProviders]
+    image_aspect_ratio: Optional[ImageAspectRatio]
+    image_resolution: Optional[ImageResolution]

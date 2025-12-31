@@ -71,8 +71,8 @@
 
 ### Provider Classes
 - **`chat_provider.py`**: Handles OpenAI, Anthropic, DeepSeek chat completions
-- **`tts_provider.py`**: Text-to-speech via OpenAI, ElevenLabs, Google
-- **`image_provider.py`**: Image generation via Replicate (Flux models)
+- **`tts_provider.py`**: Text-to-speech via OpenAI, ElevenLabs, Google (BYOK only)
+- **`image_provider.py`**: Image generation via Replicate (Flux models) and Google Gemini Nano Banana Pro
 - **`open_ai_client.py`**: Legacy OpenAI client for users with API keys
 
 ### UI System (`src/ui/`)

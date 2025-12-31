@@ -166,11 +166,6 @@ def prompt_has_error(
         if prompt_field not in note_fields:
             return f"Invalid field in prompt: {prompt_field}"
 
-        extras = get_extras(note_type, prompt_field, deck_id, prompts_map)
-
-        if extras and extras["type"] in ["tts", "image"]:
-            return "Cannot reference TTS or image fields in prompts"
-
     # Can't reference itself
     if target_field and target_field.lower() in prompt_fields:
         return "Cannot reference the target field in the prompt."
