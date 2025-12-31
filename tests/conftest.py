@@ -21,6 +21,9 @@ import os
 import sys
 from unittest.mock import MagicMock
 
+import pytest
+from tests.mocks import MockConfig
+
 # Mock anki modules before they are imported
 sys.modules["aqt"] = MagicMock()
 sys.modules["aqt.addons"] = MagicMock()
@@ -28,3 +31,41 @@ sys.modules["anki"] = MagicMock()
 sys.modules["anki.decks"] = MagicMock()
 
 os.environ["IS_TEST"] = "True"
+
+
+@pytest.fixture
+def mock_config(monkeypatch):
+    config = MockConfig(
+        prompts_map={
+            "note_types": {
+                "Basic": {
+                    "All": {
+                        "fields": {"Front": "test", "Back": "test"},
+                        "extras": {
+                            "Front": {
+                                "type": "chat",
+                                "chat_model": None,
+                                "tts_model": None,
+                                "tts_voice": None,
+                            },
+                            "Back": {
+                                "type": "tts",
+                                "chat_model": None,
+                                "tts_model": None,
+                                "tts_voice": None,
+                            },
+                        },
+                    }
+                }
+            }
+        }
+    )
+    monkeypatch.setattr("src.migrations.config", config)
+    return config
+
+
+@pytest.fixture
+def mock_logger(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr("src.migrations.logger", logger)
+    return logger

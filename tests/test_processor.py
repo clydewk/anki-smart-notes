@@ -19,95 +19,15 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Any
-
 import pytest
-from attr import dataclass
-
-
-@dataclass
-class MockNote:
-    _note_type: str
-    _data: dict[str, Any]
-
-    id = 1
-
-    def note_type(self):
-        return {"name": self._note_type}
-
-    def __getitem__(self, key):
-        return self._data[key]
-
-    def __setitem__(self, key, value):
-        self._data[key] = value
-
-    def __contains__(self, key):
-        return key in self._data
-
-    def items(self):
-        return self._data.items()
-
-    def fields(self):
-        return self._data.keys()
-
-
-@dataclass
-class MockConfig:
-    prompts_map: Any
-    allow_empty_fields: bool
-    chat_provider = "openai"
-    chat_model = "gpt-4o-mini"
-    chat_temperature = 0
-    tts_provider = "openai"
-    tts_voice = "alloy"
-    tts_model = "tts-1"
-    openai_api_key = ""
-    auth_token: str = ""
-    uuid: str = "test-uuid-12345"
-    debug: bool = True
-
-
-def p(str) -> str:
-    return f"p_{str}"
-
-
-class MockOpenAIClient:
-    async def async_get_chat_response(self, prompt: str):
-        return p(prompt)
-
-
-class MockChatClient:
-    async def async_get_chat_response(
-        self,
-        prompt: str,
-        model: str,
-        provider: str,
-        note_id: int,
-        temperature: int = 0,
-        retry_count: int = 0,
-    ) -> str:
-        return p(prompt)
-
-
-class MockAppState:
-    """Mock app state that simulates an unlocked app with unlimited capacity"""
-
-    state = {
-        "subscription": "PAID_PLAN_ACTIVE",  # Unlocked state
-        "plan": {
-            "planId": "test_plan",
-            "planName": "Test Plan",
-            "notesUsed": 0,
-            "notesLimit": 1000,
-            "daysLeft": 30,
-            "textCreditsUsed": 0,
-            "textCreditsCapacity": 1000,
-            "voiceCreditsUsed": 0,
-            "voiceCreditsCapacity": 1000,
-            "imageCreditsUsed": 0,
-            "imageCreditsCapacity": 1000,
-        },
-    }
+from tests.mocks import (
+    MockAppState,
+    MockChatClient,
+    MockConfig,
+    MockNote,
+    MockOpenAIClient,
+    p,
+)
 
 
 NOTE_TYPE_NAME = "note_type_1"

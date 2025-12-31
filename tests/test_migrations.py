@@ -19,62 +19,6 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Any
-from unittest.mock import MagicMock
-
-import pytest
-from attr import dataclass
-
-
-@dataclass
-class MockConfig:
-    prompts_map: Any
-    chat_provider: str = "openai"
-    chat_model: str = "gpt-4o-mini"
-    tts_model: str = "tts-1"
-    tts_voice: str = "alloy"
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        object.__setattr__(self, name, value)
-
-
-@pytest.fixture
-def mock_config(monkeypatch):
-    config = MockConfig(
-        prompts_map={
-            "note_types": {
-                "Basic": {
-                    "All": {
-                        "fields": {"Front": "test", "Back": "test"},
-                        "extras": {
-                            "Front": {
-                                "type": "chat",
-                                "chat_model": None,
-                                "tts_model": None,
-                                "tts_voice": None,
-                            },
-                            "Back": {
-                                "type": "tts",
-                                "chat_model": None,
-                                "tts_model": None,
-                                "tts_voice": None,
-                            },
-                        },
-                    }
-                }
-            }
-        }
-    )
-    monkeypatch.setattr("src.migrations.config", config)
-    return config
-
-
-@pytest.fixture
-def mock_logger(monkeypatch):
-    logger = MagicMock()
-    monkeypatch.setattr("src.migrations.logger", logger)
-    return logger
-
 
 def test_migrate_chat_models_global(mock_config, mock_logger, monkeypatch):
     from src.migrations import migrate_models
