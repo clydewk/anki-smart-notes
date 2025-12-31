@@ -36,11 +36,11 @@ class TTSMigrations(TypedDict):
 migration_map: dict[str, Union[dict[str, str], TTSMigrations]] = {
     "chat": {
         "o1-mini": "gpt-5-mini",
-        "gpt-4o": "gpt-5-chat-latest",
-        "gpt-4-turbo": "gpt-5-chat-latest",
-        "gpt-4": "gpt-5-chat-latest",
+        "gpt-4o": "gpt-5.2-chat-latest",
+        "gpt-4-turbo": "gpt-5.2-chat-latest",
+        "gpt-4": "gpt-5.2-chat-latest",
         "o3-mini": "gpt-5-mini",
-        "gpt-4.1": "gpt-5-chat-latest",
+        "gpt-4.1": "gpt-5.2-chat-latest",
         "gpt-4.1-mini": "gpt-5-mini",
         "gpt-4.1-nano": "gpt-5-nano",
         "o3": "gpt-5",

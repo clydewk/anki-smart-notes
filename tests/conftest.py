@@ -18,5 +18,13 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import os
+import sys
+from unittest.mock import MagicMock
+
+# Mock anki modules before they are imported
+sys.modules["aqt"] = MagicMock()
+sys.modules["aqt.addons"] = MagicMock()
+sys.modules["anki"] = MagicMock()
+sys.modules["anki.decks"] = MagicMock()
 
 os.environ["IS_TEST"] = "True"

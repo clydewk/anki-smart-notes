@@ -43,3 +43,9 @@ known-first-party = ["src"]
 force-single-line = false
 combine-as-imports = true
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "asyncio: mark test as async"
+]
+
