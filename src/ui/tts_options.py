@@ -95,6 +95,8 @@ class TTSState(TypedDict):
     selected_gender: Gender
     languages: list[str]
     selected_language: str
+    models: list[str]
+    selected_filter_model: str
 
     voice: str
 
@@ -434,12 +436,31 @@ class TTSOptions(QWidget):
                 "elevenLabs": "ElevenLabs",
             },
         )
+        provider.on_change.connect(self._on_provider_filter_change)
+
+        model = ReactiveComboBox(self.state, "models", "selected_filter_model")
 
         filters_layout.addRow("Language:", language)
         filters_layout.addRow("Gender:", gender)
         filters_layout.addRow("Provider:", provider)
+        filters_layout.addRow("Model Type:", model)
 
         return filters_box
+    
+    def _on_provider_filter_change(self, provider: str) -> None:
+        # Filter models based on provider
+        available_models = {
+            v["model"] 
+            for v in voices 
+            if provider == ALL or v["tts_provider"] == provider
+        }
+        new_models = [ALL] + sorted(list(available_models))
+        
+        self.state.update({
+            "selected_provider": provider,
+            "models": new_models,
+            "selected_filter_model": ALL
+        })
 
     def render_voices_list(self) -> QWidget:
         self.voice_box = QGroupBox(f"🗣️ Voices ({len(voices)})")
@@ -628,6 +649,14 @@ class TTSOptions(QWidget):
             if not matches_language:
                 continue
 
+            matches_model = (
+                self.state.s["selected_filter_model"] == ALL
+                or voice["model"] == self.state.s["selected_filter_model"]
+            )
+            
+            if not matches_model:
+                continue
+
             # Search works by splitting the user's input into terms and the formatted
             # voice display text into words. Each search term must match (via substring)
             # at least one word in the voice. All search terms must match for inclusion.
@@ -653,6 +682,8 @@ class TTSOptions(QWidget):
             "selected_gender": ALL,
             "languages": languages,
             "selected_language": ALL,
+            "models": [ALL] + sorted(list({v["model"] for v in voices})),
+            "selected_filter_model": ALL,
             "test_text": default_texts[ALL],
             "test_enabled": True,
             "search_text": "",

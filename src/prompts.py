@@ -228,11 +228,17 @@ def add_or_update_prompts(
 
     # Otherwise need to delete any custom config if it's not being used
     else:
+        # Special handling for tts_style which is always per-field
+        if tts_options.get("tts_style") is not None:
+            extras["tts_style"] = tts_options["tts_style"]
+
         for k in (
             overridable_chat_options
             + overridable_tts_options
             + overridable_image_options
         ):
+            if k == "tts_style":
+                continue
             extras[k] = None
 
     # Regenerate field during batch processing if requested

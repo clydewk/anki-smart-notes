@@ -251,6 +251,18 @@ overridable_tts_options: list[OverridableTTSOptions] = [
 ]
 
 
+class CustomProvider(TypedDict):
+    name: str
+    base_url: str
+    api_key: str
+
+
+class ProviderSettings(TypedDict):
+    model: str
+    temperature: float
+    reasoning_effort: Optional[OpenAIReasoningEffort]
+
+
 class OverrideableTTSOptionsDict(TypedDict):
     tts_model: Optional[TTSModels]
     tts_provider: Optional[TTSProviders]

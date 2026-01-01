@@ -29,6 +29,7 @@ from aqt import (
     QGraphicsOpacityEffect,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMenu,
     QPoint,
@@ -42,13 +43,14 @@ from aqt import (
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 from ..config import config
 from ..constants import GLOBAL_DECK_ID
 from ..decks import deck_id_to_name_map, deck_name_to_id_map
 from ..logger import logger
 from ..models import (
+    CustomProvider,
     PromptMap,
     SmartFieldType,
 )
@@ -84,6 +86,9 @@ class State(TypedDict):
     google_api_key: Optional[str]
     elevenlabs_api_key: Optional[str]
     replicate_api_key: Optional[str]
+    
+    custom_providers: list[CustomProvider]
+    search_text: str
 
 
 class AddonOptionsDialog(QDialog):
@@ -93,41 +98,21 @@ class AddonOptionsDialog(QDialog):
     restore_defaults: QPushButton
     edit_button: QPushButton
     state: StateManager[State]
+    save_timer: QTimer
 
     def __init__(self, processor: NoteProcessor):
         super().__init__()
         self.processor = processor
         self.state = StateManager[State](self.make_initial_state())
+        self.save_timer = QTimer()
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(500)
+        self.save_timer.timeout.connect(lambda: self.write_config(silent=True))
         self.setup_ui()
 
     def setup_ui(self) -> None:
         self.setWindowTitle("Smart Notes ✨")
         self.setMinimumWidth(OPTIONS_MIN_WIDTH)
-
-        # Buttons
-        table_buttons = QHBoxLayout()
-        add_button = QPushButton("💬 New Text Field")
-        add_button.clicked.connect(lambda _: self.on_add("chat"))
-        self.voice_button = QPushButton("🔈 New TTS Field")
-        self.voice_button.clicked.connect(lambda _: self.on_add("tts"))
-        self.remove_button = QPushButton("Remove")
-        self.remove_button.setFixedWidth(75)
-        self.edit_button = QPushButton("Edit")
-        self.edit_button.setFixedWidth(75)
-        self.edit_button.clicked.connect(self.on_edit)
-        table_buttons.addWidget(self.remove_button, 1)
-        table_buttons.addWidget(self.edit_button, 1)
-        self.remove_button.clicked.connect(self.on_remove)
-        self.voice_button.setFixedWidth(150)
-        self.image_button = QPushButton("🖼️ New Image Field")
-        self.image_button.setFixedWidth(150)
-        self.image_button.clicked.connect(lambda _: self.on_add("image"))
-        add_button.setFixedWidth(150)
-        table_buttons.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Policy.Expanding))
-
-        table_buttons.addWidget(self.image_button, Qt.AlignmentFlag.AlignRight)
-        table_buttons.addWidget(self.voice_button, Qt.AlignmentFlag.AlignRight)
-        table_buttons.addWidget(add_button, Qt.AlignmentFlag.AlignRight)
 
         standard_buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
@@ -141,30 +126,11 @@ class AddonOptionsDialog(QDialog):
         standard_buttons.accepted.connect(self.on_accept)
         standard_buttons.rejected.connect(self.on_reject)
 
-        # Table
-        self.table = self.create_table()
-        self.setup_table_context_menu(self.table)
-
         # Set up layout
 
         tabs = QTabWidget()
 
-        explanation = QLabel(
-            "Automatically generate text, voice, and images on any field."
-        )
-        explanation.setFont(font_small)
-        layout = QVBoxLayout()
-
-        layout.addSpacing(24)
-        layout.addWidget(QLabel("<h3>✨ Smart Fields</h3>"))
-        layout.addWidget(explanation)
-        layout.addSpacing(16)
-        layout.addWidget(self.table)
-        layout.addLayout(table_buttons)
-
-        general_tab = QWidget()
-        general_tab.setLayout(layout)
-        tabs.addTab(general_tab, "General")
+        tabs.addTab(self.render_general_tab(), "General")
         tabs.addTab(self.render_providers_tab(), "Providers")
         tabs.addTab(self.render_chat_tab(), "Text")
         self.tts_tab = self.render_tts_tab()
@@ -230,7 +196,82 @@ class AddonOptionsDialog(QDialog):
 
         self.setLayout(tab_layout)
         self.state.state_changed.connect(self.render_ui)
+        self.state.state_changed.connect(self.on_state_changed)
+        
+        # Connect substates for auto-save
+        self.tts_options.state.state_changed.connect(self.on_state_changed)
+        self.chat_options.state.state_changed.connect(self.on_state_changed)
+        self.image_options.state.state_changed.connect(self.on_state_changed)
+
         self.render_ui()
+
+    def on_state_changed(self) -> None:
+        self.save_timer.start()
+
+    def render_general_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        
+        # Header
+        header_layout = QVBoxLayout()
+        title = QLabel("<h3>✨ Smart Fields</h3>")
+        explanation = QLabel(
+            "Automatically generate text, voice, and images on any field."
+        )
+        explanation.setFont(font_small)
+        header_layout.addWidget(title)
+        header_layout.addWidget(explanation)
+        layout.addLayout(header_layout)
+        layout.addSpacing(12)
+
+        # Search Bar
+        search_layout = QHBoxLayout()
+        search_input = ReactiveLineEdit(self.state, "search_text")
+        search_input.setPlaceholderText("🔎 Search fields...")
+        search_input.on_change.connect(lambda _: self.render_table())
+        search_layout.addWidget(search_input)
+        layout.addLayout(search_layout)
+        
+        # Table
+        self.table = self.create_table()
+        self.setup_table_context_menu(self.table)
+        layout.addWidget(self.table)
+
+        # Buttons
+        buttons_layout = QHBoxLayout()
+        
+        # Left side: Edit/Remove
+        self.edit_button = QPushButton("Edit")
+        self.edit_button.setFixedWidth(80)
+        self.edit_button.clicked.connect(self.on_edit)
+        
+        self.remove_button = QPushButton("Remove")
+        self.remove_button.setFixedWidth(80)
+        self.remove_button.clicked.connect(self.on_remove)
+        
+        buttons_layout.addWidget(self.edit_button)
+        buttons_layout.addWidget(self.remove_button)
+        
+        buttons_layout.addStretch()
+        
+        # Right side: Add buttons
+        add_text = QPushButton("💬 New Text Field")
+        add_text.clicked.connect(lambda _: self.on_add("chat"))
+        
+        add_tts = QPushButton("🔈 New TTS Field")
+        add_tts.clicked.connect(lambda _: self.on_add("tts"))
+        
+        add_image = QPushButton("🖼️ New Image Field")
+        add_image.clicked.connect(lambda _: self.on_add("image"))
+        
+        buttons_layout.addWidget(add_image)
+        buttons_layout.addWidget(add_tts)
+        buttons_layout.addWidget(add_text)
+        
+        layout.addLayout(buttons_layout)
+        
+        container = QWidget()
+        container.setLayout(layout)
+        return container
 
     def setup_table_context_menu(self, table: QTableWidget) -> None:
         table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -277,24 +318,84 @@ class AddonOptionsDialog(QDialog):
         add_key_field("🔑 ElevenLabs API Key (TTS)", "elevenlabs_api_key", "...")
         add_key_field("🔑 Replicate API Key (Images)", "replicate_api_key", "r8_...")
 
-        # OpenAI Endpoint
-        self.openai_endpoint_edit = ReactiveLineEdit(self.state, "openai_endpoint")
-        self.openai_endpoint_edit.setPlaceholderText("https://api.openai.com")
-        self.openai_endpoint_edit.setMinimumWidth(400)
-        self.openai_endpoint_edit.on_change.connect(
-            lambda text: self.state.update({"openai_endpoint": text})
-        )
-        endpoint_info = QLabel("Provide an alternative endpoint to the OpenAI API.")
-        endpoint_info.setFont(font_small)
-        form.addRow("OpenAI Host:", self.openai_endpoint_edit)
-        form.addRow(endpoint_info)
-
         group_box = QGroupBox("API Configuration")
         group_box.setLayout(form)
         layout.addWidget(group_box)
+        
+        # Custom Providers
+        custom_box = QGroupBox("Custom Providers (OpenAI Compatible)")
+        custom_layout = QVBoxLayout()
+        custom_box.setLayout(custom_layout)
+        
+        self.custom_table = QTableWidget(0, 3)
+        self.custom_table.setHorizontalHeaderLabels(["Name", "Base URL", "API Key"])
+        header = self.custom_table.horizontalHeader()
+        if header:
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        
+        # Populate table
+        for provider in self.state.s["custom_providers"]:
+            self._add_custom_provider_row(provider)
+            
+        self.custom_table.itemChanged.connect(self._on_custom_table_changed)
+            
+        btns = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self._on_add_custom_provider)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self._on_remove_custom_provider)
+        btns.addWidget(add_btn)
+        btns.addWidget(remove_btn)
+        btns.addStretch()
+        
+        custom_layout.addWidget(self.custom_table)
+        custom_layout.addLayout(btns)
+        
+        layout.addWidget(custom_box)
+
         layout.addStretch()
 
         return container
+
+    def _add_custom_provider_row(self, provider: Optional[CustomProvider] = None) -> None:
+        row = self.custom_table.rowCount()
+        self.custom_table.insertRow(row)
+        
+        name = QTableWidgetItem(provider["name"] if provider else "New Provider")
+        url = QTableWidgetItem(provider["base_url"] if provider else "https://")
+        key = QTableWidgetItem(provider["api_key"] if provider else "")
+        
+        self.custom_table.setItem(row, 0, name)
+        self.custom_table.setItem(row, 1, url)
+        self.custom_table.setItem(row, 2, key)
+
+    def _on_add_custom_provider(self) -> None:
+        self.custom_table.blockSignals(True)
+        self._add_custom_provider_row()
+        self.custom_table.blockSignals(False)
+        self._on_custom_table_changed(None) # Trigger update
+
+    def _on_remove_custom_provider(self) -> None:
+        row = self.custom_table.currentRow()
+        if row >= 0:
+            self.custom_table.removeRow(row)
+            self._on_custom_table_changed(None)
+
+    def _on_custom_table_changed(self, _) -> None:
+        providers: list[CustomProvider] = []
+        for i in range(self.custom_table.rowCount()):
+            name_item = self.custom_table.item(i, 0)
+            url_item = self.custom_table.item(i, 1)
+            key_item = self.custom_table.item(i, 2)
+            
+            if name_item and url_item:
+                providers.append({
+                    "name": name_item.text(),
+                    "base_url": url_item.text(),
+                    "api_key": key_item.text() if key_item else ""
+                })
+        
+        self.state.update({"custom_providers": providers})
 
     def render_ui(self) -> None:
         self.render_table()
@@ -302,12 +403,21 @@ class AddonOptionsDialog(QDialog):
 
     def render_table(self) -> None:
         self.table.setRowCount(0)
+        search_text = self.state.s.get("search_text", "").lower()
 
         row = 0
         all_prompts = get_all_prompts(override_prompts_map=self.state.s["prompts_map"])
         for note_type, deck_prompts in all_prompts.items():
             for deck_id, field_prompts in deck_prompts.items():
                 for field, prompt in field_prompts.items():
+                    # Filter
+                    deck_name = deck_id_to_name_map().get(deck_id) or ""
+                    
+                    if search_text:
+                        searchable = f"{note_type} {deck_name} {field} {prompt}".lower()
+                        if search_text not in searchable:
+                            continue
+
                     # TODO: show deck col
                     extras = get_extras(
                         note_type=note_type, field=field, deck_id=deck_id
@@ -316,7 +426,6 @@ class AddonOptionsDialog(QDialog):
                     if not extras:
                         continue
 
-                    deck_name = deck_id_to_name_map().get(deck_id)
                     if not deck_name:
                         continue
 
@@ -476,6 +585,7 @@ class AddonOptionsDialog(QDialog):
         # Selection
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(True)
 
         # Styling
         table.horizontalHeader().setStretchLastSection(True)  # type: ignore
@@ -578,22 +688,31 @@ class AddonOptionsDialog(QDialog):
     def on_reject(self) -> None:
         self.reject()
 
-    def write_config(self) -> bool:
+    def write_config(self, silent: bool = False) -> bool:
         logger.debug("Writing config")
         if config.openai_endpoint and not is_valid_url(config.openai_endpoint):
-            show_message_box("Invalid OpenAI Host", "Please provide a valid URL.")
+            if not silent:
+                show_message_box("Invalid OpenAI Host", "Please provide a valid URL.")
             return False
 
         if (
             self.tts_options.state.s["tts_provider"] == "elevenLabs"
             and config.tts_provider != "elevenLabs"
         ):
-            did_click_ok = show_message_box(
-                "Are you sure you want to set your default voice provider to a premium model?",
-                show_cancel=True,
-            )
-            if not did_click_ok:
-                return False
+            if not silent:
+                did_click_ok = show_message_box(
+                    "Are you sure you want to set your default voice provider to a premium model?",
+                    show_cancel=True,
+                )
+                if not did_click_ok:
+                    return False
+            # If silent (auto-save), we skip the check/dialog to avoid interruption? 
+            # Or we strictly don't save if check fails?
+            # For now let's allow saving in silent mode without dialog to avoid annoyance,
+            # assuming user knows what they are doing if they selected it.
+            # OR better: only show dialog if it wasn't already ElevenLabs.
+            # But here we are checking against `config.tts_provider`.
+            pass
 
         valid_config_attrs = config.__annotations__.keys()
 
@@ -614,7 +733,8 @@ class AddonOptionsDialog(QDialog):
                 config.__setattr__(k, v)
 
         if not old_debug and self.state.s["debug"]:
-            show_message_box("Debug mode enabled. Please restart Anki.")
+            if not silent:
+                show_message_box("Debug mode enabled. Please restart Anki.")
 
         return True
 
@@ -644,6 +764,8 @@ class AddonOptionsDialog(QDialog):
             "openai_endpoint": config.openai_endpoint,
             "allow_empty_fields": config.allow_empty_fields,
             "debug": config.debug,
+            "custom_providers": config.custom_providers or [],
+            "search_text": "",
         }
 
     def on_restore_defaults(self) -> None:

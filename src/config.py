@@ -31,6 +31,7 @@ from .models import (
     DEFAULT_EXTRAS,
     ChatModels,
     ChatProviders,
+    CustomProvider,
     ImageModels,
     ImageProviders,
     ImageAspectRatio,
@@ -39,6 +40,7 @@ from .models import (
     OpenAIModels,
     OpenAIReasoningEffort,
     PromptMap,
+    ProviderSettings,
     TTSModels,
     TTSProviders,
 )
@@ -55,6 +57,9 @@ class Config:
     google_api_key: Optional[str]
     elevenlabs_api_key: Optional[str]
     replicate_api_key: Optional[str]
+
+    custom_providers: list[CustomProvider]
+    provider_settings: dict[str, ProviderSettings]
 
     prompts_map: PromptMap
     generate_at_review: bool

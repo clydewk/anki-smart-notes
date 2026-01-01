@@ -23,13 +23,17 @@ from typing import Any, Literal, Optional, TypedDict, Union, cast
 from anki.decks import DeckId
 from anki.notes import Note
 from aqt import (
+    QAction,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpacerItem,
     Qt,
@@ -41,6 +45,7 @@ from aqt import (
     QWidget,
     mw,
 )
+from aqt.qt import QCursor
 
 from ..config import config, key_or_config_val
 from ..constants import API_KEY_MISSING_MESSAGE, GLOBAL_DECK_ID
@@ -252,7 +257,6 @@ class PromptDialog(QDialog):
 
     def render_ui(self) -> None:
         self.render_buttons()
-        self.render_valid_fields()
         self.render_automatic_button()
 
     def render_main_tab(self) -> QWidget:
@@ -284,25 +288,15 @@ class PromptDialog(QDialog):
 
         self.setWindowTitle(text["title"][field_type])
 
+        # 1. Settings Area
+        settings_group = QGroupBox("Settings")
+        form_layout = QFormLayout()
+        
         self.note_combo_box = ReactiveComboBox(
             self.state, "note_types", "selected_note_type"
         )
-        card_label = QLabel("Note Type")
-        card_label.setFont(font_bold)
-        card_explanation = QLabel(text["explanation"][field_type])
-        card_explanation.setFont(font_small)
-        layout.addWidget(card_label)
-        layout.addWidget(self.note_combo_box)
-        layout.addWidget(card_explanation)
-        layout.addSpacerItem(QSpacerItem(0, 20))
+        form_layout.addRow("Note Type:", self.note_combo_box)
 
-        deck_label = QLabel("Deck")
-        deck_label.setFont(font_bold)
-        self.deck_subtitle = QLabel(
-            "Optionally apply this field only to a specific deck (useful for sharing note types between decks)."
-        )
-        self.deck_subtitle.setMaximumWidth(500)
-        self.deck_subtitle.setFont(font_small)
         self.deck_combo_box = ReactiveComboBox(
             self.state,
             "decks",
@@ -310,47 +304,35 @@ class PromptDialog(QDialog):
             render_map={str(k): v for k, v in deck_id_to_name_map().items()},
             int_keys=True,
         )
-        layout.addWidget(deck_label)
-        layout.addWidget(self.deck_combo_box)
-        layout.addWidget(self.deck_subtitle)
-        layout.addSpacerItem(QSpacerItem(0, 20))
+        self.deck_combo_box.setToolTip(
+            "Optionally apply this field only to a specific deck (useful for sharing note types between decks)."
+        )
+        form_layout.addRow("Deck:", self.deck_combo_box)
 
         if self.state.s["type"] == "tts":
             self.tts_source_combo_box = ReactiveComboBox(
                 self.state, "tts_source_fields", "selected_tts_source_field"
             )
             self.tts_source_combo_box.on_change.connect(self.on_source_changed)
-            source_label = QLabel("Source Field")
-            source_label.setFont(font_bold)
-            source_explainer = QLabel("The field that will be spoken (helper to insert tag).")
-            source_explainer.setFont(font_small)
-            layout.addWidget(source_label)
-            layout.addWidget(self.tts_source_combo_box)
-            layout.addWidget(source_explainer)
-            layout.addItem(QSpacerItem(0, 20))
+            self.tts_source_combo_box.setToolTip("The field that will be spoken.")
+            form_layout.addRow("Source Field:", self.tts_source_combo_box)
 
         self.field_combo_box = ReactiveComboBox(
             self.state, "note_fields", "selected_note_field"
         )
-        field_label = QLabel(text["destination"][field_type])
-        field_label.setFont(font_bold)
-        field_explanation = QLabel(text["destination_explanation"][field_type])
-        field_explanation.setFont(font_small)
-        layout.addWidget(field_label)
-        layout.addWidget(self.field_combo_box)
-        layout.addWidget(field_explanation)
-        layout.addSpacerItem(QSpacerItem(0, 20))
+        self.field_combo_box.setToolTip(text["destination_explanation"][field_type])
+        form_layout.addRow("Target Field:", self.field_combo_box)
+        
+        settings_group.setLayout(form_layout)
+        layout.addWidget(settings_group)
 
-        self.test_button = QPushButton("✨ Test Smart Field ✨")
-
-        text_only_container = QWidget()
-        text_only_layout = QVBoxLayout()
-        text_only_container.setLayout(text_only_layout)
-        text_only_layout.setContentsMargins(0, 0, 0, 0)
+        # 2. Prompting Area
+        prompt_group = QGroupBox("Prompt Generation")
+        prompt_layout = QVBoxLayout()
         
         # Style Instructions for Gemini TTS
         if self.state.s["type"] == "tts":
-            style_label = QLabel("Style Instructions (Gemini Only)")
+            style_label = QLabel("Style Instructions (Gemini Only):")
             style_label.setFont(font_bold)
             self.tts_style_box = ReactiveEditText(self.state, "tts_style")
             self.tts_style_box.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -359,16 +341,28 @@ class PromptDialog(QDialog):
                 QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
             )
             self.tts_style_box.setPlaceholderText('e.g. "Read aloud in a warm and friendly tone: "')
-            self.tts_style_box.setMaximumHeight(60)
+            self.tts_style_box.setMinimumHeight(60)
+            self.tts_style_box.setMaximumHeight(80)
             self.tts_style_box.on_change.connect(lambda text: self.state.update({"tts_style": text}))
             
-            text_only_layout.addWidget(style_label)
-            text_only_layout.addWidget(self.tts_style_box)
-            text_only_layout.addWidget(QLabel("Instructions for Gemini TTS models. Ignored by other providers."))
-            text_only_layout.addSpacerItem(QSpacerItem(0, 12))
+            prompt_layout.addWidget(style_label)
+            prompt_layout.addWidget(self.tts_style_box)
+            prompt_layout.addSpacing(12)
 
+        # Prompt Label + Insert Button
+        prompt_label_layout = QHBoxLayout()
         prompt_label = QLabel("Prompt / Text to Speak")
         prompt_label.setFont(font_bold)
+        prompt_label_layout.addWidget(prompt_label)
+        prompt_label_layout.addStretch()
+        
+        insert_btn = QPushButton("Insert Field ➕")
+        insert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        insert_btn.clicked.connect(self.show_insert_field_menu)
+        prompt_label_layout.addWidget(insert_btn)
+        
+        prompt_layout.addLayout(prompt_label_layout)
+
         self.prompt_text_box = ReactiveEditText(self.state, "prompt")
         self.prompt_text_box.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.prompt_text_box.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
@@ -378,32 +372,25 @@ class PromptDialog(QDialog):
         
         current_explanation = tts_explanation if field_type == "tts" else explanation
         self.prompt_text_box.setPlaceholderText(current_explanation)
+        self.prompt_text_box.setMinimumHeight(120)
         
-        self.valid_fields = QLabel("")
-        self.valid_fields.setMinimumWidth(500)
-        size_policy = QSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
-        )
-        size_policy.setHorizontalStretch(1)
-        self.valid_fields.setSizePolicy(size_policy)
-        self.valid_fields.setWordWrap(True)
-        small_font = self.valid_fields.font()
-        small_font.setPointSize(10)
-        self.valid_fields.setFont(small_font)
+        prompt_layout.addWidget(self.prompt_text_box)
+        prompt_group.setLayout(prompt_layout)
+        layout.addWidget(prompt_group)
 
-        self.setLayout(layout)
-        text_only_layout.addWidget(prompt_label)
-        text_only_layout.addWidget(self.prompt_text_box)
-        text_only_layout.addWidget(self.valid_fields)
-        layout.addWidget(text_only_container)
-        layout.addSpacerItem(QSpacerItem(0, 12))
-
-        layout.addWidget(self.test_button)
-        layout.addSpacerItem(
-            QSpacerItem(
-                0, 0, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-            )
-        )
+        # 3. Footer
+        self.test_button = QPushButton("✨ Test Smart Field ✨")
+        self.test_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        footer_layout = QHBoxLayout()
+        
+        # Enabled Box with tooltip explanation
+        self.enabled_box.setToolTip("Enable or disable this field. Disabled fields can be generated via right clicking a field in the editor.")
+        footer_layout.addWidget(self.enabled_box)
+        footer_layout.addStretch()
+        footer_layout.addWidget(self.test_button)
+        
+        layout.addLayout(footer_layout)
 
         self.state.state_changed.connect(self.render_ui)
         self.note_combo_box.on_change.connect(self._on_new_card_type_selected)
@@ -414,19 +401,6 @@ class PromptDialog(QDialog):
         )
 
         self.test_button.clicked.connect(self.on_test)
-
-        field_options = QGroupBox()
-        field_layout = QVBoxLayout()
-        field_options.setLayout(field_layout)
-        automatic_explanation = QLabel(
-            "Enable or disable this field. Disabled fields can be generated via right clicking a field in the editor."
-        )
-        automatic_explanation.setFont(font_small)
-        field_layout.addWidget(self.enabled_box)
-        field_layout.addWidget(automatic_explanation)
-
-        layout.addItem(QSpacerItem(0, 24))
-        layout.addWidget(field_options)
 
         # On small screens, make it a proportion of screen height. Otherwise set a fixed height
         FIXED_HEIGHT = 800
@@ -444,8 +418,33 @@ class PromptDialog(QDialog):
             self.field_combo_box.setEnabled(False)
             self.deck_combo_box.setEnabled(False)
             if hasattr(self, "tts_source_combo_box"):
-                self.tts_source_combo_box.setEnabled(False) # Source field selector is helper, maybe allow changing? But for now keep rigid for consistency if mode is edit
+                self.tts_source_combo_box.setEnabled(False) 
         return container
+
+    def show_insert_field_menu(self):
+        menu = QMenu(self)
+        fields = get_valid_fields_for_prompt(
+            selected_note_type=self.state.s["selected_note_type"],
+            selected_note_field=self.state.s["selected_note_field"],
+            deck_id=self.state.s["selected_deck"],
+            prompts_map=self.prompts_map,
+        )
+        
+        if not fields:
+            no_fields = QAction("No fields available", self)
+            no_fields.setEnabled(False)
+            menu.addAction(no_fields)
+        else:
+            for field in fields:
+                action = QAction(field, self)
+                action.triggered.connect(lambda _, f=field: self.insert_field_token(f))
+                menu.addAction(action)
+            
+        menu.exec(QCursor.pos())
+
+    def insert_field_token(self, field: str):
+        self.prompt_text_box.insertPlainText(f"{{{{{field}}}}}")
+        self.prompt_text_box.setFocus()
 
     def render_options_tab(self) -> QWidget:
         models_layout = default_form_layout()
@@ -464,9 +463,10 @@ class PromptDialog(QDialog):
         self.regenerate_batch_checkbox = ReactiveCheckBox(
             self.state, "regenerate_when_batching"
         )
-        models_layout.addRow(
-            "Regenerate when batch processing:", self.regenerate_batch_checkbox
-        )
+        
+        batch_label = QLabel("Regenerate when batch processing:")
+        models_layout.addRow(batch_label, self.regenerate_batch_checkbox)
+        
         batch_desc = QLabel(
             "If checked, this field always overwrites its value during batch generation."
         )
@@ -852,15 +852,7 @@ class PromptDialog(QDialog):
         self.enabled_box.setChecked(self.state.s["generate_automatically"])
 
     def render_valid_fields(self) -> None:
-        fields = get_valid_fields_for_prompt(
-            selected_note_type=self.state.s["selected_note_type"],
-            selected_note_field=self.state.s["selected_note_field"],
-            deck_id=self.state.s["selected_deck"],
-            prompts_map=self.prompts_map,
-        )
-        fields = ["{{" + field + "}}" for field in fields]
-        text = f"Valid fields to include in prompt: {', '.join(fields)}"
-        self.valid_fields.setText(text)
+        pass # Replaced by Insert button
 
     def _get_valid_target_fields(
         self,

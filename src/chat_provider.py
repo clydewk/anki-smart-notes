@@ -34,6 +34,7 @@ from .logger import logger
 from .models import (
     ChatModels,
     ChatProviders,
+    CustomProvider,
     OpenAIReasoningEffort,
     openai_reasoning_efforts_for_model,
 )
@@ -55,6 +56,20 @@ class ChatProvider:
         reasoning_effort: Optional[OpenAIReasoningEffort] = None,
         retry_count: int = 0,
     ) -> str:
+        # Check custom providers
+        custom_provider = next(
+            (p for p in (config.custom_providers or []) if p["name"] == provider), None
+        )
+        if custom_provider:
+            return await self._get_openai_compatible_response(
+                prompt,
+                model,
+                temperature,
+                reasoning_effort,
+                retry_count,
+                custom_provider,
+            )
+
         if provider == "openai":
             return await self._get_openai_response(
                 prompt, model, temperature, reasoning_effort, retry_count
@@ -73,6 +88,63 @@ class ChatProvider:
             )
         else:
             raise ValueError(f"Unknown provider: {provider}")
+
+    async def _get_openai_compatible_response(
+        self,
+        prompt: str,
+        model: str,
+        temperature: float,
+        reasoning_effort: Optional[OpenAIReasoningEffort],
+        retry_count: int,
+        provider_config: CustomProvider,
+    ) -> str:
+        api_key = provider_config["api_key"]
+        base_url = provider_config["base_url"]
+        
+        # Ensure base_url ends with v1/chat/completions if not present?
+        # Standard OpenAI compatible usually requires the full URL or base? 
+        # The user input "Base URL" usually implies the root. 
+        # But for OpenAI it is https://api.openai.com/v1/chat/completions.
+        # If user puts "http://localhost:11434/v1", we might need to append /chat/completions?
+        # Let's assume user provides the FULL endpoint URL for simplicity and maximum flexibility,
+        # OR we try to be smart.
+        # Let's assume it IS the endpoint for chat completions.
+        url = base_url
+        
+        logger.debug(
+            f"Custom Provider {provider_config['name']}: hitting {url} model: {model} retries {retry_count}"
+        )
+
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+        }
+        
+        # Pass reasoning effort if set? Most compatible providers probably ignore it or use temperature.
+        if reasoning_effort and reasoning_effort != "none":
+             payload["reasoning_effort"] = reasoning_effort
+             # Some might error if both are sent, similar to OpenAI logic
+             if "temperature" in payload:
+                 del payload["temperature"]
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        return await self._execute_request(
+            url=url,
+            headers=headers,
+            json_payload=payload,
+            timeout_sec=CHAT_CLIENT_TIMEOUT_SEC,
+            retry_count=retry_count,
+            provider=provider_config["name"],
+            prompt=prompt,
+            model=model,  # type: ignore
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+        )
 
     async def _get_openai_response(
         self,
