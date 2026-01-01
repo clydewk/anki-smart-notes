@@ -542,7 +542,9 @@ class PromptDialog(QDialog):
                 self.image_options = ImageOptions(
                     {
                         "image_model": extras.get("image_model"),
-                        "image_provider": "replicate",
+                        "image_provider": extras.get("image_provider"),
+                        "image_aspect_ratio": extras.get("image_aspect_ratio"),
+                        "image_resolution": extras.get("image_resolution"),
                     }
                 )
             return self.image_options

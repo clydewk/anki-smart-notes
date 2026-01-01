@@ -138,9 +138,10 @@ SmartFieldType = Literal["chat", "tts", "image"]
 
 ReplicateImageModels = Literal["flux-dev", "flux-schnell"]
 GoogleImageModels = Literal["gemini-3-pro-image-preview"]
-ImageModels = Union[ReplicateImageModels, GoogleImageModels]
+OpenAIImageModels = Literal["gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini", "dall-e-3"]
+ImageModels = Union[ReplicateImageModels, GoogleImageModels, OpenAIImageModels]
 
-ImageProviders = Literal["replicate", "google"]
+ImageProviders = Literal["replicate", "google", "openai"]
 ImageAspectRatio = Literal["1:1", "16:9", "4:3", "3:4", "9:16"]
 ImageResolution = Literal["1024x1024", "2048x2048"] # Simplified
 
