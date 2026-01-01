@@ -95,6 +95,12 @@ Your prompt may reference other fields via {{double curly braces}}. Valid fields
 Test out your prompt with the test button before saving it!
 """
 
+tts_explanation = """Write text to be spoken, or include the field to speak.
+
+You can use {{double curly braces}} to reference fields.
+Example: "{{Front}}" or "Hello {{Front}}"
+"""
+
 
 class State(TypedDict):
     prompt: str
@@ -112,6 +118,8 @@ class State(TypedDict):
 
     selected_deck: DeckId
     decks: list[DeckId]
+    regenerate_when_batching: bool
+    tts_style: str
 
 
 class PartialState(TypedDict):
@@ -122,10 +130,12 @@ class PartialState(TypedDict):
     selected_tts_source_field: str
     selected_note_type: str
     selected_deck: DeckId
+    tts_style: str
 
 
 class PromptDialog(QDialog):
     prompt_text_box: QTextEdit
+    tts_style_box: QTextEdit
     test_button: QPushButton
     valid_fields: QLabel
     note_combo_box: QComboBox
@@ -204,6 +214,7 @@ class PromptDialog(QDialog):
             # tts
             "tts_source_fields": default_note_state["tts_source_fields"],
             "selected_tts_source_field": selected_tts_source_field,
+            "tts_style": extras.get("tts_style") or "",
             # target fields
             "note_fields": target_fields,
             "selected_note_field": selected_target_field,
@@ -214,6 +225,7 @@ class PromptDialog(QDialog):
             "type": field_type,
             "generate_automatically": extras["automatic"],
             "use_custom_model": extras["use_custom_model"],
+            "regenerate_when_batching": extras.get("regenerate_when_batching", False),
         }
         self.state = StateManager[State](initial_state)
 
@@ -310,7 +322,7 @@ class PromptDialog(QDialog):
             self.tts_source_combo_box.on_change.connect(self.on_source_changed)
             source_label = QLabel("Source Field")
             source_label.setFont(font_bold)
-            source_explainer = QLabel("The field that will be spoken.")
+            source_explainer = QLabel("The field that will be spoken (helper to insert tag).")
             source_explainer.setFont(font_small)
             layout.addWidget(source_label)
             layout.addWidget(self.tts_source_combo_box)
@@ -335,9 +347,27 @@ class PromptDialog(QDialog):
         text_only_layout = QVBoxLayout()
         text_only_container.setLayout(text_only_layout)
         text_only_layout.setContentsMargins(0, 0, 0, 0)
-        text_only_container.setHidden(self.state.s["type"] == "tts")
+        
+        # Style Instructions for Gemini TTS
+        if self.state.s["type"] == "tts":
+            style_label = QLabel("Style Instructions (Gemini Only)")
+            style_label.setFont(font_bold)
+            self.tts_style_box = ReactiveEditText(self.state, "tts_style")
+            self.tts_style_box.setAlignment(Qt.AlignmentFlag.AlignTop)
+            self.tts_style_box.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+            self.tts_style_box.setWordWrapMode(
+                QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+            )
+            self.tts_style_box.setPlaceholderText('e.g. "Read aloud in a warm and friendly tone: "')
+            self.tts_style_box.setMaximumHeight(60)
+            self.tts_style_box.on_change.connect(lambda text: self.state.update({"tts_style": text}))
+            
+            text_only_layout.addWidget(style_label)
+            text_only_layout.addWidget(self.tts_style_box)
+            text_only_layout.addWidget(QLabel("Instructions for Gemini TTS models. Ignored by other providers."))
+            text_only_layout.addSpacerItem(QSpacerItem(0, 12))
 
-        prompt_label = QLabel("Prompt")
+        prompt_label = QLabel("Prompt / Text to Speak")
         prompt_label.setFont(font_bold)
         self.prompt_text_box = ReactiveEditText(self.state, "prompt")
         self.prompt_text_box.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -345,7 +375,10 @@ class PromptDialog(QDialog):
         self.prompt_text_box.setWordWrapMode(
             QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
         )
-        self.prompt_text_box.setPlaceholderText(explanation)
+        
+        current_explanation = tts_explanation if field_type == "tts" else explanation
+        self.prompt_text_box.setPlaceholderText(current_explanation)
+        
         self.valid_fields = QLabel("")
         self.valid_fields.setMinimumWidth(500)
         size_policy = QSizePolicy(
@@ -411,7 +444,7 @@ class PromptDialog(QDialog):
             self.field_combo_box.setEnabled(False)
             self.deck_combo_box.setEnabled(False)
             if hasattr(self, "tts_source_combo_box"):
-                self.tts_source_combo_box.setEnabled(False)
+                self.tts_source_combo_box.setEnabled(False) # Source field selector is helper, maybe allow changing? But for now keep rigid for consistency if mode is edit
         return container
 
     def render_options_tab(self) -> QWidget:
@@ -428,6 +461,17 @@ class PromptDialog(QDialog):
         override_layout.addWidget(self.custom_model)
         models_layout.addWidget(override_box)
         models_layout.addWidget(self.model_options)
+        self.regenerate_batch_checkbox = ReactiveCheckBox(
+            self.state, "regenerate_when_batching"
+        )
+        models_layout.addRow(
+            "Regenerate when batch processing:", self.regenerate_batch_checkbox
+        )
+        batch_desc = QLabel(
+            "If checked, this field always overwrites its value during batch generation."
+        )
+        batch_desc.setFont(font_small)
+        models_layout.addRow(batch_desc)
         model_box = QGroupBox("⚙️ Model Settings")
         model_box.setEnabled(True)
 
@@ -476,6 +520,7 @@ class PromptDialog(QDialog):
                         "tts_voice": extras.get("tts_voice"),
                         "tts_model": extras.get("tts_model"),
                         "tts_strip_html": extras.get("tts_strip_html"),
+                        "tts_style": extras.get("tts_style"),
                     }
                 )
             return self.tts_options
@@ -504,6 +549,22 @@ class PromptDialog(QDialog):
 
         # Should never get here
         return QWidget()
+
+    def _sync_regenerate_flag(self) -> None:
+        extras = get_extras(
+            note_type=self.state.s["selected_note_type"],
+            field=self.state.s["selected_note_field"],
+            deck_id=self.state.s["selected_deck"],
+            prompts=self.prompts_map,
+            fallback_to_global_deck=True,
+        )
+        self.state.update(
+            {
+                "regenerate_when_batching": extras.get("regenerate_when_batching", False)
+                if extras
+                else False
+            }
+        )
 
     def on_state_update(self):
         self.model_options.setEnabled(self.state.s["use_custom_model"])
@@ -542,6 +603,7 @@ class PromptDialog(QDialog):
             "note_fields": target_fields,
             "tts_source_fields": source_fields,
             "selected_tts_source_field": source_field,
+            "tts_style": "",
         }
 
     def _on_new_card_type_selected(self, note_type: str) -> None:
@@ -551,6 +613,7 @@ class PromptDialog(QDialog):
         self.state.update(cast("dict[str, Any]", new_state))
         # Force re-layout every time
         self.adjustSize()
+        self._sync_regenerate_flag()
 
     def on_deck_selected(self, deck: str) -> None:
         # Dumb hack bc of leaky abstraction reactive combo box + int keys
@@ -561,6 +624,7 @@ class PromptDialog(QDialog):
         )
 
         self.state.update(cast("dict[str, Any]", new_state))
+        self._sync_regenerate_flag()
 
     def on_source_changed(self, source: str) -> None:
         self.state.update({"prompt": self.get_tts_prompt(source)})
@@ -585,6 +649,7 @@ class PromptDialog(QDialog):
                 "selected_note_field": field,
             }
         )
+        self._sync_regenerate_flag()
 
     def render_buttons(self) -> None:
         is_enabled = (
@@ -736,8 +801,14 @@ class PromptDialog(QDialog):
         elif self.state.s["type"] == "tts":
 
             def tts_fn():
+                # Manually inject style for test
+                prompt_to_use = prompt
+                style = self.state.s.get("tts_style")
+                if style and "gemini" in tts_model and tts_provider == "google":
+                    prompt_to_use = f"{style} {prompt}"
+
                 return self.processor.field_processor.get_tts_response(
-                    input_text=prompt,
+                    input_text=prompt_to_use,
                     note=sample_note,
                     provider=tts_provider,
                     model=tts_model,
@@ -887,6 +958,13 @@ class PromptDialog(QDialog):
 
     def _create_new_prompts_map(self) -> PromptMap:
         s = self.state.s
+        
+        # Inject style into the tts_options that gets passed down
+        tts_options = cast(
+            "OverrideableTTSOptionsDict",
+            {k: self.tts_options.state.s[k] for k in overridable_tts_options},
+        )
+        tts_options["tts_style"] = s.get("tts_style")
 
         return add_or_update_prompts(
             prompts_map=self.prompts_map,
@@ -897,16 +975,14 @@ class PromptDialog(QDialog):
             is_automatic=s["generate_automatically"],
             is_custom_model=s["use_custom_model"],
             type=s["type"],
-            tts_options=cast(
-                "OverrideableTTSOptionsDict",
-                {k: self.tts_options.state.s[k] for k in overridable_tts_options},
-            ),
+            tts_options=tts_options,
             chat_options={
                 k: self.chat_options.state.s[k] for k in overridable_chat_options
             },
             image_options={
                 k: self.image_options.state.s[k] for k in overridable_image_options
             },
+            regenerate_when_batching=self.state.s["regenerate_when_batching"],
         )
 
 

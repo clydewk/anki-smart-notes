@@ -22,7 +22,7 @@ from typing import Literal, Optional, TypedDict, Union
 # Providers
 
 TTSProviders = Literal["openai", "elevenLabs", "google", "azure"]
-ChatProviders = Literal["openai", "anthropic", "deepseek"]
+ChatProviders = Literal["openai", "anthropic", "deepseek", "google"]
 
 # Chat Models
 
@@ -39,7 +39,9 @@ DeepseekModels = Literal["deepseek-v3"]
 AnthropicModels = Literal[
     "claude-3-5-haiku-latest", "claude-sonnet-4-0", "claude-opus-4-1"
 ]
-ChatModels = Union[OpenAIModels, AnthropicModels, DeepseekModels]
+GoogleChatModels = Literal["gemini-3-pro-preview", "gemini-3-flash-preview"]
+
+ChatModels = Union[OpenAIModels, AnthropicModels, DeepseekModels, GoogleChatModels]
 
 # Order that the models are displayed in the UI
 openai_chat_models: list[ChatModels] = [
@@ -59,10 +61,13 @@ anthropic_chat_models: list[ChatModels] = [
 
 deepseek_chat_models: list[ChatModels] = ["deepseek-v3"]
 
+google_chat_models: list[ChatModels] = ["gemini-3-flash-preview", "gemini-3-pro-preview"]
+
 provider_model_map: dict[ChatProviders, list[ChatModels]] = {
     "openai": openai_chat_models,
     "anthropic": anthropic_chat_models,
     "deepseek": deepseek_chat_models,
+    "google": google_chat_models,
 }
 
 
@@ -110,7 +115,7 @@ def openai_reasoning_efforts_for_model(model: str) -> list[OpenAIReasoningEffort
 
 OpenAITTSModels = Literal["tts-1"]
 ElevenTTSModels = Literal["eleven_multilingual_v2"]
-GoogleModels = Literal["standard", "wavenet", "neural"]
+GoogleModels = Literal["standard", "wavenet", "neural", "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"]
 AzureModels = Literal["standard", "neural"]
 TTSModels = Union[OpenAITTSModels, ElevenTTSModels, GoogleModels, AzureModels]
 
@@ -156,12 +161,14 @@ class FieldExtras(TypedDict):
     tts_model: Optional[TTSModels]
     tts_voice: Optional[str]
     tts_strip_html: Optional[bool]
+    tts_style: Optional[str]
 
     # Images
     image_provider: Optional[ImageProviders]
     image_model: Optional[ImageModels]
     image_aspect_ratio: Optional[ImageAspectRatio]
     image_resolution: Optional[ImageResolution]
+    regenerate_when_batching: bool
 
 
 # Any non-mandatory fields should default to none, and will be displayed from global config instead
@@ -180,11 +187,13 @@ DEFAULT_EXTRAS: FieldExtras = {
     "tts_provider": None,
     "tts_voice": None,
     "tts_strip_html": None,
+    "tts_style": None,
     # Overridable Image Options
     "image_provider": None,
     "image_model": None,
     "image_aspect_ratio": None,
     "image_resolution": None,
+    "regenerate_when_batching": False,
 }
 
 
@@ -229,6 +238,7 @@ OverridableTTSOptions = Union[
     Literal["tts_provider"],
     Literal["tts_voice"],
     Literal["tts_strip_html"],
+    Literal["tts_style"],
 ]
 
 overridable_tts_options: list[OverridableTTSOptions] = [
@@ -236,6 +246,7 @@ overridable_tts_options: list[OverridableTTSOptions] = [
     "tts_provider",
     "tts_voice",
     "tts_strip_html",
+    "tts_style",
 ]
 
 
@@ -244,6 +255,7 @@ class OverrideableTTSOptionsDict(TypedDict):
     tts_provider: Optional[TTSProviders]
     tts_voice: Optional[str]
     tts_strip_html: Optional[bool]
+    tts_style: Optional[str]
 
 
 OverridableImageOptions = Union[

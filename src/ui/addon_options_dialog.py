@@ -242,7 +242,7 @@ class AddonOptionsDialog(QDialog):
             prompt_item = self.table.item(row, 4)
             prompt_text = prompt_item.text() if prompt_item else ""
 
-            if prompt_text and prompt_text != TTS_PROMPT_STUB_VALUE:
+            if prompt_text:
                 menu = QMenu(self)
                 copy_action = QAction("Copy Prompt", self)
 
@@ -258,9 +258,9 @@ class AddonOptionsDialog(QDialog):
         container = QWidget()
         layout = QVBoxLayout()
         container.setLayout(layout)
-        
+
         form = default_form_layout()
-        
+
         def add_key_field(label: str, key: str, placeholder: str):
             edit = ReactiveLineEdit(self.state, key)  # type: ignore
             edit.setPlaceholderText(placeholder)
@@ -273,7 +273,7 @@ class AddonOptionsDialog(QDialog):
         add_key_field("🔑 OpenAI API Key", "openai_api_key", "sk-proj-...")
         add_key_field("🔑 Anthropic API Key", "anthropic_api_key", "sk-ant-...")
         add_key_field("🔑 DeepSeek API Key", "deepseek_api_key", "sk-...")
-        add_key_field("🔑 Google Cloud API Key (TTS)", "google_api_key", "AIzaSy...")
+        add_key_field("🔑 Google API Key (Gemini/TTS)", "google_api_key", "AIzaSy...")
         add_key_field("🔑 ElevenLabs API Key (TTS)", "elevenlabs_api_key", "...")
         add_key_field("🔑 Replicate API Key (Images)", "replicate_api_key", "r8_...")
 
@@ -332,7 +332,7 @@ class AddonOptionsDialog(QDialog):
                         QTableWidgetItem(
                             {
                                 "chat": f"{prompt}",
-                                "tts": TTS_PROMPT_STUB_VALUE,
+                                "tts": f"{prompt}",
                                 "image": f"{prompt}",
                             }[type]
                         ),

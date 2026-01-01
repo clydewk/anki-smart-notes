@@ -174,6 +174,7 @@ def add_or_update_prompts(
     tts_options: OverrideableTTSOptionsDict,
     chat_options: dict[OverridableChatOptions, Any],
     image_options: dict[OverridableImageOptions, Any],
+    regenerate_when_batching: bool,
 ) -> PromptMap:
     new_prompts_map = deepcopy(prompts_map)
 
@@ -233,6 +234,9 @@ def add_or_update_prompts(
             + overridable_image_options
         ):
             extras[k] = None
+
+    # Regenerate field during batch processing if requested
+    extras["regenerate_when_batching"] = regenerate_when_batching
 
     # Write em out
     new_prompts_map["note_types"][note_type][str(deck_id)]["extras"][field] = extras

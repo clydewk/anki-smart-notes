@@ -19,6 +19,8 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio
 import base64
+import io
+import wave
 from typing import Optional
 
 import aiohttp
@@ -49,7 +51,11 @@ class TTSProvider:
         elif provider == "elevenLabs":
             return await self._get_elevenlabs_tts(text, model, voice)
         elif provider == "google":
-            return await self._get_google_tts(text, model, voice)
+            # Check if using new Gemini models or old ones
+            if "gemini" in model:
+                return await self._get_google_gemini_tts(text, model, voice)
+            else:
+                return await self._get_google_tts(text, model, voice)
         elif provider == "azure":
             raise NotImplementedError("Azure TTS is not currently supported in BYOK mode.")
         else:
@@ -125,5 +131,60 @@ class TTSProvider:
                 response.raise_for_status()
                 data = await response.json()
                 return base64.b64decode(data["audioContent"])
+
+    async def _get_google_gemini_tts(self, text: str, model: str, voice: str) -> bytes:
+        api_key = config.google_api_key
+        if not api_key:
+            raise Exception("Google API key not found.")
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        
+        payload = {
+            "contents": [{
+                "parts":[{
+                    "text": text
+                }]
+            }],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {
+                            "voiceName": voice
+                        }
+                    }
+                }
+            }
+        }
+        
+        headers = {"Content-Type": "application/json"}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, headers=headers, json=payload, timeout=TTS_PROVIDER_TIMEOUT_SEC
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                # Extract audio data
+                # Structure: candidates[0].content.parts[0].inlineData.data
+                try:
+                    inline_data = data["candidates"][0]["content"]["parts"][0]["inlineData"]
+                    audio_b64 = inline_data["data"]
+                    pcm_data = base64.b64decode(audio_b64)
+                    
+                    # Convert raw PCM to WAV
+                    wav_buffer = io.BytesIO()
+                    with wave.open(wav_buffer, "wb") as wav_file:
+                        wav_file.setnchannels(1)  # Mono
+                        wav_file.setsampwidth(2)  # 16-bit
+                        wav_file.setframerate(24000)  # 24kHz
+                        wav_file.writeframes(pcm_data)
+                    
+                    return wav_buffer.getvalue()
+                    
+                except (KeyError, IndexError):
+                    logger.error(f"Unexpected response format from Google Gemini TTS: {data}")
+                    raise Exception("Failed to extract audio from Google Gemini response")
 
 tts_provider = TTSProvider()

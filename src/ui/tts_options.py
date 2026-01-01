@@ -268,8 +268,43 @@ def get_azure_voices() -> list[TTSMeta]:
     return voices
 
 
+def get_gemini_voices() -> list[TTSMeta]:
+    gemini_voice_names = [
+        "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe",
+        "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome",
+        "Algenib", "Rasalgethi", "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux",
+        "Pulcherrima", "Achird", "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat"
+    ]
+    voices: list[TTSMeta] = []
+    # Only adding Flash for now to avoid cluttering the UI too much, users can override model if needed?
+    # No, to allow easy selection, I should probably add both or just Flash as default.
+    # But wait, selection forces model. So I must add both if I want both selectable via voice list.
+    # The user can override model in "Model Settings" tab (which calls render_custom_model -> TTSOptions with specific args).
+    # But for default settings...
+    # I'll add both.
+    
+    models: list[tuple[str, PriceTiers]] = [
+        ("gemini-2.5-flash-preview-tts", "low"),
+        ("gemini-2.5-pro-preview-tts", "standard")
+    ]
+    
+    for name in gemini_voice_names:
+        for model, tier in models:
+            friendly_model = "Flash" if "flash" in model else "Pro"
+            voices.append({
+                "tts_provider": "google",
+                "voice": name,
+                "model": model,
+                "friendly_voice": f"{name} (Gemini {friendly_model})",
+                "gender": "All",
+                "language": ALL, 
+                "price_tier": tier
+            })
+    return voices
+
+
 # Combine all voices
-voices = get_google_voices() + openai_voices + get_eleven_voices() + get_azure_voices()
+voices = get_google_voices() + openai_voices + get_eleven_voices() + get_azure_voices() + get_gemini_voices()
 
 languages: list[str] = [ALL] + sorted({voice["language"] for voice in voices} - {ALL})
 providers: list[AllTTSProviders] = [ALL, "google", "openai", "elevenLabs", "azure"]

@@ -95,10 +95,16 @@ class FieldProcessor:
             tts_voice: Union[OpenAIVoices, ElevenVoices] = key_or_config_val(
                 extras, "tts_voice"
             )
+            tts_style: Optional[str] = key_or_config_val(extras, "tts_style")
+
+            # Prepend style instructions for Gemini TTS
+            input_text = input
+            if tts_style and tts_provider == "google" and "gemini" in tts_model:
+                input_text = f"{tts_style} {input}"
 
             tts_response = await self.get_tts_response(
                 note=note,
-                input_text=input,
+                input_text=input_text,
                 model=tts_model,
                 voice=tts_voice,
                 provider=tts_provider,
@@ -109,7 +115,7 @@ class FieldProcessor:
             if not tts_response:
                 return None
 
-            file_name = get_media_path(note, node.field, "mp3")
+            file_name = get_media_path(note, node.field, "wav" if "gemini" in tts_model else "mp3")
             path = media.write_data(file_name, tts_response)
 
             return f"[sound:{path}]"
@@ -192,7 +198,7 @@ class FieldProcessor:
 
         # Check for API key
         if not self._check_api_key(provider, show_error_box):
-            return None
+             return None
 
         resp = await self.chat_provider.async_get_chat_response(
             interpolated_prompt,
@@ -276,7 +282,7 @@ class FieldProcessor:
             has_key = bool(config.elevenlabs_api_key)
         elif provider == "replicate":
             has_key = bool(config.replicate_api_key)
-
+        
         if not has_key:
             logger.error(f"Missing API key for {provider}")
             if show_error_box:
@@ -286,7 +292,7 @@ class FieldProcessor:
                     )
                 )
             return False
-
+        
         return True
 
 

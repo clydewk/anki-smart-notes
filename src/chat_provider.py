@@ -41,6 +41,7 @@ from .models import (
 OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
 DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
+GOOGLE_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 class ChatProvider:
@@ -64,6 +65,10 @@ class ChatProvider:
             )
         elif provider == "deepseek":
             return await self._get_deepseek_response(
+                prompt, model, temperature, retry_count
+            )
+        elif provider == "google":
+            return await self._get_google_response(
                 prompt, model, temperature, retry_count
             )
         else:
@@ -235,6 +240,58 @@ class ChatProvider:
             reasoning_effort=None,
         )
 
+    async def _get_google_response(
+        self,
+        prompt: str,
+        model: ChatModels,
+        temperature: float,
+        retry_count: int,
+    ) -> str:
+        api_key = config.google_api_key
+        if not api_key:
+            raise Exception(
+                "Google API key not found. Please set it in the settings."
+            )
+        
+        logger.debug(
+            f"Google: hitting {GOOGLE_ENDPOINT_BASE} model: {model} retries {retry_count}"
+        )
+
+        url = f"{GOOGLE_ENDPOINT_BASE}/{model}:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
+        
+        # Gemini 3 defaults to dynamic thinking (high) if not specified.
+        # Use default temperature 1.0 as recommended for Gemini 3, unless user explicitly changes it?
+        # User provided code:
+        # "For Gemini 3, we strongly recommend keeping the temperature parameter at its default value of 1.0."
+        # "Gemini 3 series models use dynamic thinking by default... If thinking_level is not specified, Gemini 3 will default to high."
+        
+        # We will pass the temperature if it's not 1.0 (default in Anki Smart Notes might be 1.0)
+        # But wait, existing default is 1.0 in constants.py.
+        # If I pass it, is it bad? The docs say "Changing the temperature (setting it below 1.0) may lead to unexpected behavior"
+        # I'll stick to passing it if it matches the config, but users might lower it.
+        # Let's pass it for now as Smart Notes allows configuration.
+        
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": temperature
+            }
+        }
+
+        return await self._execute_request(
+            url=url,
+            headers=headers,
+            json_payload=payload,
+            timeout_sec=CHAT_CLIENT_TIMEOUT_SEC,
+            retry_count=retry_count,
+            provider="google",
+            prompt=prompt,
+            model=model,
+            temperature=temperature,
+            reasoning_effort=None,
+        )
+
     async def _execute_request(
         self,
         url: str,
@@ -279,6 +336,9 @@ class ChatProvider:
 
                 if provider == "anthropic":
                     msg = resp["content"][0]["text"]
+                elif provider == "google":
+                    # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
+                    msg = resp["candidates"][0]["content"]["parts"][0]["text"]
                 else:
                     msg = resp["choices"][0]["message"]["content"]
 

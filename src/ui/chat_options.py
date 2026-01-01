@@ -59,11 +59,18 @@ models_map: dict[str, str] = {
     "claude-sonnet-4-0": "Claude Sonnet 4.0 (3x Cost)",
     "claude-3-5-haiku-latest": "Claude 3.5 Haiku (2x Cost)",
     "deepseek-v3": "Deepseek v3 (0.7x Cost)",
+    "gemini-3-pro-preview": "Gemini 3 Pro",
+    "gemini-3-flash-preview": "Gemini 3 Flash",
 }
 
-providers_map = {"openai": "OpenAI", "anthropic": "Anthropic", "deepseek": "DeepSeek"}
+providers_map = {
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "deepseek": "DeepSeek",
+    "google": "Google",
+}
 
-all_chat_providers: list[ChatProviders] = ["openai", "anthropic", "deepseek"]
+all_chat_providers: list[ChatProviders] = ["openai", "anthropic", "deepseek", "google"]
 
 reasoning_efforts_map: dict[str, str] = {
     "none": "None (Use Temperature)",
@@ -149,7 +156,7 @@ class ChatOptions(QWidget):
         )
         temp_desc.setFont(font_small)
         advanced_layout.addRow(temp_desc)
-        
+
         advanced_layout.addRow("Reasoning Effort:", self.reasoning_effort)
         reasoning_desc = QLabel(
             "Controls how hard the model thinks. Only available for some models. Disables temperature when active."
@@ -167,7 +174,7 @@ class ChatOptions(QWidget):
         chat_layout.setContentsMargins(0, 0, 0, 0)
 
         self.setLayout(chat_layout)
-        
+
         # Initial check for enabled/disabled state
         self._on_reasoning_effort_change(self.state.s.get("chat_reasoning_effort"))
         self._on_model_change(self.state.s["chat_model"])
@@ -182,15 +189,19 @@ class ChatOptions(QWidget):
 
         ret["chat_providers"] = all_chat_providers
         ret["chat_models"] = provider_model_map[ret["chat_provider"]]
-        
+
         # Ensure reasoning effort is initialized properly
         current_model = ret.get("chat_model")
-        efforts = openai_reasoning_efforts_for_model(current_model) if current_model else []
+        efforts = (
+            openai_reasoning_efforts_for_model(current_model) if current_model else []
+        )
         ret["chat_reasoning_efforts"] = efforts
-        
+
         if not ret.get("chat_reasoning_effort") and efforts:
-             # Default to "none" if available, else first option
-             ret["chat_reasoning_effort"] = "none" if "none" in efforts else efforts[0] if efforts else None
+            # Default to "none" if available, else first option
+            ret["chat_reasoning_effort"] = (
+                "none" if "none" in efforts else efforts[0] if efforts else None
+            )
 
         return ret
 
@@ -198,16 +209,18 @@ class ChatOptions(QWidget):
         # Update available reasoning efforts for the new model
         efforts = openai_reasoning_efforts_for_model(model)
         self.state.update({"chat_reasoning_efforts": efforts})
-        
+
         # If current selection is not valid for new model, reset
         current_effort = self.state.s.get("chat_reasoning_effort")
         if current_effort not in efforts:
-             new_effort = "none" if "none" in efforts else (efforts[0] if efforts else None)
-             self.state.update({"chat_reasoning_effort": new_effort})
+            new_effort = (
+                "none" if "none" in efforts else (efforts[0] if efforts else None)
+            )
+            self.state.update({"chat_reasoning_effort": new_effort})
 
     def _on_reasoning_effort_change(self, effort: Optional[str]) -> None:
-        self.state.update({"chat_reasoning_effort": effort}) # type: ignore
-        
+        self.state.update({"chat_reasoning_effort": effort})  # type: ignore
+
         # Disable temperature if reasoning effort is set to something other than "none" or None
         is_reasoning = effort and effort != "none"
         self.temperature.setEnabled(not is_reasoning)

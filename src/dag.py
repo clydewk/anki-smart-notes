@@ -84,7 +84,8 @@ def generate_fields_dag(
                 out_nodes=[],
                 in_nodes=[],
                 existing_value=note[field],
-                overwrite=overwrite_fields,
+                overwrite=overwrite_fields
+                or extras.get("regenerate_when_batching", False),
                 manual=not should_generate_automatically,
                 is_target=bool(target_field and field_lower == target_field.lower()),
                 input=prompt,
