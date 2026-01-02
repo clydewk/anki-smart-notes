@@ -171,4 +171,4 @@ config.json
 # Dependencies
 vendor/
 
-todo*.md
+todo*.mdrate_limits.json
