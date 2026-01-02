@@ -34,7 +34,7 @@ IMAGE_PROVIDER_TIMEOUT_SEC = 45
 GOOGLE_IMAGE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GOOGLE_IMAGE_DEFAULT_SIZE = "1024x1024"
 
-STANDARD_BATCH_LIMIT = 10
+STANDARD_BATCH_LIMIT = 500
 
 DEFAULT_CHAT_MODEL: ChatModels = "gpt-4o-mini"
 DEFAULT_CHAT_PROVIDER: ChatProviders = "openai"

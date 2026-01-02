@@ -38,6 +38,7 @@ from .models import (
     OpenAIReasoningEffort,
     openai_reasoning_efforts_for_model,
 )
+from .rate_limiter import get_rate_limiter
 
 OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
@@ -100,17 +101,17 @@ class ChatProvider:
     ) -> str:
         api_key = provider_config["api_key"]
         base_url = provider_config["base_url"]
-        
+
         # Ensure base_url ends with v1/chat/completions if not present?
-        # Standard OpenAI compatible usually requires the full URL or base? 
-        # The user input "Base URL" usually implies the root. 
+        # Standard OpenAI compatible usually requires the full URL or base?
+        # The user input "Base URL" usually implies the root.
         # But for OpenAI it is https://api.openai.com/v1/chat/completions.
         # If user puts "http://localhost:11434/v1", we might need to append /chat/completions?
         # Let's assume user provides the FULL endpoint URL for simplicity and maximum flexibility,
         # OR we try to be smart.
         # Let's assume it IS the endpoint for chat completions.
         url = base_url
-        
+
         logger.debug(
             f"Custom Provider {provider_config['name']}: hitting {url} model: {model} retries {retry_count}"
         )
@@ -120,13 +121,13 @@ class ChatProvider:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
         }
-        
+
         # Pass reasoning effort if set? Most compatible providers probably ignore it or use temperature.
         if reasoning_effort and reasoning_effort != "none":
-             payload["reasoning_effort"] = reasoning_effort
-             # Some might error if both are sent, similar to OpenAI logic
-             if "temperature" in payload:
-                 del payload["temperature"]
+            payload["reasoning_effort"] = reasoning_effort
+            # Some might error if both are sent, similar to OpenAI logic
+            if "temperature" in payload:
+                del payload["temperature"]
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -321,34 +322,30 @@ class ChatProvider:
     ) -> str:
         api_key = config.google_api_key
         if not api_key:
-            raise Exception(
-                "Google API key not found. Please set it in the settings."
-            )
-        
+            raise Exception("Google API key not found. Please set it in the settings.")
+
         logger.debug(
             f"Google: hitting {GOOGLE_ENDPOINT_BASE} model: {model} retries {retry_count}"
         )
 
         url = f"{GOOGLE_ENDPOINT_BASE}/{model}:generateContent?key={api_key}"
         headers = {"Content-Type": "application/json"}
-        
+
         # Gemini 3 defaults to dynamic thinking (high) if not specified.
         # Use default temperature 1.0 as recommended for Gemini 3, unless user explicitly changes it?
         # User provided code:
         # "For Gemini 3, we strongly recommend keeping the temperature parameter at its default value of 1.0."
         # "Gemini 3 series models use dynamic thinking by default... If thinking_level is not specified, Gemini 3 will default to high."
-        
+
         # We will pass the temperature if it's not 1.0 (default in Anki Smart Notes might be 1.0)
         # But wait, existing default is 1.0 in constants.py.
         # If I pass it, is it bad? The docs say "Changing the temperature (setting it below 1.0) may lead to unexpected behavior"
         # I'll stick to passing it if it matches the config, but users might lower it.
         # Let's pass it for now as Smart Notes allows configuration.
-        
+
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": temperature
-            }
+            "generationConfig": {"temperature": temperature},
         }
 
         return await self._execute_request(
@@ -357,7 +354,7 @@ class ChatProvider:
             json_payload=payload,
             timeout_sec=CHAT_CLIENT_TIMEOUT_SEC,
             retry_count=retry_count,
-            provider="google",
+            provider="google_text",  # Use specific text quota key
             prompt=prompt,
             model=model,
             temperature=temperature,
@@ -377,60 +374,79 @@ class ChatProvider:
         temperature: float,
         reasoning_effort: Optional[OpenAIReasoningEffort],
     ) -> str:
+        limiter = get_rate_limiter(provider)
+
         try:
-            async with (
-                aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=timeout_sec)
-                ) as session,
-                session.post(url, headers=headers, json=json_payload) as response,
-            ):
-                if response.status == 429:
-                    logger.debug(f"Got a 429 from {provider}")
-                    if retry_count < MAX_RETRIES:
-                        wait_time = (2**retry_count) * RETRY_BASE_SECONDS
-                        logger.debug(
-                            f"Retry: {retry_count} Waiting {wait_time} seconds before retrying"
-                        )
-                        await asyncio.sleep(wait_time)
-                        # Recursively call the public method to retry logic
-                        return await self.async_get_chat_response(
-                            prompt,
-                            model,
-                            provider,  # type: ignore
-                            -1,
-                            temperature,
-                            reasoning_effort,
-                            retry_count + 1,
-                        )
+            async with limiter:
+                async with (
+                    aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=timeout_sec)
+                    ) as session,
+                    session.post(url, headers=headers, json=json_payload) as response,
+                ):
+                    if response.status == 429:
+                        logger.debug(f"Got a 429 from {provider}")
+                        await limiter.report_failure()
 
-                response.raise_for_status()
-                resp = await response.json()
+                        if retry_count < MAX_RETRIES:
+                            wait_time = (2**retry_count) * RETRY_BASE_SECONDS
+                            logger.debug(
+                                f"Retry: {retry_count} Waiting {wait_time} seconds before retrying"
+                            )
+                            await asyncio.sleep(wait_time)
+                            # Recursively call the public method to retry logic
+                            return await self.async_get_chat_response(
+                                prompt,
+                                model,
+                                provider.replace("_text", "")
+                                if provider == "google_text"
+                                else provider,  # type: ignore - Pass base provider name if needed for logic, but internally execute uses key
+                                -1,
+                                temperature,
+                                reasoning_effort,
+                                retry_count + 1,
+                            )
 
-                if provider == "anthropic":
-                    msg = resp["content"][0]["text"]
-                elif provider == "google":
-                    # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
-                    msg = resp["candidates"][0]["content"]["parts"][0]["text"]
-                else:
-                    msg = resp["choices"][0]["message"]["content"]
+                    response.raise_for_status()
+                    await limiter.report_success()
 
-                logger.debug(f"Got response from {provider}: {msg}")
-                return msg
+                    resp = await response.json()
+
+                    if "anthropic" in provider:
+                        msg = resp["content"][0]["text"]
+                    elif "google" in provider:
+                        # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
+                        msg = resp["candidates"][0]["content"]["parts"][0]["text"]
+                    else:
+                        msg = resp["choices"][0]["message"]["content"]
+
+                    logger.debug(f"Got response from {provider}: {msg}")
+                    return msg
 
         except asyncio.TimeoutError:
             logger.warning(f"{provider} request timed out")
+            # Timeouts are also a sign of congestion, back off
+            await limiter.report_failure()
+
             if retry_count < MAX_RETRIES:
                 wait_time = (2**retry_count) * RETRY_BASE_SECONDS
                 await asyncio.sleep(wait_time)
                 return await self.async_get_chat_response(
                     prompt,
                     model,
-                    provider,  # type: ignore
+                    provider.replace("_text", "")
+                    if provider == "google_text"
+                    else provider,  # type: ignore
                     -1,
                     temperature,
                     reasoning_effort,
                     retry_count + 1,
                 )
+            raise
+        except Exception:
+            # Any other exception? Maybe report failure if it's network related?
+            # For safety, let's treat generic exceptions as potentially overload related
+            # if we can distinguish them. But for now, just 429 and Timeout.
             raise
 
 
