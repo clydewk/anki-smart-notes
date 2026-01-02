@@ -459,19 +459,24 @@ class PromptDialog(QDialog):
         override_layout.addWidget(QLabel("Override Default Settings"))
         override_layout.addWidget(self.custom_model)
         models_layout.addWidget(override_box)
-        models_layout.addWidget(self.model_options)
+        # Regenerate when batching
         self.regenerate_batch_checkbox = ReactiveCheckBox(
             self.state, "regenerate_when_batching"
         )
-        
-        batch_label = QLabel("Regenerate when batch processing:")
-        models_layout.addRow(batch_label, self.regenerate_batch_checkbox)
+        batch_box = QWidget()
+        batch_layout = QHBoxLayout()
+        batch_layout.setContentsMargins(0, 0, 0, 0)
+        batch_box.setLayout(batch_layout)
+        batch_layout.addWidget(QLabel("Regenerate when batch processing:"))
+        batch_layout.addWidget(self.regenerate_batch_checkbox)
+        models_layout.addWidget(batch_box)
         
         batch_desc = QLabel(
             "If checked, this field always overwrites its value during batch generation."
         )
         batch_desc.setFont(font_small)
         models_layout.addRow(batch_desc)
+        models_layout.addWidget(self.model_options)
         model_box = QGroupBox("⚙️ Model Settings")
         model_box.setEnabled(True)
 

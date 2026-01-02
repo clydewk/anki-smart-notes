@@ -18,6 +18,8 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 from typing import Any, Optional, TypedDict
+import html
+import re
 from urllib.parse import urlparse
 
 from aqt import (
@@ -68,6 +70,33 @@ from .ui_utils import default_form_layout, font_large, font_small, show_message_
 
 OPTIONS_MIN_WIDTH = 875
 TTS_PROMPT_STUB_VALUE = "🔈"
+
+
+def get_item_text(item: QTableWidgetItem) -> str:
+    val = item.data(Qt.ItemDataRole.UserRole)
+    if val:
+        return str(val)
+    return item.text()
+
+
+def highlight_match(text: str, query: str) -> str:
+    if not query:
+        return html.escape(text)
+
+    pattern = re.compile(f"({re.escape(query)})", re.IGNORECASE)
+    parts = pattern.split(text)
+
+    result = []
+    for i, part in enumerate(parts):
+        escaped_part = html.escape(part)
+        if i % 2 == 1:
+            result.append(
+                f'<span style="background-color: rgba(255, 213, 79, 0.4); font-weight: bold;">{escaped_part}</span>'
+            )
+        else:
+            result.append(escaped_part)
+
+    return "".join(result)
 
 
 class State(TypedDict):
@@ -227,7 +256,7 @@ class AddonOptionsDialog(QDialog):
         search_layout = QHBoxLayout()
         search_input = ReactiveLineEdit(self.state, "search_text")
         search_input.setPlaceholderText("🔎 Search fields...")
-        search_input.on_change.connect(lambda _: self.render_table())
+        search_input.on_change.connect(lambda text: self.state.update({"search_text": text}))
         search_layout.addWidget(search_input)
         layout.addLayout(search_layout)
         
@@ -281,7 +310,7 @@ class AddonOptionsDialog(QDialog):
         row = self.table.rowAt(pos.y())
         if row >= 0:
             prompt_item = self.table.item(row, 4)
-            prompt_text = prompt_item.text() if prompt_item else ""
+            prompt_text = get_item_text(prompt_item) if prompt_item else ""
 
             if prompt_text:
                 menu = QMenu(self)
@@ -418,7 +447,7 @@ class AddonOptionsDialog(QDialog):
                         if search_text not in searchable:
                             continue
 
-                    # TODO: show deck col
+                    
                     extras = get_extras(
                         note_type=note_type, field=field, deck_id=deck_id
                     )
@@ -449,8 +478,33 @@ class AddonOptionsDialog(QDialog):
                     enabled = extras["automatic"]
                     for i, item in enumerate(items):
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                        item.setTextAlignment(
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                        )
                         self.table.setItem(row, i, item)
-                        if not enabled:
+
+                        if search_text and i in [0, 1, 2, 4]:
+                            text = item.text()
+                            # Always use QLabel for consistency in search results
+                            label = QLabel(highlight_match(text, search_text))
+                            style = "background-color: transparent;"
+                            if not enabled:
+                                style += " color: #a0a0a0;"
+                            label.setStyleSheet(style)
+                            label.setAlignment(
+                                Qt.AlignmentFlag.AlignLeft
+                                | Qt.AlignmentFlag.AlignVCenter
+                            )
+                            label.setAttribute(
+                                Qt.WidgetAttribute.WA_TransparentForMouseEvents
+                            )
+                            label.setIndent(3)
+                            label.setToolTip(text)
+                            self.table.setCellWidget(row, i, label)
+                            item.setData(Qt.ItemDataRole.UserRole, text)
+                            item.setText("")
+
+                        if not enabled and not self.table.cellWidget(row, i):
                             item.setForeground(Qt.GlobalColor.lightGray)
                     row += 1
 
@@ -475,7 +529,7 @@ class AddonOptionsDialog(QDialog):
         )
         plugin_form.addRow("", QLabel(""))
 
-        # Regenerate when during
+        # Regenerate when batching
         self.regenerate_notes_when_batching = ReactiveCheckBox(
             self.state, "regenerate_notes_when_batching"
         )
@@ -606,9 +660,9 @@ class AddonOptionsDialog(QDialog):
         if row is None:
             return
 
-        note_type = self.table.item(row, 0).text()  # type: ignore
-        deck_id = deck_name_to_id_map()[self.table.item(row, 1).text()]  # type: ignore
-        field = self.table.item(row, 2).text()  # type: ignore
+        note_type = get_item_text(self.table.item(row, 0))  # type: ignore
+        deck_id = deck_name_to_id_map()[get_item_text(self.table.item(row, 1))]  # type: ignore
+        field = get_item_text(self.table.item(row, 2))  # type: ignore
         logger.debug(f"Editing {note_type}, {field}")
 
         # Get type
@@ -669,9 +723,9 @@ class AddonOptionsDialog(QDialog):
             # Should never happen
             return
 
-        note_type = self.table.item(row, 0).text()  # type: ignore
-        deck_id = deck_name_to_id_map()[self.table.item(row, 1).text()]  # type: ignore
-        field = self.table.item(row, 2).text()  # type: ignore
+        note_type = get_item_text(self.table.item(row, 0))  # type: ignore
+        deck_id = deck_name_to_id_map()[get_item_text(self.table.item(row, 1))]  # type: ignore
+        field = get_item_text(self.table.item(row, 2))  # type: ignore
         new_map = remove_prompt(
             self.state.s["prompts_map"],
             note_type=note_type,
