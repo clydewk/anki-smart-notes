@@ -18,8 +18,11 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import asyncio
+import logging
+import time
 import traceback
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Optional
 
 import aiohttp
@@ -37,9 +40,37 @@ from .logger import logger
 from .nodes import FieldNode
 from .notes import get_note_type
 from .prompts import get_prompts_for_note
+from .rate_limiter import RateLimitManager
 from .sentry import run_async_in_background_with_sentry
 from .ui.ui_utils import show_message_box
 from .utils import run_on_main
+
+@dataclass
+class BatchStatistics:
+    processed: list[Note]
+    failed: list[Note]
+    skipped: list[Note]
+    updated_fields: set[str]
+    error_details: dict[int, str]
+    start_time: float
+    end_time: float
+    db_writes: int
+    rate_limits: dict[str, float]
+    logs: list[str]
+
+
+class ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.logs = []
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.logs.append(msg)
+        except Exception:
+            self.handleError(record)
+
 
 class ProgressDialog(QDialog):
     def __init__(self, label: str, max_val: int, on_cancel: Callable[[], None]):
@@ -83,7 +114,7 @@ class NoteProcessor:
     def process_cards_with_progress(
         self,
         card_ids: Sequence[CardId],
-        on_success: Optional[Callable[[list[Note], list[Note], list[Note]], None]],
+        on_success: Optional[Callable[[BatchStatistics], None]],
         overwrite_fields: bool = False,
     ) -> None:
         """Processes notes in the background with a progress bar, batching into a single undo op"""
@@ -105,18 +136,32 @@ class NoteProcessor:
 
         logger.debug("Processing notes...")
 
-        limit = STANDARD_BATCH_LIMIT
-        logger.debug(f"Batch limit: {limit}")
+        # Relax global concurrency limit to allow specialized limiters (per-provider) to control flow.
+        # We set it to STANDARD_BATCH_LIMIT to prevent OOM/file descriptor exhaustion, but the actual rate limiting
+        # happens inside the providers.
+        initial_limit = STANDARD_BATCH_LIMIT
+        logger.debug(f"Global concurrency limit: {initial_limit}")
 
         # Only show fancy progress meter for large batches
         cancellation_state = {"cancelled": False}
+
+        # Disable autosave to avoid "Backing up..." popups during batch processing
+        autosave_was_active = False
+        if hasattr(mw, "autosaveTimer") and mw.autosaveTimer.isActive():
+            mw.autosaveTimer.stop()
+            autosave_was_active = True
+        
+        # Also try to disable automatic backups if the method exists (Anki 2.1.50+)
+        if hasattr(mw.col, "set_autosave_enabled"):
+             # Some versions allow disabling at collection level
+             mw.col.set_autosave_enabled(False)
 
         def on_cancel() -> None:
             cancellation_state["cancelled"] = True
             logger.info("Cancellation requested")
             if progress:
                 progress.set_label(
-                    "Cancelling... please wait for current batch to finish."
+                    "Cancelling... please wait for active tasks to finish."
                 )
                 progress.disable_cancel()
 
@@ -125,18 +170,39 @@ class NoteProcessor:
         )
         progress.show()
 
-        def wrapped_on_success(res: tuple[list[Note], list[Note], list[Note]]) -> None:
-            updated, failed, skipped = res
+        # Capture logs
+        log_handler = ListHandler()
+        log_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(message)s"))
+        logger.addHandler(log_handler)
+
+        def wrapped_on_success(res: BatchStatistics) -> None:
+            stats = res
+
+            logger.removeHandler(log_handler)
+
+            if autosave_was_active and hasattr(mw, "autosaveTimer"):
+                mw.autosaveTimer.start()
+            if hasattr(mw.col, "set_autosave_enabled"):
+                mw.col.set_autosave_enabled(True)
+
             if progress:
                 progress.close()
             if not mw or not mw.col:
                 return
-            mw.col.update_notes(updated)
+            # Note: DB updates are mainly handled during processing to allow incremental progress saving
+            # But we might have stragglers or need to finalize things. 
             self._reqlinquish_req_in_process()
             if on_success:
-                on_success(updated, failed, skipped)
+                on_success(stats)
 
         def on_failure(e: Exception) -> None:
+            logger.removeHandler(log_handler)
+
+            if autosave_was_active and hasattr(mw, "autosaveTimer"):
+                mw.autosaveTimer.start()
+            if hasattr(mw.col, "set_autosave_enabled"):
+                mw.col.set_autosave_enabled(True)
+
             if progress:
                 progress.close()
             self._reqlinquish_req_in_process()
@@ -164,169 +230,168 @@ class NoteProcessor:
                     progress.set_value(len(note_ids))
 
         async def op():
-            # ... existing op code ...
+            start_time = time.time()
+            
+            # Worker Pool with relaxed global limit
+            # We set a high fixed concurrency limit (safeguard) and rely on 
+            # provider-specific RPM limiters for actual flow control.
+            
+            concurrency_limit = STANDARD_BATCH_LIMIT
+            
             total_updated = []
             total_failed = []
             total_skipped = []
-            to_process_ids = note_ids[:]
-
-            # Manually track processed count since sometimes we may
-            # process a note without actually calling OpenAI
+            all_updated_fields: set[str] = set()
+            error_details: dict[int, str] = {}
+            
+            update_buffer: list[Note] = []
             processed_count = 0
+            db_writes = 0
+            
+            to_process_ids = note_ids[:]
+            active_tasks: set[asyncio.Task] = set()
 
-            while len(to_process_ids) > 0:
+            async def worker(nid: NoteId) -> tuple[Optional[Note], bool | Exception, list[str]]:
                 if cancellation_state["cancelled"]:
-                    break
-
-                logger.debug("Processing batch...")
-                batch = to_process_ids[:limit]
-                to_process_ids = to_process_ids[limit:]
-
-                def on_progress() -> None:
-                    nonlocal processed_count
-                    processed_count += 1
-                    run_on_main(
-                        lambda: on_update(
-                            [],  # Don't update DB yet, just progress
-                            processed_count,
-                            False,
-                        )
-                    )
-
-                updated, failed, skipped = await self._process_notes_batch(
-                    batch,
-                    overwrite_fields=overwrite_fields,
-                    did_map=did_map,
-                    on_progress=on_progress,
-                    cancellation_state=cancellation_state,
-                )
-
-                # Count is already incremented in on_progress
-                # processed_count += len(batch)
-
-                total_updated.extend(updated)
-                total_failed.extend(failed)
-                total_skipped.extend(skipped)
-
-                # Update the notes in the main thread
-                run_on_main(
-                    lambda updated=updated,
-                    to_process_ids_empty=len(to_process_ids) == 0,
-                    processed_count=processed_count: on_update(
-                        updated,
-                        processed_count,
-                        to_process_ids_empty,
-                    )
-                )
-
-                if not to_process_ids:
-                    break
-
-            return total_updated, total_failed, total_skipped
-
-        run_async_in_background_with_sentry(
-            op, wrapped_on_success, on_failure, with_progress=False
-        )
-
-    async def _process_notes_batch(
-        self,
-        note_ids: Sequence[NoteId],
-        overwrite_fields: bool,
-        did_map: dict[NoteId, DeckId],
-        on_progress: Optional[Callable[[], None]] = None,
-        cancellation_state: Optional[dict[str, bool]] = None,
-    ) -> tuple[list[Note], list[Note], list[Note]]:
-        """Returns updated, failed, skipped notes"""
-        logger.debug(f"Processing {len(note_ids)} notes...")
-        if not mw or not mw.col:
-            logger.error("No mw!")
-            return ([], [], [])
-
-        notes = [mw.col.get_note(note_id) for note_id in note_ids]
-
-        # Only process notes that have prompts
-        to_process: list[Note] = []
-        skipped: list[Note] = []
-        for note in notes:
-            note_type = get_note_type(note)
-            prompts = get_prompts_for_note(note_type, did_map[note.id])
-            if not prompts:
-                logger.debug("Error: no prompts found for note type")
-                skipped.append(note)
-                if on_progress:
-                    on_progress()
-            else:
-                to_process.append(note)
-        if not to_process and not skipped:
-            logger.debug("No notes to process")
-            return ([], [], [])
-
-        # Run them all in parallel
-        tasks = []
-        for note in to_process:
-
-            async def wrapped(n: Note = note) -> Optional[bool]:
-                if cancellation_state and cancellation_state["cancelled"]:
-                    return None
+                    return (None, False, [])
+                
                 try:
-                    res = await self._process_note(
-                        n, overwrite_fields=overwrite_fields, deck_id=did_map[n.id]
+                    # Note: Accessing mw.col in background thread.
+                    # This avoids main-thread blocking but is technically unsafe in Anki.
+                    # However, since we only read here and write on main thread, it is generally stable.
+                    note = mw.col.get_note(nid)
+                    
+                    # Filter
+                    note_type = get_note_type(note)
+                    prompts = get_prompts_for_note(note_type, did_map[nid])
+                    if not prompts:
+                        return (note, False, []) # Treated as skipped
+                    
+                    # Process
+                    # This will internally hit provider-specific rate limiters and block if needed
+                    did_update, updated_fields = await self._process_note(
+                        note, 
+                        deck_id=did_map[nid],
+                        overwrite_fields=overwrite_fields
                     )
-                    if on_progress:
-                        on_progress()
-                    return res
-                except asyncio.CancelledError:
-                    return None
+                    return (note, did_update, updated_fields)
+                    
                 except Exception as e:
-                    if on_progress:
-                        on_progress()
-                    raise e
+                     # Try to retrieve note just for reporting purposes
+                    try:
+                        n = mw.col.get_note(nid)
+                        return (n, e, [])
+                    except:
+                        return (None, e, [])
 
-            tasks.append(asyncio.create_task(wrapped()))
+            while to_process_ids or active_tasks:
+                if cancellation_state["cancelled"]:
+                    # Wait for active tasks to drain then break
+                    if not active_tasks:
+                        break
+                
+                # Fill the pool
+                while to_process_ids and len(active_tasks) < concurrency_limit:
+                    if cancellation_state["cancelled"]:
+                        break
+                    nid = to_process_ids.pop(0)
+                    task = asyncio.create_task(worker(nid))
+                    active_tasks.add(task)
+                
+                if not active_tasks:
+                    break
+                
+                # Wait for at least one task to finish
+                done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                active_tasks = pending
+                
+                for task in done:
+                    processed_count += 1
+                    try:
+                        note_obj, status, u_fields = await task
+                    except Exception as e:
+                        # Should be caught inside worker, but just in case
+                        note_obj, status, u_fields = (None, e, [])
 
-        # Wait for tasks to complete, checking for cancellation periodically
-        while True:
-            if cancellation_state and cancellation_state["cancelled"]:
-                logger.debug("Cancelling pending tasks in batch...")
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                # Don't break immediately, we need to gather the results (which will be CancelledErrors/None)
-                # But we can just proceed to gather below
-                break
+                    if isinstance(status, Exception):
+                        if note_obj:
+                            total_failed.append(note_obj)
+                            error_details[note_obj.id] = str(status)
+                            logger.error(f"Error processing note {note_obj.id}: {status}")
+                        else:
+                            logger.error(f"Error processing note: {status}")
+                            
+                    else:
+                        # Success
+                        if status is True:
+                            # Note updated
+                            total_updated.append(note_obj)
+                            update_buffer.append(note_obj)
+                            all_updated_fields.update(u_fields)
+                        elif status is False:
+                            total_skipped.append(note_obj)
+                            
+                    # Flush buffer periodically (DB write)
+                    batch_to_update = []
+                    # Increase buffer size to reduce Anki backup/undo creation spam
+                    if len(update_buffer) >= 50:
+                        batch_to_update = update_buffer[:]
+                        update_buffer.clear()
+                    
+                    # Update UI/DB
+                    # We always want to call this if we have DB updates
+                    # If no DB updates, we only want to call it occasionally to save UI repaints
+                    if batch_to_update or processed_count % 5 == 0:
+                         if batch_to_update:
+                             db_writes += 1
+                         run_on_main(
+                            lambda u=batch_to_update, p=processed_count: on_update(u, p, False)
+                        )
 
-            _, pending = await asyncio.wait(
-                tasks, timeout=0.1, return_when=asyncio.ALL_COMPLETED
-            )
-            if not pending:
-                break
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process errors
-        notes_to_update = []
-        failed = []
-        for i, result in enumerate(results):
-            if result is None:
-                # Cancelled
-                continue
-
-            note = to_process[i]
-            if isinstance(result, Exception):
-                logger.error(
-                    f"Error processing note {note.id}: {result}, {''.join(traceback.format_exception(type(result), result, result.__traceback__))}"
+            # Final flush
+            if update_buffer:
+                db_writes += 1
+                run_on_main(
+                    lambda u=update_buffer, p=processed_count: on_update(u, p, True)
                 )
-                failed.append(note)
-            elif result:
-                notes_to_update.append(note)
             else:
-                skipped.append(note)
+                run_on_main(
+                    lambda u=[], p=processed_count: on_update(u, p, True)
+                )
+            
+            end_time = time.time()
+            rate_limits = {k: v._rpm for k, v in RateLimitManager.get_instance().limiters.items()}
+            
+            # Retrieve logs from the handler
+            logs = list(log_handler.logs)
 
-        logger.debug(
-            f"Updated: {len(notes_to_update)}, Failed: {len(failed)}, Skipped: {len(skipped)}"
-        )
+            return BatchStatistics(
+                processed=total_updated,
+                failed=total_failed,
+                skipped=total_skipped,
+                updated_fields=all_updated_fields,
+                error_details=error_details,
+                start_time=start_time,
+                end_time=end_time,
+                db_writes=db_writes,
+                rate_limits=rate_limits,
+                logs=logs
+            )
 
-        return (notes_to_update, failed, skipped)
+        try:
+            run_async_in_background_with_sentry(
+                op, wrapped_on_success, on_failure, with_progress=False
+            )
+        except Exception as e:
+            logger.removeHandler(log_handler)
+            if autosave_was_active and hasattr(mw, "autosaveTimer"):
+                mw.autosaveTimer.start()
+            if hasattr(mw.col, "set_autosave_enabled"):
+                mw.col.set_autosave_enabled(True)
+            if progress:
+                progress.close()
+            self._reqlinquish_req_in_process()
+            raise e
 
     def process_card(
         self,
@@ -345,6 +410,10 @@ class NoteProcessor:
         note = card.note()
 
         def wrapped_on_success(updated: bool) -> None:
+            # Save the note if it was updated
+            if updated and mw and mw.col:
+                mw.col.update_note(note)
+                
             self._reqlinquish_req_in_process()
             on_success(updated)
 
@@ -381,15 +450,15 @@ class NoteProcessor:
         target_field: Optional[str] = None,
         on_field_update: Optional[Callable[[], None]] = None,
         show_progress: bool = False,
-    ) -> bool:
-        """Process a single note, returns whether any fields were updated. Optionally can target specific fields. Caller responsible for handling any exceptions."""
+    ) -> tuple[bool, list[str]]:
+        """Process a single note, returns (updated_status, updated_fields). Optionally can target specific fields. Caller responsible for handling any exceptions."""
 
         note_type = get_note_type(note)
         prompts_for_note = get_prompts_for_note(note_type, deck_id)
 
         if not prompts_for_note:
             logger.debug("no prompts found for note type")
-            return False
+            return (False, [])
 
         # Topsort + parallel process the DAG
         dag = generate_fields_dag(
@@ -398,8 +467,9 @@ class NoteProcessor:
             overwrite_fields=overwrite_fields,
             deck_id=deck_id,
         )
-
+        
         did_update = False
+        updated_fields: list[str] = []
 
         will_show_progress = show_progress and len(dag)
         if will_show_progress:
@@ -409,7 +479,7 @@ class NoteProcessor:
                     min=0,
                     max=len(dag),
                     immediate=True,
-                )
+                    )
             )
 
         try:
@@ -417,7 +487,7 @@ class NoteProcessor:
                 next_batch: list[FieldNode] = [
                     node for node in dag.values() if not node.in_nodes
                 ]
-                logger.debug(f"Processing next nodes: {next_batch}")
+                logger.debug(f"Processing next nodes: {[n.field for n in next_batch]}")
                 batch_tasks = {
                     node.field: self._process_node(
                         # Only show the error box for the target field
@@ -432,11 +502,17 @@ class NoteProcessor:
 
                 for field, response in zip(batch_tasks.keys(), responses):
                     node = dag[field]
-                    if response:
-                        logger.debug(
-                            f"Updating field {field} with response: {response}"
-                        )
-                        note[node.field_upper] = response
+                    if response is not None:
+                        current_val = note[node.field_upper]
+                        if response != current_val:
+                            logger.debug(
+                                f"Updating field {field} with response: {response}"
+                            )
+                            note[node.field_upper] = response
+                        else:
+                            # Use trace instead of debug to reduce noise
+                            # logger.debug(f"Field {field} unchanged")
+                            pass
 
                     if node.abort:
                         for out_node in node.out_nodes:
@@ -447,9 +523,10 @@ class NoteProcessor:
 
                     # New notes have ID 0 and don't exist in the DB yet, so can't be updated!
                     if note.id and node.did_update:
-                        if mw and mw.col:
-                            mw.col.update_note(note)
                         did_update = True
+                        updated_fields.append(node.field)
+                        # Note: we do NOT update DB here anymore. Caller must handle persistence.
+                        # This improves performance and safety in batch operations.
 
                     dag.pop(field)
                     if on_field_update:
@@ -459,7 +536,7 @@ class NoteProcessor:
             if will_show_progress:
                 run_on_main(lambda: mw.progress.finish())  # type: ignore
 
-        return did_update
+        return (did_update, updated_fields)
 
     def _handle_failure(self, e: Exception) -> None:
         logger.debug("Handling failure")
@@ -501,10 +578,10 @@ class NoteProcessor:
         self, node: FieldNode, note: Note, show_error_message_box: bool
     ) -> Optional[str]:
         if node.abort:
-            logger.debug(f"Skipping field {node.field}")
+            # logger.debug(f"Skipping field {node.field}")
             return None
 
-        logger.debug(f"Processing field {node.field}")
+        # logger.debug(f"Processing field {node.field}")
 
         value = note[node.field_upper]
 

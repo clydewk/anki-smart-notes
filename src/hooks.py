@@ -35,7 +35,7 @@ from .config import config
 from .decks import deck_id_to_name_map
 from .logger import logger, setup_logger
 from .migrations import migrate_models
-from .note_proccessor import NoteProcessor
+from .note_proccessor import NoteProcessor, BatchStatistics
 from .notes import get_field_from_index, is_ai_field, is_card_fully_processed
 from .sentry import with_sentry
 from .tasks import run_async_in_background
@@ -174,10 +174,14 @@ def add_editor_top_button(
 
 def make_on_batch_success(
     browser: browser.Browser,  # type: ignore
-) -> Callable[[list[Note], list[Note], list[Note]], None]:
-    def wrapped_on_batch_success(
-        updated: list[Note], errors: list[Note], skipped: list[Note]
-    ):
+) -> Callable[[BatchStatistics], None]:
+    def wrapped_on_batch_success(stats: BatchStatistics):
+        updated = stats.processed
+        errors = stats.failed
+        skipped = stats.skipped
+        updated_fields = stats.updated_fields
+        error_details = stats.error_details
+
         browser.on_all_or_selected_rows_changed()
 
         def pluralize(word: str, count: int) -> str:
@@ -185,16 +189,56 @@ def make_on_batch_success(
 
         if not len(updated) and len(errors):
             show_message_box("All notes failed. Check your API keys and configuration.")
-        elif len(errors) or len(skipped):
-            parts = [f"Processed {pluralize('note', len(updated))} successfully"]
+        else:
+            parts = []
+            if len(updated):
+                parts.append(f"Processed {pluralize('note', len(updated))} successfully")
+            
             if len(errors):
                 parts.append(f"{pluralize('note', len(errors))} failed")
+            
             if len(skipped):
                 parts.append(f"{pluralize('note', len(skipped))} skipped")
-            show_message_box(". ".join(parts) + ".")
-        else:
+
+            debug_info = ""
+            if config.debug:
+                duration = stats.end_time - stats.start_time
+                notes_per_sec = len(updated) / duration if duration > 0 else 0
+                
+                debug_parts = []
+                debug_parts.append(f"--- Batch Processing Report ---")
+                debug_parts.append(f"Time Taken: {duration:.2f}s")
+                debug_parts.append(f"Processing Speed: {notes_per_sec:.2f} notes/sec")
+                debug_parts.append(f"Database Writes: {stats.db_writes}")
+                debug_parts.append(f"Processed: {len(updated)}")
+                debug_parts.append(f"Failed: {len(errors)}")
+                debug_parts.append(f"Skipped: {len(skipped)}")
+                
+                if updated_fields:
+                    field_list = ", ".join(sorted(list(updated_fields)))
+                    debug_parts.append(f"Fields processed: {field_list}")
+
+                if stats.rate_limits:
+                    debug_parts.append("\n--- Rate Limits (RPM) ---")
+                    for provider, rpm in stats.rate_limits.items():
+                        debug_parts.append(f"{provider}: {rpm:.1f}")
+                
+                if errors:
+                    debug_parts.append("\n--- Failures ---")
+                    for note in errors:
+                        msg = error_details.get(note.id, "Unknown error")
+                        debug_parts.append(f"Note ID {note.id} failed: {msg}")
+
+                if stats.logs:
+                    debug_parts.append("\n--- Execution Logs ---")
+                    debug_parts.extend(stats.logs)
+
+                debug_info = "\n".join(debug_parts)
+
             show_message_box(
-                f"Processed {pluralize('note', len(updated))} successfully."
+                ". ".join(parts) + ".",
+                copy_button_text="Copy Debug Info" if debug_info else None,
+                copy_button_content=debug_info if debug_info else None
             )
 
     return wrapped_on_batch_success

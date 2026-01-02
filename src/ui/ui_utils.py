@@ -27,6 +27,8 @@ def show_message_box(
     details: Optional[str] = None,
     custom_ok: Optional[str] = None,
     show_cancel: bool = False,
+    copy_button_text: Optional[str] = None,
+    copy_button_content: Optional[str] = None,
 ):
     msg = QMessageBox()
     msg.setText(message)
@@ -34,11 +36,10 @@ def show_message_box(
     if details:
         msg.setInformativeText(details)
 
-    # TODO: this custom_ok is getting put in the wrong position (left most), idk why
     ok_button = None
     if custom_ok:
         ok_button = QPushButton(custom_ok)
-        msg.addButton(ok_button, QMessageBox.ButtonRole.ActionRole)
+        msg.addButton(ok_button, QMessageBox.ButtonRole.AcceptRole)
 
     else:
         msg.addButton(QMessageBox.StandardButton.Ok)
@@ -46,8 +47,22 @@ def show_message_box(
     if show_cancel:
         msg.addButton(QMessageBox.StandardButton.Cancel)
 
+    copy_button = None
+    if copy_button_text and copy_button_content:
+        copy_button = QPushButton(copy_button_text)
+        msg.addButton(copy_button, QMessageBox.ButtonRole.ActionRole)
+
     val = msg.exec()
-    return msg.clickedButton() == ok_button or val == QMessageBox.StandardButton.Ok
+    clicked_button = msg.clickedButton()
+    
+    if clicked_button == copy_button:
+        # Copy to clipboard
+        from aqt import mw
+        if mw:
+            mw.app.clipboard().setText(copy_button_content)
+        return False
+
+    return clicked_button == ok_button or val == QMessageBox.StandardButton.Ok
 
 
 def default_form_layout() -> QFormLayout:
