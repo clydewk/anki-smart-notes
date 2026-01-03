@@ -173,3 +173,4 @@ vendor/
 
 todo*.md
 rate_limits.json
+*.md
