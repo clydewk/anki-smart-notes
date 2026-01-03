@@ -64,6 +64,8 @@ def pinger(event: str) -> Callable[[], Any]:
     # No-op pinger
     async def ping() -> None:
         pass
+
     return ping
+
 
 sentry = None

@@ -50,7 +50,18 @@ class ImageProvider:
         note_id: int,
         aspect_ratio: Optional[ImageAspectRatio] = None,
         resolution: Optional[ImageResolution] = None,
+        output_format: Optional[str] = None,
+        quality: Optional[int] = None,
     ) -> bytes:
+        # Check custom providers
+        custom_provider = next(
+            (p for p in (config.custom_providers or []) if p["name"] == provider), None
+        )
+        if custom_provider:
+            return await self._get_openai_image(
+                prompt, model, aspect_ratio, resolution, custom_provider
+            )
+
         # Safeguard: Ensure provider matches model to avoid config mismatch errors
         if model in MODEL_MAP:
             provider = "replicate"
@@ -61,7 +72,11 @@ class ImageProvider:
 
         if provider == "replicate":
             return await self._get_replicate_image(
-                prompt, model, aspect_ratio=aspect_ratio
+                prompt,
+                model,
+                aspect_ratio=aspect_ratio,
+                output_format=output_format,
+                quality=quality,
             )
         if provider == "google":
             return await self._get_google_image(
@@ -81,48 +96,75 @@ class ImageProvider:
         timeout_sec: int,
         provider: str,
         retry_count: int = 0,
-        **kwargs
+        **kwargs,
     ) -> bytes:
         limiter = get_rate_limiter(provider)
-        
+
         try:
             async with limiter:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        url, 
-                        headers=headers, 
-                        json=json_payload, 
+                        url,
+                        headers=headers,
+                        json=json_payload,
                         timeout=timeout_sec,
-                        **kwargs
+                        **kwargs,
                     ) as response:
                         if response.status == 429:
                             await limiter.report_failure()
-                            
+
                             if retry_count < MAX_RETRIES:
                                 wait_time = (2**retry_count) * RETRY_BASE_SECONDS
-                                logger.debug(f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}")
+                                logger.debug(
+                                    f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}"
+                                )
                                 await asyncio.sleep(wait_time)
                                 return await self._execute_request(
-                                    url, headers, json_payload, timeout_sec, provider, retry_count + 1, **kwargs
+                                    url,
+                                    headers,
+                                    json_payload,
+                                    timeout_sec,
+                                    provider,
+                                    retry_count + 1,
+                                    **kwargs,
                                 )
-                            
+
                             response.raise_for_status()
-                        
+
                         response.raise_for_status()
                         await limiter.report_success()
                         return await response.read()
 
         except asyncio.TimeoutError:
             from .logger import logger
+
             logger.warning(f"{provider} request timed out")
-            await limiter.report_failure()
-            
+            await limiter.report_timeout()
+
             if retry_count < MAX_RETRIES:
                 wait_time = (2**retry_count) * RETRY_BASE_SECONDS
                 await asyncio.sleep(wait_time)
                 return await self._execute_request(
-                    url, headers, json_payload, timeout_sec, provider, retry_count + 1, **kwargs
+                    url,
+                    headers,
+                    json_payload,
+                    timeout_sec,
+                    provider,
+                    retry_count + 1,
+                    **kwargs,
                 )
+            raise
+
+        except aiohttp.ClientResponseError as e:
+            # If it's a 5xx error, it's not a rate limit, but the server is struggling.
+            # We might want to back off, but maybe not as aggressively as a 429?
+            # For now, let's treat it as failure but log it clearly.
+            if e.status != 429:
+                from .logger import logger
+
+                logger.warning(f"{provider} returned status {e.status}: {e.message}")
+
+            await limiter.report_failure()
             raise
 
         except Exception:
@@ -134,6 +176,8 @@ class ImageProvider:
         prompt: str,
         model: ImageModels,
         aspect_ratio: Optional[ImageAspectRatio] = None,
+        output_format: Optional[str] = None,
+        quality: Optional[int] = None,
     ) -> bytes:
         api_key = config.replicate_api_key
         if not api_key:
@@ -149,12 +193,31 @@ class ImageProvider:
             "Prefer": "wait",
         }
 
+        # Handle Replicate output format
+        # Flux supports: webp, jpg, png.
+        # If user requests avif, we should ask for png (lossless) and convert later.
+        repl_format = "webp"
+        if output_format:
+            if output_format in ["webp", "jpg", "png"]:
+                repl_format = output_format
+            elif output_format == "jpeg":
+                repl_format = "jpg"
+            elif output_format == "avif":
+                repl_format = "png"  # Get lossless then convert
+
+        # Handle Replicate quality
+        # Flux supports 0-100.
+        repl_quality = 80
+        if quality is not None and quality > 0:
+            repl_quality = quality
+
         url = f"{REPLICATE_API_BASE}/models/{model_path}/predictions"
         payload = {
             "input": {
                 "prompt": prompt,
                 "aspect_ratio": aspect_ratio or "1:1",
-                "output_format": "webp",
+                "output_format": repl_format,
+                "output_quality": repl_quality,
             }
         }
 
@@ -162,21 +225,24 @@ class ImageProvider:
         # Retry logic for creation is easy, but polling retry logic is harder.
         # For now, let's implement basic retry for the CREATION request.
         # If creation succeeds but polling fails/times out, we don't retry currently.
-        
+
         return await self._get_replicate_image_with_retry(
             url, headers, payload, "replicate"
         )
-        
+
     async def _get_replicate_image_with_retry(
         self, url, headers, payload, provider, retry_count=0
     ) -> bytes:
         limiter = get_rate_limiter(provider)
-        
+
         try:
             async with limiter:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        url, headers=headers, json=payload, timeout=IMAGE_PROVIDER_TIMEOUT_SEC
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=IMAGE_PROVIDER_TIMEOUT_SEC,
                     ) as response:
                         if response.status == 429:
                             await limiter.report_failure()
@@ -200,9 +266,9 @@ class ImageProvider:
 
                     get_url = prediction["urls"]["get"]
                     start_time = asyncio.get_event_loop().time()
-                    
+
                     await limiter.report_success()
-                    
+
                     async with aiohttp.ClientSession() as session:
                         while True:
                             if (
@@ -213,7 +279,9 @@ class ImageProvider:
 
                             await asyncio.sleep(1)
 
-                            async with session.get(get_url, headers=headers) as response:
+                            async with session.get(
+                                get_url, headers=headers
+                            ) as response:
                                 response.raise_for_status()
                                 prediction = await response.json()
 
@@ -227,7 +295,7 @@ class ImageProvider:
                                 )
                             if status == "canceled":
                                 raise Exception("Replicate prediction canceled.")
-                            
+
         except Exception:
             # If we retry, we handle it above. If we get here, it's a hard fail.
             # Only catch if we want to report failure to limiter.
@@ -258,14 +326,16 @@ class ImageProvider:
 
         url = f"{GOOGLE_IMAGE_BASE_URL}/{model}:generateContent?key={api_key}"
         headers = {"Content-Type": "application/json"}
-        
+
         image_config: dict[str, Any] = {
             "aspectRatio": aspect_ratio or "1:1",
         }
-        
+
         if resolution and resolution == "2048x2048":
-             image_config["imageSize"] = "4K"
-        
+            image_config["imageSize"] = "2K"
+        elif resolution and resolution == "4096x4096":
+            image_config["imageSize"] = "4K"
+
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"imageConfig": image_config},
@@ -275,8 +345,9 @@ class ImageProvider:
         data_bytes = await self._execute_request(
             url, headers, payload, IMAGE_PROVIDER_TIMEOUT_SEC, "google_image"
         )
-        
+
         import json
+
         data = json.loads(data_bytes)
 
         image_bytes = self._extract_google_image_bytes(data)
@@ -324,14 +395,26 @@ class ImageProvider:
         model: ImageModels,
         aspect_ratio: Optional[ImageAspectRatio] = None,
         resolution: Optional[ImageResolution] = None,
+        provider_config: Optional[dict] = None,
     ) -> bytes:
-        api_key = config.openai_api_key
-        if not api_key:
-            raise Exception("OpenAI API key not found. Please set it in the settings.")
-        
-        # ... logic for size ...
-        
-        url = f"{config.openai_endpoint or 'https://api.openai.com'}/v1/images/generations"
+        if provider_config:
+            api_key = provider_config["api_key"]
+            base_url = provider_config["base_url"]
+            # Assume base_url is root or v1. If it ends with v1, we append images/generations
+            if base_url.endswith("/v1"):
+                url = f"{base_url}/images/generations"
+            else:
+                url = f"{base_url}/v1/images/generations"
+            provider_name = provider_config["name"]
+        else:
+            api_key = config.openai_api_key
+            if not api_key:
+                raise Exception(
+                    "OpenAI API key not found. Please set it in the settings."
+                )
+            url = f"{config.openai_endpoint or 'https://api.openai.com'}/v1/images/generations"
+            provider_name = "openai"
+
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -350,10 +433,10 @@ class ImageProvider:
             # DALL-E 3 standard sizes are 1024x1024, 1024x1792, 1792x1024.
             # GPT-Image models might support "auto" or these sizes.
             # Using 1024x1024 as safe default if ratio isn't standard supported by model.
-        
+
         # Use resolution parameter if provided and valid for standard square
         if resolution == "2048x2048" and model == "dall-e-3":
-             pass
+            pass
 
         # Construct payload
         payload: dict[str, Any] = {
@@ -362,33 +445,34 @@ class ImageProvider:
             "n": 1,
             "response_format": "b64_json",
         }
-        
+
         if "gpt-image" in model:
-             if aspect_ratio == "1:1":
-                 payload["size"] = "1024x1024"
-             elif aspect_ratio == "16:9" or aspect_ratio == "4:3": # Approx
-                 payload["size"] = "1536x1024"
-             elif aspect_ratio == "9:16" or aspect_ratio == "3:4": # Approx
-                 payload["size"] = "1024x1536"
-             else:
-                 payload["size"] = "1024x1024" # Default
+            if aspect_ratio == "1:1":
+                payload["size"] = "1024x1024"
+            elif aspect_ratio == "16:9" or aspect_ratio == "4:3":  # Approx
+                payload["size"] = "1536x1024"
+            elif aspect_ratio == "9:16" or aspect_ratio == "3:4":  # Approx
+                payload["size"] = "1024x1536"
+            else:
+                payload["size"] = "1024x1024"  # Default
         else:
-             if aspect_ratio == "1:1":
-                 payload["size"] = "1024x1024"
-             elif aspect_ratio == "16:9":
-                 payload["size"] = "1792x1024"
-             elif aspect_ratio == "9:16":
-                 payload["size"] = "1024x1792"
-             else:
-                 payload["size"] = "1024x1024"
+            if aspect_ratio == "1:1":
+                payload["size"] = "1024x1024"
+            elif aspect_ratio == "16:9":
+                payload["size"] = "1792x1024"
+            elif aspect_ratio == "9:16":
+                payload["size"] = "1024x1792"
+            else:
+                payload["size"] = "1024x1024"
 
         data_bytes = await self._execute_request(
-            url, headers, payload, IMAGE_PROVIDER_TIMEOUT_SEC, "openai"
+            url, headers, payload, IMAGE_PROVIDER_TIMEOUT_SEC, provider_name
         )
-        
+
         import json
+
         data = json.loads(data_bytes)
-        
+
         try:
             b64_json = data["data"][0]["b64_json"]
             return base64.b64decode(b64_json)

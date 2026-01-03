@@ -100,17 +100,18 @@ class ChatProvider:
         provider_config: CustomProvider,
     ) -> str:
         api_key = provider_config["api_key"]
-        base_url = provider_config["base_url"]
+        base_url = provider_config["base_url"].rstrip("/")
 
-        # Ensure base_url ends with v1/chat/completions if not present?
-        # Standard OpenAI compatible usually requires the full URL or base?
-        # The user input "Base URL" usually implies the root.
-        # But for OpenAI it is https://api.openai.com/v1/chat/completions.
-        # If user puts "http://localhost:11434/v1", we might need to append /chat/completions?
-        # Let's assume user provides the FULL endpoint URL for simplicity and maximum flexibility,
-        # OR we try to be smart.
-        # Let's assume it IS the endpoint for chat completions.
-        url = base_url
+        # Intelligent URL guessing
+        if not base_url.endswith("/chat/completions"):
+            # If it ends in /v1, just append chat/completions
+            if base_url.endswith("/v1"):
+                url = f"{base_url}/chat/completions"
+            else:
+                # Otherwise assume it's a base URL and append full path
+                url = f"{base_url}/v1/chat/completions"
+        else:
+            url = base_url
 
         logger.debug(
             f"Custom Provider {provider_config['name']}: hitting {url} model: {model} retries {retry_count}"
@@ -134,11 +135,26 @@ class ChatProvider:
             "Content-Type": "application/json",
         }
 
+        # Check for reasoning models to allow longer timeouts
+        timeout = CHAT_CLIENT_TIMEOUT_SEC
+        lower_model = model.lower()
+        if (
+            "o1-" in lower_model
+            or "o3-" in lower_model
+            or "gemini-3" in lower_model
+            or "reasoning" in lower_model
+            or "thinking" in lower_model
+        ):
+            timeout = REASONING_CLIENT_TIMEOUT_SEC
+            logger.debug(
+                f"Custom Provider: Detected reasoning model {model}, using extended timeout {timeout}s"
+            )
+
         return await self._execute_request(
             url=url,
             headers=headers,
             json_payload=payload,
-            timeout_sec=CHAT_CLIENT_TIMEOUT_SEC,
+            timeout_sec=timeout,
             retry_count=retry_count,
             provider=provider_config["name"],
             prompt=prompt,
@@ -361,6 +377,40 @@ class ChatProvider:
             reasoning_effort=None,
         )
 
+    async def fetch_models(self, provider_config: CustomProvider) -> list[str]:
+        api_key = provider_config["api_key"]
+        base_url = provider_config["base_url"]
+
+        # Try to derive models endpoint from chat completion endpoint
+        url = base_url
+        if "/chat/completions" in url:
+            url = url.replace("/chat/completions", "/models")
+        else:
+            # Fallback: assume base_url is root or v1, try appending /models
+            if url.endswith("/"):
+                url = f"{url}models"
+            else:
+                url = f"{url}/models"
+
+        logger.debug(f"Fetching models for {provider_config['name']} from {url}")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session, session.get(url, headers=headers) as response:
+                response.raise_for_status()
+                data = await response.json()
+                # Standard OpenAI response: { "data": [ { "id": "model-id", ... } ] }
+                return sorted([model["id"] for model in data.get("data", [])])
+        except Exception as e:
+            logger.error(f"Failed to fetch models from {provider_config['name']}: {e}")
+            raise e
+
     async def _execute_request(
         self,
         url: str,
@@ -425,8 +475,9 @@ class ChatProvider:
 
         except asyncio.TimeoutError:
             logger.warning(f"{provider} request timed out")
-            # Timeouts are also a sign of congestion, back off
-            await limiter.report_failure()
+            # Timeouts are also a sign of congestion, but we don't back off RPM for them
+            # as it might just be a slow provider/model.
+            await limiter.report_timeout()
 
             if retry_count < MAX_RETRIES:
                 wait_time = (2**retry_count) * RETRY_BASE_SECONDS
@@ -443,6 +494,15 @@ class ChatProvider:
                     retry_count + 1,
                 )
             raise
+
+        except aiohttp.ClientResponseError as e:
+            # Handle 5xx errors differently from 429s in logs
+            if e.status != 429:
+                logger.warning(f"{provider} returned status {e.status}: {e.message}")
+
+            await limiter.report_failure()
+            raise
+
         except Exception:
             # Any other exception? Maybe report failure if it's network related?
             # For safety, let's treat generic exceptions as potentially overload related

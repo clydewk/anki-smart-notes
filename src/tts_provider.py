@@ -47,6 +47,13 @@ class TTSProvider:
         if strip_html:
             text = anki_strip_html(input)
 
+        # Check custom providers
+        custom_provider = next(
+            (p for p in (config.custom_providers or []) if p["name"] == provider), None
+        )
+        if custom_provider:
+            return await self._get_openai_tts(text, model, voice, custom_provider)
+
         if provider == "openai":
             return await self._get_openai_tts(text, model, voice)
         elif provider == "elevenLabs":
@@ -58,7 +65,9 @@ class TTSProvider:
             else:
                 return await self._get_google_tts(text, model, voice)
         elif provider == "azure":
-            raise NotImplementedError("Azure TTS is not currently supported in BYOK mode.")
+            raise NotImplementedError(
+                "Azure TTS is not currently supported in BYOK mode."
+            )
         else:
             raise ValueError(f"Unknown TTS provider: {provider}")
 
@@ -70,59 +79,95 @@ class TTSProvider:
         timeout_sec: int,
         provider: str,
         retry_count: int = 0,
-        **kwargs
+        **kwargs,
     ) -> bytes:
         limiter = get_rate_limiter(provider)
-        
+
         try:
             async with limiter:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        url, 
-                        headers=headers, 
-                        json=json_payload, 
+                        url,
+                        headers=headers,
+                        json=json_payload,
                         timeout=timeout_sec,
-                        **kwargs
+                        **kwargs,
                     ) as response:
                         if response.status == 429:
                             await limiter.report_failure()
-                            
+
                             if retry_count < MAX_RETRIES:
                                 wait_time = (2**retry_count) * RETRY_BASE_SECONDS
-                                logger.debug(f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}")
+                                logger.debug(
+                                    f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}"
+                                )
                                 await asyncio.sleep(wait_time)
                                 return await self._execute_request(
-                                    url, headers, json_payload, timeout_sec, provider, retry_count + 1, **kwargs
+                                    url,
+                                    headers,
+                                    json_payload,
+                                    timeout_sec,
+                                    provider,
+                                    retry_count + 1,
+                                    **kwargs,
                                 )
-                            
+
                             response.raise_for_status()
-                        
+
                         response.raise_for_status()
                         await limiter.report_success()
                         return await response.read()
 
         except asyncio.TimeoutError:
             logger.warning(f"{provider} request timed out")
-            await limiter.report_failure()
-            
+            await limiter.report_timeout()
+
             if retry_count < MAX_RETRIES:
                 wait_time = (2**retry_count) * RETRY_BASE_SECONDS
                 await asyncio.sleep(wait_time)
                 return await self._execute_request(
-                    url, headers, json_payload, timeout_sec, provider, retry_count + 1, **kwargs
+                    url,
+                    headers,
+                    json_payload,
+                    timeout_sec,
+                    provider,
+                    retry_count + 1,
+                    **kwargs,
                 )
+            raise
+
+        except aiohttp.ClientResponseError as e:
+            if e.status != 429:
+                logger.warning(f"{provider} returned status {e.status}: {e.message}")
+
+            await limiter.report_failure()
             raise
 
         except Exception:
             await limiter.report_failure()
             raise
 
-    async def _get_openai_tts(self, text: str, model: str, voice: str) -> bytes:
-        api_key = config.openai_api_key
-        if not api_key:
-            raise Exception("OpenAI API key not found.")
+    async def _get_openai_tts(
+        self, text: str, model: str, voice: str, provider_config: Optional[dict] = None
+    ) -> bytes:
+        if provider_config:
+            api_key = provider_config["api_key"]
+            base_url = provider_config["base_url"]
+            # Assume base_url is root or v1. If it ends with v1, we append audio/speech
+            if base_url.endswith("/v1"):
+                url = f"{base_url}/audio/speech"
+            else:
+                url = f"{base_url}/v1/audio/speech"
+            provider_name = provider_config["name"]
+        else:
+            api_key = config.openai_api_key
+            if not api_key:
+                raise Exception("OpenAI API key not found.")
+            url = (
+                f"{config.openai_endpoint or 'https://api.openai.com'}/v1/audio/speech"
+            )
+            provider_name = "openai"
 
-        url = f"{config.openai_endpoint or 'https://api.openai.com'}/v1/audio/speech"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -134,7 +179,7 @@ class TTSProvider:
         }
 
         return await self._execute_request(
-            url, headers, payload, TTS_PROVIDER_TIMEOUT_SEC, "openai"
+            url, headers, payload, TTS_PROVIDER_TIMEOUT_SEC, provider_name
         )
 
     async def _get_elevenlabs_tts(self, text: str, model: str, voice: str) -> bytes:
@@ -163,11 +208,11 @@ class TTSProvider:
             raise Exception("Google Cloud API key not found.")
 
         url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={api_key}"
-        
+
         # Parse voice name to get language code. Usually format is "en-US-Standard-A"
         # We need languageCode="en-US", name="en-US-Standard-A"
         language_code = "-".join(voice.split("-")[:2])
-        
+
         payload = {
             "input": {"text": text},
             "voice": {"languageCode": language_code, "name": voice},
@@ -177,12 +222,13 @@ class TTSProvider:
         # Google Cloud TTS has high limits, but usually uses standard cloud quotas
         # Note: Google TTS returns JSON with content, not raw bytes. _execute_request returns raw bytes.
         # We need to handle this.
-        
+
         data_bytes = await self._execute_request(
             url, None, payload, TTS_PROVIDER_TIMEOUT_SEC, "google"
         )
-        
+
         import json
+
         data = json.loads(data_bytes)
         return base64.b64decode(data["audioContent"])
 
@@ -192,42 +238,35 @@ class TTSProvider:
             raise Exception("Google API key not found.")
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        
+
         payload = {
-            "contents": [{
-                "parts":[{
-                    "text": text
-                }]
-            }],
+            "contents": [{"parts": [{"text": text}]}],
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": {
-                    "voiceConfig": {
-                        "prebuiltVoiceConfig": {
-                            "voiceName": voice
-                        }
-                    }
-                }
-            }
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+                },
+            },
         }
-        
+
         headers = {"Content-Type": "application/json"}
 
         # Use specific limiter for Gemini TTS which has restrictive quotas (10 RPM)
         data_bytes = await self._execute_request(
             url, headers, payload, TTS_PROVIDER_TIMEOUT_SEC, "google_tts"
         )
-        
+
         import json
+
         data = json.loads(data_bytes)
-        
+
         # Extract audio data
         # Structure: candidates[0].content.parts[0].inlineData.data
         try:
             inline_data = data["candidates"][0]["content"]["parts"][0]["inlineData"]
             audio_b64 = inline_data["data"]
             pcm_data = base64.b64decode(audio_b64)
-            
+
             # Convert raw PCM to WAV
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, "wb") as wav_file:
@@ -235,11 +274,12 @@ class TTSProvider:
                 wav_file.setsampwidth(2)  # 16-bit
                 wav_file.setframerate(24000)  # 24kHz
                 wav_file.writeframes(pcm_data)
-            
+
             return wav_buffer.getvalue()
-            
+
         except (KeyError, IndexError):
             logger.error(f"Unexpected response format from Google Gemini TTS: {data}")
             raise Exception("Failed to extract audio from Google Gemini response")
+
 
 tts_provider = TTSProvider()

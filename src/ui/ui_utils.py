@@ -54,10 +54,11 @@ def show_message_box(
 
     val = msg.exec()
     clicked_button = msg.clickedButton()
-    
+
     if clicked_button == copy_button:
         # Copy to clipboard
         from aqt import mw
+
         if mw:
             mw.app.clipboard().setText(copy_button_content)
         return False

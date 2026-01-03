@@ -32,9 +32,10 @@ from .models import (
     ChatModels,
     ChatProviders,
     CustomProvider,
-    ImageModels,
-    ImageProviders,
     ImageAspectRatio,
+    ImageModels,
+    ImageOutputFormat,
+    ImageProviders,
     ImageResolution,
     NoteTypeMap,
     OpenAIModels,
@@ -89,6 +90,8 @@ class Config:
     image_model: ImageModels
     image_aspect_ratio: Optional[ImageAspectRatio]
     image_resolution: Optional[ImageResolution]
+    image_output_format: Optional[ImageOutputFormat]
+    image_quality: Optional[int]
 
     # Dialogs / Migrations
     did_show_chained_error_dialog: bool
@@ -161,7 +164,7 @@ class Config:
         self._backup_config()
 
         logger.debug("Migration: prompts map migration for per-deck prompts")
-        old_prompts_map: OldPromptsMap = cast(OldPromptsMap, self.prompts_map)
+        old_prompts_map: OldPromptsMap = cast("OldPromptsMap", self.prompts_map)
         new_prompts_map: PromptMap = {"note_types": {}}
 
         for note_type, fields_and_extras in old_prompts_map["note_types"].items():
@@ -238,7 +241,7 @@ M = TypeVar("M", bound=Mapping[str, object])
 # TODO: make this use the none_defaulting (too much type golf for now tho)
 def key_or_config_val(vals: Optional[M], k: str) -> T:  # type: ignore
     return (
-        cast(T, vals[k])
+        cast("T", vals[k])
         if (vals and vals.get(k) is not None)
-        else cast(T, config.__getattr__(k))
+        else cast("T", config.__getattr__(k))
     )

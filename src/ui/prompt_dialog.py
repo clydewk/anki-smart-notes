@@ -33,9 +33,6 @@ from aqt import (
     QLabel,
     QMenu,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QSpacerItem,
     Qt,
     QTabWidget,
     QTextEdit,
@@ -291,7 +288,7 @@ class PromptDialog(QDialog):
         # 1. Settings Area
         settings_group = QGroupBox("Settings")
         form_layout = QFormLayout()
-        
+
         self.note_combo_box = ReactiveComboBox(
             self.state, "note_types", "selected_note_type"
         )
@@ -322,14 +319,14 @@ class PromptDialog(QDialog):
         )
         self.field_combo_box.setToolTip(text["destination_explanation"][field_type])
         form_layout.addRow("Target Field:", self.field_combo_box)
-        
+
         settings_group.setLayout(form_layout)
         layout.addWidget(settings_group)
 
         # 2. Prompting Area
         prompt_group = QGroupBox("Prompt Generation")
         prompt_layout = QVBoxLayout()
-        
+
         # Style Instructions for Gemini TTS
         if self.state.s["type"] == "tts":
             style_label = QLabel("Style Instructions (Gemini Only):")
@@ -340,11 +337,15 @@ class PromptDialog(QDialog):
             self.tts_style_box.setWordWrapMode(
                 QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
             )
-            self.tts_style_box.setPlaceholderText('e.g. "Read aloud in a warm and friendly tone: "')
+            self.tts_style_box.setPlaceholderText(
+                'e.g. "Read aloud in a warm and friendly tone: "'
+            )
             self.tts_style_box.setMinimumHeight(60)
             self.tts_style_box.setMaximumHeight(80)
-            self.tts_style_box.on_change.connect(lambda text: self.state.update({"tts_style": text}))
-            
+            self.tts_style_box.on_change.connect(
+                lambda text: self.state.update({"tts_style": text})
+            )
+
             prompt_layout.addWidget(style_label)
             prompt_layout.addWidget(self.tts_style_box)
             prompt_layout.addSpacing(12)
@@ -355,12 +356,12 @@ class PromptDialog(QDialog):
         prompt_label.setFont(font_bold)
         prompt_label_layout.addWidget(prompt_label)
         prompt_label_layout.addStretch()
-        
+
         insert_btn = QPushButton("Insert Field ➕")
         insert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         insert_btn.clicked.connect(self.show_insert_field_menu)
         prompt_label_layout.addWidget(insert_btn)
-        
+
         prompt_layout.addLayout(prompt_label_layout)
 
         self.prompt_text_box = ReactiveEditText(self.state, "prompt")
@@ -369,11 +370,11 @@ class PromptDialog(QDialog):
         self.prompt_text_box.setWordWrapMode(
             QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
         )
-        
+
         current_explanation = tts_explanation if field_type == "tts" else explanation
         self.prompt_text_box.setPlaceholderText(current_explanation)
         self.prompt_text_box.setMinimumHeight(120)
-        
+
         prompt_layout.addWidget(self.prompt_text_box)
         prompt_group.setLayout(prompt_layout)
         layout.addWidget(prompt_group)
@@ -381,15 +382,17 @@ class PromptDialog(QDialog):
         # 3. Footer
         self.test_button = QPushButton("✨ Test Smart Field ✨")
         self.test_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        
+
         footer_layout = QHBoxLayout()
-        
+
         # Enabled Box with tooltip explanation
-        self.enabled_box.setToolTip("Enable or disable this field. Disabled fields can be generated via right clicking a field in the editor.")
+        self.enabled_box.setToolTip(
+            "Enable or disable this field. Disabled fields can be generated via right clicking a field in the editor."
+        )
         footer_layout.addWidget(self.enabled_box)
         footer_layout.addStretch()
         footer_layout.addWidget(self.test_button)
-        
+
         layout.addLayout(footer_layout)
 
         self.state.state_changed.connect(self.render_ui)
@@ -418,7 +421,7 @@ class PromptDialog(QDialog):
             self.field_combo_box.setEnabled(False)
             self.deck_combo_box.setEnabled(False)
             if hasattr(self, "tts_source_combo_box"):
-                self.tts_source_combo_box.setEnabled(False) 
+                self.tts_source_combo_box.setEnabled(False)
         return container
 
     def show_insert_field_menu(self):
@@ -429,7 +432,7 @@ class PromptDialog(QDialog):
             deck_id=self.state.s["selected_deck"],
             prompts_map=self.prompts_map,
         )
-        
+
         if not fields:
             no_fields = QAction("No fields available", self)
             no_fields.setEnabled(False)
@@ -439,7 +442,7 @@ class PromptDialog(QDialog):
                 action = QAction(field, self)
                 action.triggered.connect(lambda _, f=field: self.insert_field_token(f))
                 menu.addAction(action)
-            
+
         menu.exec(QCursor.pos())
 
     def insert_field_token(self, field: str):
@@ -470,7 +473,7 @@ class PromptDialog(QDialog):
         batch_layout.addWidget(QLabel("Regenerate when batch processing:"))
         batch_layout.addWidget(self.regenerate_batch_checkbox)
         models_layout.addWidget(batch_box)
-        
+
         batch_desc = QLabel(
             "If checked, this field always overwrites its value during batch generation."
         )
@@ -567,7 +570,9 @@ class PromptDialog(QDialog):
         )
         self.state.update(
             {
-                "regenerate_when_batching": extras.get("regenerate_when_batching", False)
+                "regenerate_when_batching": extras.get(
+                    "regenerate_when_batching", False
+                )
                 if extras
                 else False
             }
@@ -845,6 +850,12 @@ class PromptDialog(QDialog):
             run_async_in_background_with_sentry(img_fn, on_success, on_failure)
 
     def _ensure_api_key(self, provider: str) -> bool:
+        # Check custom providers first
+        if config.custom_providers:
+            for p in config.custom_providers:
+                if p["name"] == provider:
+                    return True
+
         key_attr = PROVIDER_API_KEY_ATTRS.get(provider)
         if not key_attr:
             return True
@@ -857,7 +868,7 @@ class PromptDialog(QDialog):
         self.enabled_box.setChecked(self.state.s["generate_automatically"])
 
     def render_valid_fields(self) -> None:
-        pass # Replaced by Insert button
+        pass  # Replaced by Insert button
 
     def _get_valid_target_fields(
         self,
@@ -957,7 +968,7 @@ class PromptDialog(QDialog):
 
     def _create_new_prompts_map(self) -> PromptMap:
         s = self.state.s
-        
+
         # Inject style into the tts_options that gets passed down
         tts_options = cast(
             "OverrideableTTSOptionsDict",

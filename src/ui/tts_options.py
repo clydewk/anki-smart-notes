@@ -228,7 +228,7 @@ def get_eleven_voices() -> list[TTSMeta]:
                 "model": model["model"],
                 "friendly_voice": f"{voice['name'].capitalize()} ({friendly_models[model['model']]})",
                 "gender": voice["gender"],
-                "price_tier": cast(PriceTiers, model["price_tier"]),
+                "price_tier": cast("PriceTiers", model["price_tier"]),
             }
 
             voices.append(ttsMeta)
@@ -272,10 +272,36 @@ def get_azure_voices() -> list[TTSMeta]:
 
 def get_gemini_voices() -> list[TTSMeta]:
     gemini_voice_names = [
-        "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe",
-        "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome",
-        "Algenib", "Rasalgethi", "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux",
-        "Pulcherrima", "Achird", "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat"
+        "Zephyr",
+        "Puck",
+        "Charon",
+        "Kore",
+        "Fenrir",
+        "Leda",
+        "Orus",
+        "Aoede",
+        "Callirrhoe",
+        "Autonoe",
+        "Enceladus",
+        "Iapetus",
+        "Umbriel",
+        "Algieba",
+        "Despina",
+        "Erinome",
+        "Algenib",
+        "Rasalgethi",
+        "Laomedeia",
+        "Achernar",
+        "Alnilam",
+        "Schedar",
+        "Gacrux",
+        "Pulcherrima",
+        "Achird",
+        "Zubenelgenubi",
+        "Vindemiatrix",
+        "Sadachbia",
+        "Sadaltager",
+        "Sulafat",
     ]
     voices: list[TTSMeta] = []
     # Only adding Flash for now to avoid cluttering the UI too much, users can override model if needed?
@@ -284,32 +310,42 @@ def get_gemini_voices() -> list[TTSMeta]:
     # The user can override model in "Model Settings" tab (which calls render_custom_model -> TTSOptions with specific args).
     # But for default settings...
     # I'll add both.
-    
+
     models: list[tuple[str, PriceTiers]] = [
         ("gemini-2.5-flash-preview-tts", "low"),
-        ("gemini-2.5-pro-preview-tts", "standard")
+        ("gemini-2.5-pro-preview-tts", "standard"),
     ]
-    
+
     for name in gemini_voice_names:
         for model, tier in models:
             friendly_model = "Flash" if "flash" in model else "Pro"
-            voices.append({
-                "tts_provider": "google",
-                "voice": name,
-                "model": model,
-                "friendly_voice": f"{name} (Gemini {friendly_model})",
-                "gender": "All",
-                "language": ALL, 
-                "price_tier": tier
-            })
+            voices.append(
+                {
+                    "tts_provider": "google",
+                    "voice": name,
+                    "model": model,
+                    "friendly_voice": f"{name} (Gemini {friendly_model})",
+                    "gender": "All",
+                    "language": ALL,
+                    "price_tier": tier,
+                }
+            )
     return voices
 
 
 # Combine all voices
-voices = get_google_voices() + openai_voices + get_eleven_voices() + get_azure_voices() + get_gemini_voices()
+base_voices = (
+    get_google_voices()
+    + openai_voices
+    + get_eleven_voices()
+    + get_azure_voices()
+    + get_gemini_voices()
+)
+voices = base_voices.copy()
 
 languages: list[str] = [ALL] + sorted({voice["language"] for voice in voices} - {ALL})
-providers: list[AllTTSProviders] = [ALL, "google", "openai", "elevenLabs", "azure"]
+base_providers: list[AllTTSProviders] = [ALL, "google", "openai", "elevenLabs", "azure"]
+providers: list[AllTTSProviders] = base_providers.copy()
 
 
 def format_voice(voice: TTSMeta) -> str:
@@ -368,12 +404,104 @@ class TTSOptions(QWidget):
         super().__init__()
         self.extras_visible = extras_visible
 
+        # Merge custom models into available models
+        self._inject_custom_models()
+
         self.state = StateManager[TTSState](self.get_initial_state(tts_options))
         self.search_timer = QTimer()
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self.update_search)
         self.pending_search_text = ""
         self.setup_ui()
+
+    def refresh_custom_providers(self) -> None:
+        global voices, providers, voice_search_cache
+
+        # Reset to base
+        voices[:] = base_voices[:]
+        providers[:] = base_providers[:]
+
+        # Rebuild cache for base voices
+        voice_search_cache.clear()
+        for v in voices:
+            voice_search_cache[(v["tts_provider"], v["voice"], v["model"])] = (
+                format_voice(v).lower().split()
+            )
+
+        # Inject custom models
+        self._inject_custom_models()
+
+        # Update state
+        available_models = [ALL] + sorted(list({v["model"] for v in voices}))
+
+        self.state.update({"providers": providers[:], "models": available_models})
+
+        # Refresh the list view
+        self.voices_models.update_data(self.get_visible_voice_filters())
+        self.voice_box.setTitle(f"🗣️ Voices ({len(self.voices_models.get_data())})")
+
+    def _inject_custom_models(self) -> None:
+        if not config.custom_providers:
+            return
+
+        for provider in config.custom_providers:
+            caps = provider.get("capabilities", [])
+            # If capabilities list is empty or explicitly contains "tts"
+            if not caps or "tts" in caps:
+                p_name = provider["name"]
+
+                # Check for tts_models first, then fallback to models
+                models_to_add = []
+                if provider.get("tts_models"):
+                    models_to_add = provider["tts_models"]  # type: ignore
+                elif provider.get("models"):
+                    models_to_add = provider["models"]  # type: ignore
+
+                if not models_to_add:
+                    continue
+
+                # Add provider to providers list if not present
+                if p_name not in providers:
+                    providers.append(p_name)  # type: ignore
+
+                # Add voices/models
+                for m in models_to_add:
+                    # Check if already added to avoid duplicates
+                    exists = any(
+                        v["tts_provider"] == p_name and v["model"] == m for v in voices
+                    )
+                    if exists:
+                        continue
+
+                    # Create a "voice" entry for this model
+                    # For custom OpenAI-compatible TTS, the "voice" is usually a parameter passed in payload
+                    # But often the MODEL itself is what we select here if we treat it like other providers?
+                    # Actually standard OpenAI TTS has `model` (tts-1) and `voice` (alloy).
+                    # Custom providers might just have models.
+                    # Or they might support `voice` parameter.
+                    # Our config supports both `tts_model` and `tts_voice`.
+                    # If the custom provider lists "models", are these models or voices?
+                    # Usually "models".
+                    # So we should probably list them as models, and maybe have a generic voice or assume models imply voices?
+                    # For simplicity, let's treat the model name as the voice name too, or generic.
+                    # Let's add a generic entry.
+
+                    voices.append(
+                        {
+                            "tts_provider": p_name,  # type: ignore
+                            "voice": m,  # Use model name as voice name for simplicity in list
+                            "model": m,
+                            "friendly_voice": f"{m} ({p_name})",
+                            "gender": ALL,
+                            "language": ALL,
+                            "price_tier": "standard",
+                        }
+                    )
+
+                    # Update search cache
+                    voice_search_cache[(p_name, m, m)] = (
+                        format_voice(voices[-1]).lower().split()
+                    )
 
     def setup_ui(self) -> None:
         self.voices_list = QListView()
@@ -446,21 +574,23 @@ class TTSOptions(QWidget):
         filters_layout.addRow("Model Type:", model)
 
         return filters_box
-    
+
     def _on_provider_filter_change(self, provider: str) -> None:
         # Filter models based on provider
         available_models = {
-            v["model"] 
-            for v in voices 
+            v["model"]
+            for v in voices
             if provider == ALL or v["tts_provider"] == provider
         }
         new_models = [ALL] + sorted(list(available_models))
-        
-        self.state.update({
-            "selected_provider": provider,
-            "models": new_models,
-            "selected_filter_model": ALL
-        })
+
+        self.state.update(
+            {
+                "selected_provider": provider,
+                "models": new_models,
+                "selected_filter_model": ALL,
+            }
+        )
 
     def render_voices_list(self) -> QWidget:
         self.voice_box = QGroupBox(f"🗣️ Voices ({len(voices)})")
@@ -653,7 +783,7 @@ class TTSOptions(QWidget):
                 self.state.s["selected_filter_model"] == ALL
                 or voice["model"] == self.state.s["selected_filter_model"]
             )
-            
+
             if not matches_model:
                 continue
 

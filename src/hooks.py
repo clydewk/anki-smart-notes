@@ -26,7 +26,6 @@ from collections.abc import Sequence
 from typing import Any, Callable, Optional
 
 from anki.cards import Card
-from anki.notes import Note
 from aqt import QAction, QMenu, browser, editor, gui_hooks, mw
 from aqt.addcards import AddCards
 from aqt.browser.sidebar.item import SidebarItemType
@@ -35,7 +34,7 @@ from .config import config
 from .decks import deck_id_to_name_map
 from .logger import logger, setup_logger
 from .migrations import migrate_models
-from .note_proccessor import NoteProcessor, BatchStatistics
+from .note_proccessor import BatchStatistics, NoteProcessor
 from .notes import get_field_from_index, is_ai_field, is_card_fully_processed
 from .sentry import with_sentry
 from .tasks import run_async_in_background
@@ -187,58 +186,71 @@ def make_on_batch_success(
         def pluralize(word: str, count: int) -> str:
             return f"{count} {word}{'s' if count != 1 else ''}"
 
+        debug_info = ""
+        was_cancelled = stats.was_cancelled
+
+        if config.debug:
+            duration = stats.end_time - stats.start_time
+            notes_per_sec = len(updated) / duration if duration > 0 else 0
+
+            debug_parts = []
+            debug_parts.append("--- Batch Processing Report ---")
+            if was_cancelled:
+                debug_parts.append("Status: Cancelled")
+            debug_parts.append(f"Time Taken: {duration:.2f}s")
+            debug_parts.append(f"Processing Speed: {notes_per_sec:.2f} notes/sec")
+            debug_parts.append(f"Database Writes: {stats.db_writes}")
+            debug_parts.append(f"Processed: {len(updated)}")
+            debug_parts.append(f"Failed: {len(errors)}")
+            debug_parts.append(f"Skipped: {len(skipped)}")
+
+            if updated_fields:
+                field_list = ", ".join(sorted(list(updated_fields)))
+                debug_parts.append(f"Fields processed: {field_list}")
+
+            if stats.rate_limits:
+                debug_parts.append("\n--- Rate Limits (RPM) ---")
+                for provider, rpm in stats.rate_limits.items():
+                    debug_parts.append(f"{provider}: {rpm:.1f}")
+
+            if errors:
+                debug_parts.append("\n--- Failures ---")
+                for note in errors:
+                    msg = error_details.get(note.id, "Unknown error")
+                    debug_parts.append(f"Note ID {note.id} failed: {msg}")
+
+            if stats.logs:
+                debug_parts.append("\n--- Execution Logs ---")
+                debug_parts.extend(stats.logs)
+
+            debug_info = "\n".join(debug_parts)
+
         if not len(updated) and len(errors):
-            show_message_box("All notes failed. Check your API keys and configuration.")
+            show_message_box(
+                "All notes failed. Check your API keys and configuration.",
+                copy_button_text="Copy Debug Info" if debug_info else None,
+                copy_button_content=debug_info if debug_info else None,
+            )
         else:
             parts = []
             if len(updated):
-                parts.append(f"Processed {pluralize('note', len(updated))} successfully")
-            
+                parts.append(
+                    f"Processed {pluralize('note', len(updated))} successfully"
+                )
+
             if len(errors):
                 parts.append(f"{pluralize('note', len(errors))} failed")
-            
+
             if len(skipped):
                 parts.append(f"{pluralize('note', len(skipped))} skipped")
 
-            debug_info = ""
-            if config.debug:
-                duration = stats.end_time - stats.start_time
-                notes_per_sec = len(updated) / duration if duration > 0 else 0
-                
-                debug_parts = []
-                debug_parts.append(f"--- Batch Processing Report ---")
-                debug_parts.append(f"Time Taken: {duration:.2f}s")
-                debug_parts.append(f"Processing Speed: {notes_per_sec:.2f} notes/sec")
-                debug_parts.append(f"Database Writes: {stats.db_writes}")
-                debug_parts.append(f"Processed: {len(updated)}")
-                debug_parts.append(f"Failed: {len(errors)}")
-                debug_parts.append(f"Skipped: {len(skipped)}")
-                
-                if updated_fields:
-                    field_list = ", ".join(sorted(list(updated_fields)))
-                    debug_parts.append(f"Fields processed: {field_list}")
-
-                if stats.rate_limits:
-                    debug_parts.append("\n--- Rate Limits (RPM) ---")
-                    for provider, rpm in stats.rate_limits.items():
-                        debug_parts.append(f"{provider}: {rpm:.1f}")
-                
-                if errors:
-                    debug_parts.append("\n--- Failures ---")
-                    for note in errors:
-                        msg = error_details.get(note.id, "Unknown error")
-                        debug_parts.append(f"Note ID {note.id} failed: {msg}")
-
-                if stats.logs:
-                    debug_parts.append("\n--- Execution Logs ---")
-                    debug_parts.extend(stats.logs)
-
-                debug_info = "\n".join(debug_parts)
+            if was_cancelled:
+                parts.append("Batch processing cancelled")
 
             show_message_box(
                 ". ".join(parts) + ".",
                 copy_button_text="Copy Debug Info" if debug_info else None,
-                copy_button_content=debug_info if debug_info else None
+                copy_button_content=debug_info if debug_info else None,
             )
 
     return wrapped_on_batch_success
@@ -264,7 +276,7 @@ def on_browser_context(processor: NoteProcessor, browser: browser.Browser, menu:
 
 def on_start_actions() -> None:
     perform_update_check()
-    
+
     # Cache decks for autocomplete
     async def cache_leaf_decks_map():
         deck_id_to_name_map()

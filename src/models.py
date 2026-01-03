@@ -61,7 +61,10 @@ anthropic_chat_models: list[ChatModels] = [
 
 deepseek_chat_models: list[ChatModels] = ["deepseek-v3"]
 
-google_chat_models: list[ChatModels] = ["gemini-3-flash-preview", "gemini-3-pro-preview"]
+google_chat_models: list[ChatModels] = [
+    "gemini-3-flash-preview",
+    "gemini-3-pro-preview",
+]
 
 provider_model_map: dict[ChatProviders, list[ChatModels]] = {
     "openai": openai_chat_models,
@@ -115,7 +118,13 @@ def openai_reasoning_efforts_for_model(model: str) -> list[OpenAIReasoningEffort
 
 OpenAITTSModels = Literal["tts-1"]
 ElevenTTSModels = Literal["eleven_multilingual_v2"]
-GoogleModels = Literal["standard", "wavenet", "neural", "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"]
+GoogleModels = Literal[
+    "standard",
+    "wavenet",
+    "neural",
+    "gemini-2.5-flash-preview-tts",
+    "gemini-2.5-pro-preview-tts",
+]
 AzureModels = Literal["standard", "neural"]
 TTSModels = Union[OpenAITTSModels, ElevenTTSModels, GoogleModels, AzureModels]
 
@@ -138,12 +147,16 @@ SmartFieldType = Literal["chat", "tts", "image"]
 
 ReplicateImageModels = Literal["flux-dev", "flux-schnell"]
 GoogleImageModels = Literal["gemini-3-pro-image-preview"]
-OpenAIImageModels = Literal["gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini", "dall-e-3"]
+OpenAIImageModels = Literal[
+    "gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini", "dall-e-3"
+]
 ImageModels = Union[ReplicateImageModels, GoogleImageModels, OpenAIImageModels]
 
 ImageProviders = Literal["replicate", "google", "openai"]
 ImageAspectRatio = Literal["1:1", "16:9", "4:3", "3:4", "9:16"]
-ImageResolution = Literal["1024x1024", "2048x2048"] # Simplified
+ImageResolution = Literal["1024x1024", "2048x2048", "4096x4096"]  # Simplified
+ImageOutputFormat = Literal["webp", "png", "jpeg", "avif"]
+
 
 class FieldExtras(TypedDict):
     automatic: bool
@@ -169,6 +182,8 @@ class FieldExtras(TypedDict):
     image_model: Optional[ImageModels]
     image_aspect_ratio: Optional[ImageAspectRatio]
     image_resolution: Optional[ImageResolution]
+    image_output_format: Optional[ImageOutputFormat]
+    image_quality: Optional[int]  # 0-100, -1 for default/lossless if format supports it
     regenerate_when_batching: bool
 
 
@@ -194,6 +209,8 @@ DEFAULT_EXTRAS: FieldExtras = {
     "image_model": None,
     "image_aspect_ratio": None,
     "image_resolution": None,
+    "image_output_format": None,
+    "image_quality": None,
     "regenerate_when_batching": False,
 }
 
@@ -255,6 +272,13 @@ class CustomProvider(TypedDict):
     name: str
     base_url: str
     api_key: str
+    models: list[str]
+    capabilities: list[str]  # "chat", "tts", "image"
+
+    # Granular capability lists
+    chat_models: Optional[list[str]]
+    tts_models: Optional[list[str]]
+    image_models: Optional[list[str]]
 
 
 class ProviderSettings(TypedDict):
@@ -276,6 +300,8 @@ OverridableImageOptions = Union[
     Literal["image_model"],
     Literal["image_aspect_ratio"],
     Literal["image_resolution"],
+    Literal["image_output_format"],
+    Literal["image_quality"],
 ]
 
 overridable_image_options: list[OverridableImageOptions] = [
@@ -283,6 +309,8 @@ overridable_image_options: list[OverridableImageOptions] = [
     "image_provider",
     "image_aspect_ratio",
     "image_resolution",
+    "image_output_format",
+    "image_quality",
 ]
 
 
@@ -291,3 +319,5 @@ class OverridableImageOptionsDict(TypedDict):
     image_provider: Optional[ImageProviders]
     image_aspect_ratio: Optional[ImageAspectRatio]
     image_resolution: Optional[ImageResolution]
+    image_output_format: Optional[ImageOutputFormat]
+    image_quality: Optional[int]

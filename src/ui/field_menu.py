@@ -70,7 +70,6 @@ class FieldMenu:
         generate_item = QAction("✨ Generate Smart Field", self.menu)
 
         def wrapped() -> None:
-
             def on_success(_: bool):
                 self.editor.loadNote()
 

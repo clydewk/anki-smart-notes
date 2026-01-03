@@ -22,6 +22,7 @@ import sys
 from unittest.mock import MagicMock
 
 import pytest
+
 from tests.mocks import MockConfig
 
 # Mock anki modules before they are imported

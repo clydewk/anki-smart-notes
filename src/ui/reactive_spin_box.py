@@ -19,12 +19,35 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Any, Generic, TypeVar
 
-from aqt import QDoubleSpinBox, pyqtSignal
+from aqt import QDoubleSpinBox, QSpinBox, pyqtSignal
 
 from .reactive_widget import ReactiveWidget
 from .state_manager import StateManager
 
 T = TypeVar("T")
+
+
+class ReactiveSpinBox(ReactiveWidget[T], QSpinBox, Generic[T]):
+    on_change = pyqtSignal(int)
+
+    def __init__(self, state: StateManager[T], key: str, **kwargs: Any):
+        super().__init__(state, **kwargs)
+        self._key = key
+
+        state.bind(self)
+
+        self.valueChanged.connect(self._on_state_changed)
+        self.on_change.connect(lambda val: state.update({key: val}))
+
+    def _update_from_state(self, updates: dict[str, Any]) -> None:
+        if val := updates.get(self._key):
+            self.setValue(val)
+
+    def _on_state_changed(self, value: int) -> None:
+        if self._state.updating:
+            return
+
+        self.on_change.emit(value)
 
 
 class ReactiveDoubleSpinBox(ReactiveWidget[T], QDoubleSpinBox, Generic[T]):
@@ -37,6 +60,7 @@ class ReactiveDoubleSpinBox(ReactiveWidget[T], QDoubleSpinBox, Generic[T]):
         state.bind(self)
 
         self.valueChanged.connect(self._on_state_changed)
+        self.on_change.connect(lambda val: state.update({key: val}))
 
     def _update_from_state(self, updates: dict[str, Any]) -> None:
         self.setValue(updates[self._key])

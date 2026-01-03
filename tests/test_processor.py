@@ -20,6 +20,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import pytest
+
 from tests.mocks import (
     MockAppState,
     MockChatClient,
@@ -28,7 +29,6 @@ from tests.mocks import (
     MockOpenAIClient,
     p,
 )
-
 
 NOTE_TYPE_NAME = "note_type_1"
 

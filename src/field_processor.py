@@ -24,12 +24,12 @@ from anki.notes import Note
 from aqt import mw
 
 from .chat_provider import ChatProvider, chat_provider
-from .config import key_or_config_val, config
+from .config import config, key_or_config_val
 from .constants import API_KEY_MISSING_MESSAGE
 from .image_provider import ImageProvider, image_provider
 from .logger import logger
 from .markdown import convert_markdown_to_html
-from .media_utils import get_media_path
+from .media_utils import convert_image_data, get_media_path
 from .models import (
     DEFAULT_EXTRAS,
     ChatModels,
@@ -37,6 +37,7 @@ from .models import (
     ElevenVoices,
     ImageAspectRatio,
     ImageModels,
+    ImageOutputFormat,
     ImageProviders,
     ImageResolution,
     OpenAIReasoningEffort,
@@ -115,7 +116,9 @@ class FieldProcessor:
             if not tts_response:
                 return None
 
-            file_name = get_media_path(note, node.field, "wav" if "gemini" in tts_model else "mp3")
+            file_name = get_media_path(
+                note, node.field, "wav" if "gemini" in tts_model else "mp3"
+            )
             path = media.write_data(file_name, tts_response)
 
             return f"[sound:{path}]"
@@ -135,7 +138,7 @@ class FieldProcessor:
                 prompt=input,
                 model=chat_model,
                 provider=chat_provider,
-                temperature=chat_temperature,
+                temperature=temperature,
                 reasoning_effort=chat_reasoning_effort,
                 field_lower=node.field,
                 should_convert_to_html=should_convert,
@@ -159,6 +162,10 @@ class FieldProcessor:
             image_resolution: Optional[ImageResolution] = key_or_config_val(
                 extras, "image_resolution"
             )
+            image_output_format: ImageOutputFormat = (
+                key_or_config_val(extras, "image_output_format") or "webp"
+            )
+            image_quality: int = key_or_config_val(extras, "image_quality") or -1
 
             image_response = await self.get_image_response(
                 note=note,
@@ -167,12 +174,15 @@ class FieldProcessor:
                 provider=image_provider,
                 aspect_ratio=image_aspect_ratio,
                 resolution=image_resolution,
+                output_format=image_output_format,
+                quality=image_quality,
                 show_error_box=show_error_box,
             )
             if not image_response:
                 return None
 
-            file_name = get_media_path(note, node.field, "webp")
+            ext = image_output_format if image_output_format != "jpeg" else "jpg"
+            file_name = get_media_path(note, node.field, ext)
             path = media.write_data(file_name, image_response)
             return f'<img src="{path}"/>'
         else:
@@ -198,7 +208,7 @@ class FieldProcessor:
 
         # Check for API key
         if not self._check_api_key(provider, show_error_box):
-             return None
+            return None
 
         resp = await self.chat_provider.async_get_chat_response(
             interpolated_prompt,
@@ -249,6 +259,8 @@ class FieldProcessor:
         provider: ImageProviders,
         aspect_ratio: Optional[ImageAspectRatio] = None,
         resolution: Optional[ImageResolution] = None,
+        output_format: Optional[str] = None,
+        quality: Optional[int] = None,
         show_error_box: bool = True,
     ) -> Optional[bytes]:
         interpolated_prompt = interpolate_prompt(input_text, note)
@@ -259,17 +271,42 @@ class FieldProcessor:
         if not self._check_api_key(provider, show_error_box):
             return None
 
-        return await self.image_provider.async_get_image_response(
+        raw_bytes = await self.image_provider.async_get_image_response(
             prompt=interpolated_prompt,
             model=model,
             provider=provider,
             note_id=note.id,
             aspect_ratio=aspect_ratio,
             resolution=resolution,
+            output_format=output_format,
+            quality=quality,
         )
 
+        if not raw_bytes:
+            return None
+
+        # Ensure format and quality
+        try:
+            return convert_image_data(
+                raw_bytes,
+                format=output_format or "webp",
+                quality=quality if quality is not None else -1,
+            )
+        except Exception as e:
+            logger.error(f"Failed to convert image: {e}")
+            if show_error_box:
+                run_on_main(lambda: show_message_box(f"Failed to convert image: {e}"))
+            return None
+
     def _check_api_key(self, provider: str, show_error_box: bool) -> bool:
-        has_key = False
+        # First check if this matches a custom provider
+        # Custom providers manage their own keys
+        if config.custom_providers:
+            for p in config.custom_providers:
+                if p["name"] == provider:
+                    return True
+
+        has_key = True
         if provider == "openai":
             has_key = bool(config.openai_api_key)
         elif provider == "anthropic":
@@ -282,17 +319,15 @@ class FieldProcessor:
             has_key = bool(config.elevenlabs_api_key)
         elif provider == "replicate":
             has_key = bool(config.replicate_api_key)
-        
+
         if not has_key:
             logger.error(f"Missing API key for {provider}")
             if show_error_box:
                 run_on_main(
-                    lambda: show_message_box(
-                        API_KEY_MISSING_MESSAGE.format(provider)
-                    )
+                    lambda: show_message_box(API_KEY_MISSING_MESSAGE.format(provider))
                 )
             return False
-        
+
         return True
 
 

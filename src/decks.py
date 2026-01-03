@@ -51,7 +51,7 @@ def deck_id_to_name_map() -> dict[DeckId, str]:
             else:
                 leaves.append(node)
 
-        cached_leaf_decks = {cast(DeckId, node.deck_id): node.name for node in leaves}
+        cached_leaf_decks = {cast("DeckId", node.deck_id): node.name for node in leaves}
         cached_leaf_decks[GLOBAL_DECK_ID] = GLOBAL_DECK_NAME
         logger.debug("Cached leaf decks map")
         logger.debug(cached_leaf_decks)

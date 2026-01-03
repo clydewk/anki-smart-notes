@@ -40,11 +40,13 @@ class ReactiveComboBox(ReactiveWidget[T], QComboBox, Generic[T]):
         # Internally can't use int bc huge ints will cause overflow (thx insane anki deck ids), but
         # pretend to outside consumers
         int_keys: bool = False,
+        editable: bool = False,
         **kwargs: Any,
     ):
         if render_map is None:
             render_map = {}
         super().__init__(state, **kwargs)
+        self.setEditable(editable)
         self._fields_key = fields_key
         self._selected_key = selected_key
         self.state_to_ui = render_map

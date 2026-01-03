@@ -137,9 +137,4 @@ def get_valid_fields_for_prompt(
 ) -> list[str]:
     """Gets all fields excluding the selected one, if one is selected"""
     fields = get_fields(selected_note_type)
-    return [
-        field
-        for field in fields
-        if field != selected_note_field
-    ]
-
+    return [field for field in fields if field != selected_note_field]

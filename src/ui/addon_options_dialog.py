@@ -17,9 +17,9 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Any, Optional, TypedDict
 import html
 import re
+from typing import Any, Optional, TypedDict
 from urllib.parse import urlparse
 
 from aqt import (
@@ -60,6 +60,7 @@ from ..note_proccessor import NoteProcessor
 from ..prompts import get_all_prompts, get_extras, get_prompts_for_note, remove_prompt
 from ..utils import get_fields, get_version
 from .chat_options import ChatOptions
+from .custom_provider_dialog import CustomProviderDialog
 from .image_options import ImageOptions
 from .prompt_dialog import PromptDialog
 from .reactive_check_box import ReactiveCheckBox
@@ -115,7 +116,7 @@ class State(TypedDict):
     google_api_key: Optional[str]
     elevenlabs_api_key: Optional[str]
     replicate_api_key: Optional[str]
-    
+
     custom_providers: list[CustomProvider]
     search_text: str
 
@@ -226,7 +227,7 @@ class AddonOptionsDialog(QDialog):
         self.setLayout(tab_layout)
         self.state.state_changed.connect(self.render_ui)
         self.state.state_changed.connect(self.on_state_changed)
-        
+
         # Connect substates for auto-save
         self.tts_options.state.state_changed.connect(self.on_state_changed)
         self.chat_options.state.state_changed.connect(self.on_state_changed)
@@ -239,7 +240,7 @@ class AddonOptionsDialog(QDialog):
 
     def render_general_tab(self) -> QWidget:
         layout = QVBoxLayout()
-        
+
         # Header
         header_layout = QVBoxLayout()
         title = QLabel("<h3>✨ Smart Fields</h3>")
@@ -256,10 +257,12 @@ class AddonOptionsDialog(QDialog):
         search_layout = QHBoxLayout()
         search_input = ReactiveLineEdit(self.state, "search_text")
         search_input.setPlaceholderText("🔎 Search fields...")
-        search_input.on_change.connect(lambda text: self.state.update({"search_text": text}))
+        search_input.on_change.connect(
+            lambda text: self.state.update({"search_text": text})
+        )
         search_layout.addWidget(search_input)
         layout.addLayout(search_layout)
-        
+
         # Table
         self.table = self.create_table()
         self.setup_table_context_menu(self.table)
@@ -267,37 +270,37 @@ class AddonOptionsDialog(QDialog):
 
         # Buttons
         buttons_layout = QHBoxLayout()
-        
+
         # Left side: Edit/Remove
         self.edit_button = QPushButton("Edit")
         self.edit_button.setFixedWidth(80)
         self.edit_button.clicked.connect(self.on_edit)
-        
+
         self.remove_button = QPushButton("Remove")
         self.remove_button.setFixedWidth(80)
         self.remove_button.clicked.connect(self.on_remove)
-        
+
         buttons_layout.addWidget(self.edit_button)
         buttons_layout.addWidget(self.remove_button)
-        
+
         buttons_layout.addStretch()
-        
+
         # Right side: Add buttons
         add_text = QPushButton("💬 New Text Field")
         add_text.clicked.connect(lambda _: self.on_add("chat"))
-        
+
         add_tts = QPushButton("🔈 New TTS Field")
         add_tts.clicked.connect(lambda _: self.on_add("tts"))
-        
+
         add_image = QPushButton("🖼️ New Image Field")
         add_image.clicked.connect(lambda _: self.on_add("image"))
-        
+
         buttons_layout.addWidget(add_image)
         buttons_layout.addWidget(add_tts)
         buttons_layout.addWidget(add_text)
-        
+
         layout.addLayout(buttons_layout)
-        
+
         container = QWidget()
         container.setLayout(layout)
         return container
@@ -350,81 +353,135 @@ class AddonOptionsDialog(QDialog):
         group_box = QGroupBox("API Configuration")
         group_box.setLayout(form)
         layout.addWidget(group_box)
-        
+
         # Custom Providers
         custom_box = QGroupBox("Custom Providers (OpenAI Compatible)")
         custom_layout = QVBoxLayout()
         custom_box.setLayout(custom_layout)
-        
-        self.custom_table = QTableWidget(0, 3)
-        self.custom_table.setHorizontalHeaderLabels(["Name", "Base URL", "API Key"])
+
+        self.custom_table = QTableWidget(0, 4)
+        self.custom_table.setHorizontalHeaderLabels(
+            ["Name", "Base URL", "Capabilities", "API Key"]
+        )
         header = self.custom_table.horizontalHeader()
         if header:
             header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        
+
         # Populate table
         for provider in self.state.s["custom_providers"]:
             self._add_custom_provider_row(provider)
-            
-        self.custom_table.itemChanged.connect(self._on_custom_table_changed)
-            
+
+        # Make table read-only for cells, we use dialog to edit
+        self.custom_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.custom_table.itemDoubleClicked.connect(self._on_edit_custom_provider)
+
         btns = QHBoxLayout()
         add_btn = QPushButton("Add")
         add_btn.clicked.connect(self._on_add_custom_provider)
+
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(lambda: self._on_edit_custom_provider(None))
+
         remove_btn = QPushButton("Remove")
         remove_btn.clicked.connect(self._on_remove_custom_provider)
+
         btns.addWidget(add_btn)
+        btns.addWidget(edit_btn)
         btns.addWidget(remove_btn)
         btns.addStretch()
-        
+
         custom_layout.addWidget(self.custom_table)
         custom_layout.addLayout(btns)
-        
+
         layout.addWidget(custom_box)
 
         layout.addStretch()
 
         return container
 
-    def _add_custom_provider_row(self, provider: Optional[CustomProvider] = None) -> None:
+    def _add_custom_provider_row(self, provider: CustomProvider) -> None:
         row = self.custom_table.rowCount()
         self.custom_table.insertRow(row)
-        
-        name = QTableWidgetItem(provider["name"] if provider else "New Provider")
-        url = QTableWidgetItem(provider["base_url"] if provider else "https://")
-        key = QTableWidgetItem(provider["api_key"] if provider else "")
-        
+
+        name = QTableWidgetItem(provider["name"])
+        url = QTableWidgetItem(provider["base_url"])
+
+        caps = provider.get("capabilities", [])
+        caps_display = ", ".join(caps) if caps else "chat"
+        capabilities = QTableWidgetItem(caps_display)
+
+        # key = QTableWidgetItem(provider["api_key"]) # Hide key or mask it?
+        key = QTableWidgetItem("********" if provider["api_key"] else "")
+
+        # Store full provider data in the name item user data
+        name.setData(Qt.ItemDataRole.UserRole, provider)
+
         self.custom_table.setItem(row, 0, name)
         self.custom_table.setItem(row, 1, url)
-        self.custom_table.setItem(row, 2, key)
+        self.custom_table.setItem(row, 2, capabilities)
+        self.custom_table.setItem(row, 3, key)
 
     def _on_add_custom_provider(self) -> None:
-        self.custom_table.blockSignals(True)
-        self._add_custom_provider_row()
-        self.custom_table.blockSignals(False)
-        self._on_custom_table_changed(None) # Trigger update
+        dialog = CustomProviderDialog(parent=self)
+        if dialog.exec():
+            provider = dialog.get_provider()
+            self._add_custom_provider_row(provider)
+            self._save_custom_providers()
+
+    def _on_edit_custom_provider(self, item: Optional[QTableWidgetItem]) -> None:
+        row = self.custom_table.currentRow()
+        if row < 0:
+            return
+
+        name_item = self.custom_table.item(row, 0)
+        provider_data = name_item.data(Qt.ItemDataRole.UserRole)
+
+        dialog = CustomProviderDialog(provider=provider_data, parent=self)
+        if dialog.exec():
+            new_provider = dialog.get_provider()
+
+            # Update row
+            self.custom_table.item(row, 0).setText(new_provider["name"])
+            self.custom_table.item(row, 0).setData(
+                Qt.ItemDataRole.UserRole, new_provider
+            )
+            self.custom_table.item(row, 1).setText(new_provider["base_url"])
+
+            caps = new_provider.get("capabilities", [])
+            caps_display = ", ".join(caps) if caps else "chat"
+            self.custom_table.item(row, 2).setText(caps_display)
+
+            self.custom_table.item(row, 3).setText(
+                "********" if new_provider["api_key"] else ""
+            )
+
+            self._save_custom_providers()
 
     def _on_remove_custom_provider(self) -> None:
         row = self.custom_table.currentRow()
         if row >= 0:
             self.custom_table.removeRow(row)
-            self._on_custom_table_changed(None)
+            self._save_custom_providers()
 
-    def _on_custom_table_changed(self, _) -> None:
+    def _save_custom_providers(self) -> None:
         providers: list[CustomProvider] = []
         for i in range(self.custom_table.rowCount()):
-            name_item = self.custom_table.item(i, 0)
-            url_item = self.custom_table.item(i, 1)
-            key_item = self.custom_table.item(i, 2)
-            
-            if name_item and url_item:
-                providers.append({
-                    "name": name_item.text(),
-                    "base_url": url_item.text(),
-                    "api_key": key_item.text() if key_item else ""
-                })
-        
+            item = self.custom_table.item(i, 0)
+            provider = item.data(Qt.ItemDataRole.UserRole)
+            providers.append(provider)
+
         self.state.update({"custom_providers": providers})
+
+        # Ensure config is updated immediately so tabs can read it
+        config.custom_providers = providers
+
+        # Refresh tabs
+        if hasattr(self, "chat_options"):
+            self.chat_options.refresh_custom_providers()
+        if hasattr(self, "tts_options"):
+            self.tts_options.refresh_custom_providers()
+        if hasattr(self, "image_options"):
+            self.image_options.refresh_custom_providers()
 
     def render_ui(self) -> None:
         self.render_table()
@@ -441,13 +498,12 @@ class AddonOptionsDialog(QDialog):
                 for field, prompt in field_prompts.items():
                     # Filter
                     deck_name = deck_id_to_name_map().get(deck_id) or ""
-                    
+
                     if search_text:
                         searchable = f"{note_type} {deck_name} {field} {prompt}".lower()
                         if search_text not in searchable:
                             continue
 
-                    
                     extras = get_extras(
                         note_type=note_type, field=field, deck_id=deck_id
                     )
@@ -760,7 +816,7 @@ class AddonOptionsDialog(QDialog):
                 )
                 if not did_click_ok:
                     return False
-            # If silent (auto-save), we skip the check/dialog to avoid interruption? 
+            # If silent (auto-save), we skip the check/dialog to avoid interruption?
             # Or we strictly don't save if check fails?
             # For now let's allow saving in silent mode without dialog to avoid annoyance,
             # assuming user knows what they are doing if they selected it.

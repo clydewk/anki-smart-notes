@@ -18,6 +18,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 from typing import Any
+
 from attr import dataclass
 
 
@@ -107,4 +108,3 @@ class MockAppState:
             "imageCreditsCapacity": 1000,
         },
     }
-

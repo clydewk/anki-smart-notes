@@ -102,4 +102,4 @@ T = TypeVar("T")
 
 
 def none_defaulting(d: Mapping[str, Any], k: str, fallback: T) -> T:
-    return cast(T, d[k]) if d.get(k) is not None else fallback
+    return cast("T", d[k]) if d.get(k) is not None else fallback
