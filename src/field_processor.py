@@ -117,7 +117,7 @@ class FieldProcessor:
                 return None
 
             file_name = get_media_path(
-                note, node.field, "wav" if "gemini" in tts_model else "mp3"
+                note, node.field, "wav" if tts_provider == "google" and "gemini" in tts_model else "mp3"
             )
             path = media.write_data(file_name, tts_response)
 
@@ -138,7 +138,7 @@ class FieldProcessor:
                 prompt=input,
                 model=chat_model,
                 provider=chat_provider,
-                temperature=temperature,
+                temperature=chat_temperature,
                 reasoning_effort=chat_reasoning_effort,
                 field_lower=node.field,
                 should_convert_to_html=should_convert,
