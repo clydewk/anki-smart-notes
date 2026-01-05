@@ -117,7 +117,9 @@ class FieldProcessor:
                 return None
 
             file_name = get_media_path(
-                note, node.field, "wav" if tts_provider == "google" and "gemini" in tts_model else "mp3"
+                note,
+                node.field,
+                "wav" if tts_provider == "google" and "gemini" in tts_model else "mp3",
             )
             path = media.write_data(file_name, tts_response)
 
@@ -295,7 +297,8 @@ class FieldProcessor:
         except Exception as e:
             logger.error(f"Failed to convert image: {e}")
             if show_error_box:
-                run_on_main(lambda: show_message_box(f"Failed to convert image: {e}"))
+                error_msg = f"Failed to convert image: {e}"
+                run_on_main(lambda: show_message_box(error_msg))
             return None
 
     def _check_api_key(self, provider: str, show_error_box: bool) -> bool:

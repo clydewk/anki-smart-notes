@@ -39,12 +39,6 @@ from .state_manager import StateManager
 from .ui_utils import default_form_layout, font_small
 
 
-class ProviderSettings(TypedDict):
-    model: str
-    temperature: float
-    reasoning_effort: Optional[OpenAIReasoningEffort]
-
-
 class ChatOptionsState(TypedDict):
     chat_provider: ChatProviders
     chat_providers: list[ChatProviders]

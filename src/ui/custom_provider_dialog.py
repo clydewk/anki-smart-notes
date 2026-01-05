@@ -191,10 +191,10 @@ class CustomProviderDialog(QDialog):
             # Helper to merge new models into existing text
             def merge_models(text_edit: QTextEdit, new_models: list[str]):
                 current_text = text_edit.toPlainText()
-                existing = set(
+                existing = {
                     line.strip() for line in current_text.splitlines() if line.strip()
-                )
-                all_models = sorted(list(existing.union(set(new_models))))
+                }
+                all_models = sorted(existing.union(set(new_models)))
                 text_edit.setText("\n".join(all_models))
 
             # Naive categorization heuristics
@@ -325,7 +325,7 @@ class CustomProviderDialog(QDialog):
         image_models = get_clean_list(self.image_models_edit)
 
         # Master list for legacy compatibility
-        all_models = sorted(list(set(chat_models + tts_models + image_models)))
+        all_models = sorted(set(chat_models + tts_models + image_models))
 
         return {
             "name": self.name_edit.text().strip(),

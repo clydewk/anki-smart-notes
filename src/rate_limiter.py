@@ -21,248 +21,758 @@ import asyncio
 import json
 import os
 import time
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from .logger import logger
 from .utils import get_file_path
 
 
-class AdaptiveRateLimiter:
-    """
-    Implements a rate-based limiter (leaky bucket) that controls Requests Per Minute (RPM).
-    Instead of limiting concurrency, it enforces a minimum time interval between requests.
+@dataclass
+class RateLimitDimension:
+    """Tracks usage for one dimension (RPM, TPM, or RPD)."""
 
-    It adapts the RPM based on success/failure:
-    - Success: Additive Increase (RAMP UP)
-    - Failure (429): Multiplicative Decrease (BACK OFF)
+    limit: float  # Current limit (may be learned from API)
+    max_limit: float  # Maximum allowed limit
+    min_limit: float  # Minimum limit (floor)
+    used: float = 0.0  # Usage in current window
+    window_start: float = field(default_factory=time.time)  # Window start timestamp
+    window_seconds: float = 60.0  # Window duration (60s for RPM/TPM, 86400 for RPD)
+    learned_from_api: bool = False  # Whether limit was learned from response headers
+    remaining_from_api: Optional[float] = None  # Remaining quota from last API response
+    reset_at_from_api: Optional[float] = None  # Reset timestamp from last API response
+
+    def is_exhausted(self, amount: float = 1.0) -> bool:
+        """Check if adding `amount` would exceed the limit."""
+        self._maybe_reset_window()
+        # If we have API-reported remaining, use that for more accuracy
+        if self.remaining_from_api is not None and self.learned_from_api:
+            return amount > self.remaining_from_api
+        return (self.used + amount) > self.limit
+
+    def consume(self, amount: float = 1.0) -> None:
+        """Record usage of `amount` units."""
+        self._maybe_reset_window()
+        self.used += amount
+        # Also decrement remaining if we're tracking it
+        if self.remaining_from_api is not None:
+            self.remaining_from_api = max(0, self.remaining_from_api - amount)
+
+    def time_until_available(self, amount: float = 1.0) -> float:
+        """Returns seconds until `amount` units would be available."""
+        self._maybe_reset_window()
+
+        # If we have API-reported reset time, use it
+        if (
+            self.reset_at_from_api is not None
+            and self.learned_from_api
+            and self.remaining_from_api is not None
+            and amount > self.remaining_from_api
+        ):
+            return max(0, self.reset_at_from_api - time.time())
+
+        if not self.is_exhausted(amount):
+            return 0.0
+
+        # Time until window resets
+        elapsed = time.time() - self.window_start
+        return max(0, self.window_seconds - elapsed)
+
+    def update_from_headers(
+        self,
+        limit: Optional[float],
+        remaining: Optional[float],
+        reset_at: Optional[float],
+    ) -> None:
+        """Update limits based on API response headers."""
+        if limit is not None and limit > 0:
+            # Clamp to our configured max
+            self.limit = min(limit, self.max_limit)
+            self.learned_from_api = True
+        if remaining is not None:
+            self.remaining_from_api = remaining
+            # Sync our used counter with reality
+            if self.limit > 0:
+                self.used = self.limit - remaining
+        if reset_at is not None:
+            self.reset_at_from_api = reset_at
+
+    def _maybe_reset_window(self) -> None:
+        """Reset the window if it has expired."""
+        now = time.time()
+        elapsed = now - self.window_start
+
+        # Check API-reported reset time first
+        if self.reset_at_from_api is not None and now >= self.reset_at_from_api:
+            self.used = 0.0
+            self.window_start = now
+            self.remaining_from_api = self.limit if self.learned_from_api else None
+            self.reset_at_from_api = None
+            return
+
+        # Standard window reset
+        if elapsed >= self.window_seconds:
+            # For daily windows, align to UTC midnight
+            if self.window_seconds >= 86400:
+                self.window_start = self.get_utc_midnight_timestamp()
+            else:
+                self.window_start = now
+            self.used = 0.0
+            self.remaining_from_api = None
+            self.reset_at_from_api = None
+
+    @staticmethod
+    def get_utc_midnight_timestamp() -> float:
+        """Get timestamp of the most recent UTC midnight."""
+        now = datetime.now(timezone.utc)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.timestamp()
+
+    def apply_backoff(self) -> None:
+        """Apply multiplicative decrease on failure (AIMD)."""
+        old_limit = self.limit
+        self.limit = max(self.min_limit, self.limit * 0.5)
+        if self.limit != old_limit:
+            logger.debug(
+                f"Rate limit backoff: {old_limit:.0f} -> {self.limit:.0f} "
+                f"(window: {self.window_seconds}s)"
+            )
+
+    def apply_rampup(self) -> None:
+        """Apply additive increase on success (AIMD). Uses 2% multiplicative for smoother ramp."""
+        if self.learned_from_api:
+            # Don't ramp up if we know the real limit
+            return
+        old_limit = self.limit
+        # Multiplicative increase of 2% is smoother than fixed +10
+        self.limit = min(self.max_limit, self.limit * 1.02)
+        if int(self.limit) > int(old_limit):
+            logger.debug(
+                f"Rate limit rampup: {old_limit:.0f} -> {self.limit:.0f} "
+                f"(window: {self.window_seconds}s)"
+            )
+
+
+@dataclass
+class ModelRateLimitConfig:
+    """Configuration for a specific model's rate limits."""
+
+    rpm: int = 60
+    rpm_max: int = 1000
+    tpm: int = 100000
+    tpm_max: int = 1000000
+    rpd: int = 10000
+    rpd_max: int = 100000
+    reset_hour_utc: int = 0  # Hour when daily limit resets (0 = midnight UTC)
+
+
+# Default configurations per provider and model
+# Format: "provider" or "provider:model" -> config
+DEFAULT_RATE_LIMITS: dict[str, ModelRateLimitConfig] = {
+    # OpenAI Tier 5 defaults (conservative starting points, will learn from headers)
+    "openai": ModelRateLimitConfig(
+        rpm=1000,
+        rpm_max=15000,
+        tpm=1000000,
+        tpm_max=40000000,
+        rpd=100000,
+        rpd_max=10000000,
+    ),
+    "openai:gpt-5.2": ModelRateLimitConfig(
+        rpm=1000,
+        rpm_max=15000,
+        tpm=1000000,
+        tpm_max=40000000,
+        rpd=100000,
+        rpd_max=10000000,
+    ),
+    "openai:gpt-5.1": ModelRateLimitConfig(
+        rpm=1000,
+        rpm_max=15000,
+        tpm=1000000,
+        tpm_max=40000000,
+        rpd=100000,
+        rpd_max=10000000,
+    ),
+    "openai:gpt-5": ModelRateLimitConfig(
+        rpm=1000,
+        rpm_max=15000,
+        tpm=1000000,
+        tpm_max=40000000,
+        rpd=100000,
+        rpd_max=10000000,
+    ),
+    "openai:gpt-4o": ModelRateLimitConfig(
+        rpm=500, rpm_max=10000, tpm=500000, tpm_max=30000000, rpd=50000, rpd_max=5000000
+    ),
+    "openai:gpt-4o-mini": ModelRateLimitConfig(
+        rpm=1000,
+        rpm_max=30000,
+        tpm=1000000,
+        tpm_max=150000000,
+        rpd=100000,
+        rpd_max=10000000,
+    ),
+    # Anthropic
+    "anthropic": ModelRateLimitConfig(
+        rpm=50, rpm_max=4000, tpm=100000, tpm_max=400000, rpd=10000, rpd_max=1000000
+    ),
+    # DeepSeek
+    "deepseek": ModelRateLimitConfig(
+        rpm=60, rpm_max=500, tpm=100000, tpm_max=10000000, rpd=10000, rpd_max=1000000
+    ),
+    # Google Gemini - Text models
+    "google_text": ModelRateLimitConfig(
+        rpm=15, rpm_max=60, tpm=500000, tpm_max=4000000, rpd=200, rpd_max=1500
+    ),
+    "google_text:gemini-3-pro": ModelRateLimitConfig(
+        rpm=25, rpm_max=60, tpm=500000, tpm_max=1000000, rpd=200, rpd_max=250
+    ),
+    "google_text:gemini-3-pro-preview": ModelRateLimitConfig(
+        rpm=25, rpm_max=60, tpm=500000, tpm_max=1000000, rpd=200, rpd_max=250
+    ),
+    "google_text:gemini-2.5-flash": ModelRateLimitConfig(
+        rpm=1000, rpm_max=2000, tpm=250000, tpm_max=1000000, rpd=1000, rpd_max=10000
+    ),
+    "google_text:gemini-2.5-pro": ModelRateLimitConfig(
+        rpm=150, rpm_max=360, tpm=1000000, tpm_max=4000000, rpd=1000, rpd_max=2500
+    ),
+    # Google Gemini - TTS models (very restrictive)
+    "google_tts": ModelRateLimitConfig(
+        rpm=5, rpm_max=10, tpm=5000, tpm_max=10000, rpd=50, rpd_max=100
+    ),
+    "google_tts:gemini-2.5-flash-tts": ModelRateLimitConfig(
+        rpm=5, rpm_max=10, tpm=5000, tpm_max=10000, rpd=50, rpd_max=100
+    ),
+    "google_tts:gemini-2.5-flash-preview-tts": ModelRateLimitConfig(
+        rpm=5, rpm_max=10, tpm=5000, tpm_max=10000, rpd=50, rpd_max=100
+    ),
+    "google_tts:gemini-2.5-pro-preview-tts": ModelRateLimitConfig(
+        rpm=10, rpm_max=10, tpm=5000, tpm_max=10000, rpd=50, rpd_max=50
+    ),
+    # Google Gemini - Image models
+    "google_image": ModelRateLimitConfig(
+        rpm=15, rpm_max=20, tpm=50000, tpm_max=100000, rpd=200, rpd_max=250
+    ),
+    "google_image:gemini-3-pro-image-preview": ModelRateLimitConfig(
+        rpm=18, rpm_max=20, tpm=50000, tpm_max=100000, rpd=200, rpd_max=250
+    ),
+    # ElevenLabs TTS
+    "elevenLabs": ModelRateLimitConfig(
+        rpm=10, rpm_max=100, tpm=100000, tpm_max=1000000, rpd=1000, rpd_max=10000
+    ),
+    # Azure TTS
+    "azure": ModelRateLimitConfig(
+        rpm=30, rpm_max=200, tpm=500000, tpm_max=5000000, rpd=10000, rpd_max=100000
+    ),
+    # Replicate (image generation)
+    "replicate": ModelRateLimitConfig(
+        rpm=10, rpm_max=100, tpm=100000, tpm_max=1000000, rpd=1000, rpd_max=10000
+    ),
+}
+
+
+class MultiDimensionalRateLimiter:
+    """
+    Rate limiter that tracks RPM (Requests Per Minute), TPM (Tokens Per Minute),
+    and RPD (Requests Per Day) simultaneously.
+
+    Uses AIMD (Additive Increase, Multiplicative Decrease) to adapt limits,
+    and can learn actual limits from API response headers.
     """
 
     def __init__(
         self,
-        initial_rpm: int = 5,
-        min_rpm: int = 1,
-        max_rpm: int = 60,
-        manager=None,
-        provider_name: str = "",
+        provider: str,
+        model: str = "",
+        config: Optional[ModelRateLimitConfig] = None,
+        manager: Optional["RateLimitManager"] = None,
     ):
-        self._rpm = float(initial_rpm)
-        self._min_rpm = min_rpm
-        self._max_rpm = max_rpm
+        self._provider = provider
+        self._model = model
         self._manager = manager
-        self._provider_name = provider_name
+        self._key = f"{provider}:{model}" if model else provider
 
-        # Queue-based scheduling to allow unlimited concurrency but enforce rate limits
-        # dynamically. This prevents "locking in" slow rates for future requests.
-        self._queue = asyncio.Queue()
-        self._rpm_changed = asyncio.Event()
-        self._last_request_time = 0.0
-        self._scheduler_task: Optional[asyncio.Task] = None
+        # Get config, falling back to provider default
+        if config is None:
+            config = DEFAULT_RATE_LIMITS.get(
+                self._key, DEFAULT_RATE_LIMITS.get(provider, ModelRateLimitConfig())
+            )
 
-    async def acquire(self):
+        # Initialize the three dimensions
+        self.rpm = RateLimitDimension(
+            limit=float(config.rpm),
+            max_limit=float(config.rpm_max),
+            min_limit=1.0,
+            window_seconds=60.0,
+        )
+        self.tpm = RateLimitDimension(
+            limit=float(config.tpm),
+            max_limit=float(config.tpm_max),
+            min_limit=100.0,
+            window_seconds=60.0,
+        )
+        self.rpd = RateLimitDimension(
+            limit=float(config.rpd),
+            max_limit=float(config.rpd_max),
+            min_limit=1.0,
+            window_seconds=86400.0,  # 24 hours
+        )
+
+        # Queue-based scheduling
+        self._queue: asyncio.Queue[tuple[asyncio.Future[None], int]] = asyncio.Queue()
+        self._scheduler_task: Optional[asyncio.Task[None]] = None
+        self._lock = asyncio.Lock()
+
+        # Track estimated vs actual tokens for learning
+        self._last_estimated_tokens = 0
+
+    @property
+    def key(self) -> str:
+        return self._key
+
+    async def acquire(self, estimated_tokens: int = 0) -> None:
         """
-        Waits until it's safe to make a request based on current RPM.
+        Wait until it's safe to make a request.
+        Pass estimated_tokens for TPM tracking (will be corrected later via report_success).
         """
         # Ensure scheduler is running
         if self._scheduler_task is None or self._scheduler_task.done():
             self._scheduler_task = asyncio.create_task(self._scheduler())
 
-        # Create a future for this request and add to queue
+        self._last_estimated_tokens = estimated_tokens
+
+        # Create a future and queue it
         loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        await self._queue.put(fut)
+        fut: asyncio.Future[None] = loop.create_future()
+        await self._queue.put((fut, estimated_tokens))
 
         # Wait for our turn
         try:
             await fut
         except asyncio.CancelledError:
-            # If we are cancelled, the scheduler might still be holding us or
-            # about to release us. We can't easily remove from asyncio.Queue
-            # (it's not a deque), so the scheduler handle cancellation
-            # by checking fut.cancelled().
             raise
 
-    async def _scheduler(self):
+    async def _scheduler(self) -> None:
+        """Background task that processes the queue respecting all rate limits."""
         while True:
-            # Wait for next request
-            fut = await self._queue.get()
+            item = await self._queue.get()
+            fut, estimated_tokens = item
 
             if fut.cancelled():
                 self._queue.task_done()
                 continue
 
-            # Wait for rate limit slot
+            # Wait until all dimensions allow us to proceed
             while True:
-                interval = 60.0 / self._rpm
-                target = self._last_request_time + interval
-                now = time.time()
+                # Calculate wait time for each dimension
+                rpm_wait = self.rpm.time_until_available(1)
+                tpm_wait = (
+                    self.tpm.time_until_available(estimated_tokens)
+                    if estimated_tokens > 0
+                    else 0
+                )
+                rpd_wait = self.rpd.time_until_available(1)
 
-                # If idle, we can go immediately (target < now).
-                # Otherwise wait difference.
-                wait = target - now
+                max_wait = max(rpm_wait, tpm_wait, rpd_wait)
 
-                if wait <= 0:
+                if max_wait <= 0:
                     break
+
+                # Log if we're waiting due to limits
+                if max_wait > 1:
+                    dimension = (
+                        "RPM"
+                        if rpm_wait == max_wait
+                        else ("TPM" if tpm_wait == max_wait else "RPD")
+                    )
+                    logger.debug(
+                        f"RateLimiter [{self._key}]: Waiting {max_wait:.1f}s for {dimension}"
+                    )
 
                 try:
-                    # Wait for the calculated time, but wake up if RPM changes
-                    await asyncio.wait_for(self._rpm_changed.wait(), timeout=wait)
-                    self._rpm_changed.clear()
-                    # Loop again to recalculate with new RPM
-                    if fut.cancelled():
-                        break
-                except asyncio.TimeoutError:
-                    # Time reached naturally
-                    break
+                    await asyncio.sleep(min(max_wait, 1.0))  # Check every second
+                except asyncio.CancelledError:
+                    if not fut.done():
+                        fut.cancel()
+                    self._queue.task_done()
+                    return
 
-            # If task was cancelled during wait, don't consume the slot
             if fut.cancelled():
                 self._queue.task_done()
                 continue
 
-            # Dispatch
-            self._last_request_time = time.time()
+            # Consume from all dimensions
+            async with self._lock:
+                self.rpm.consume(1)
+                if estimated_tokens > 0:
+                    self.tpm.consume(estimated_tokens)
+                self.rpd.consume(1)
+
             if not fut.done():
                 fut.set_result(None)
             self._queue.task_done()
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "MultiDimensionalRateLimiter":
         await self.acquire()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[Any],
+    ) -> None:
         pass
 
-    async def report_success(self):
-        """Called when a request succeeds. Gently ramps up RPM."""
-        if self._rpm < self._max_rpm:
-            old_rpm = int(self._rpm)
-            # Additive increase: +10.0 RPM per success for faster ramp-up
-            self._rpm += 10.0
-
-            # Cap at max
-            if self._rpm > self._max_rpm:
-                self._rpm = self._max_rpm
-
-            new_rpm = int(self._rpm)
-
-            # If RPM changed, notify scheduler to potentially wake up early
-            if self._rpm != float(old_rpm):
-                self._rpm_changed.set()
-
-            if new_rpm > old_rpm:
+    async def report_success(
+        self,
+        actual_tokens: int = 0,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
+        """
+        Called after a successful request.
+        - actual_tokens: Real token count from response (corrects estimate)
+        - headers: Response headers for learning actual limits
+        """
+        async with self._lock:
+            # Correct TPM usage if we have actual token count from response body
+            if actual_tokens > 0 and self._last_estimated_tokens > 0:
+                diff = actual_tokens - self._last_estimated_tokens
+                if diff != 0:
+                    self.tpm.used = max(0, self.tpm.used + diff)
                 logger.debug(
-                    f"RateLimiter: Ramping up {self._provider_name} to {new_rpm} RPM"
+                    f"RateLimiter [{self._key}]: Token correction "
+                    f"(estimated: {self._last_estimated_tokens}, actual: {actual_tokens})"
                 )
-                if self._manager:
-                    self._manager.save_state()
+                # If we're getting actual tokens from response, we're accurately tracking usage
+                # No need to ramp up TPM - we know exactly what we're using
+                self.tpm.learned_from_api = True
 
-    async def report_failure(self):
-        """Called when a 429/failure occurs. Backs off RPM."""
-        if self._rpm > self._min_rpm:
-            old_rpm = int(self._rpm)
-            # Multiplicative decrease
-            self._rpm = max(self._min_rpm, self._rpm * 0.5)
+            # Parse headers to learn actual limits (OpenAI-style x-ratelimit headers)
+            if headers:
+                self._parse_rate_limit_headers(headers)
 
-            new_rpm = int(self._rpm)
+            # Apply ramp-up (only if not learned from API)
+            self.rpm.apply_rampup()
+            self.tpm.apply_rampup()
+            # Don't ramp up RPD - it's usually fixed
 
-            # Notify scheduler (though decreasing RPM usually means waiting longer,
-            # so waking up just to wait longer is fine)
-            self._rpm_changed.set()
-
-            logger.warning(
-                f"RateLimiter: 429/Congestion detected! Backing off {self._provider_name} to {new_rpm} RPM"
-            )
+            # Save state
             if self._manager:
                 self._manager.save_state()
 
-    async def report_timeout(self):
-        """Called when a request times out. Currently does not back off RPM."""
+    async def report_failure(
+        self,
+        headers: Optional[dict[str, str]] = None,
+        retry_after: Optional[float] = None,
+    ) -> None:
+        """Called when a 429 or rate limit error occurs."""
+        async with self._lock:
+            # Parse headers even on failure - we might learn the real limits
+            if headers:
+                self._parse_rate_limit_headers(headers)
+
+            # If we got a Retry-After header, use it
+            if retry_after and retry_after > 0:
+                # Set the reset time for RPM (most likely the bottleneck)
+                self.rpm.reset_at_from_api = time.time() + retry_after
+
+            # Apply backoff to all dimensions
+            self.rpm.apply_backoff()
+            self.tpm.apply_backoff()
+            # RPD backoff is less useful but apply it anyway
+            self.rpd.apply_backoff()
+
+            logger.warning(
+                f"RateLimiter [{self._key}]: 429/Failure. "
+                f"RPM: {self.rpm.limit:.0f}, TPM: {self.tpm.limit:.0f}, RPD: {self.rpd.limit:.0f}"
+            )
+
+            if self._manager:
+                self._manager.save_state()
+
+    async def report_timeout(self) -> None:
+        """Called when a request times out. Does not back off aggressively."""
         logger.warning(
-            f"RateLimiter: Timeout detected for {self._provider_name}. Maintaining {int(self._rpm)} RPM"
+            f"RateLimiter [{self._key}]: Timeout. Maintaining current limits."
         )
+
+    def _parse_rate_limit_headers(self, headers: dict[str, str]) -> None:
+        """Parse rate limit information from response headers."""
+        # OpenAI-style headers
+        rpm_limit = self._parse_header_float(headers.get("x-ratelimit-limit-requests"))
+        rpm_remaining = self._parse_header_float(
+            headers.get("x-ratelimit-remaining-requests")
+        )
+        rpm_reset = self._parse_reset_header(headers.get("x-ratelimit-reset-requests"))
+
+        tpm_limit = self._parse_header_float(headers.get("x-ratelimit-limit-tokens"))
+        tpm_remaining = self._parse_header_float(
+            headers.get("x-ratelimit-remaining-tokens")
+        )
+        tpm_reset = self._parse_reset_header(headers.get("x-ratelimit-reset-tokens"))
+
+        # Update dimensions
+        if rpm_limit or rpm_remaining is not None or rpm_reset:
+            self.rpm.update_from_headers(rpm_limit, rpm_remaining, rpm_reset)
+            if rpm_limit:
+                logger.debug(
+                    f"RateLimiter [{self._key}]: Learned RPM limit from API: {rpm_limit}"
+                )
+
+        if tpm_limit or tpm_remaining is not None or tpm_reset:
+            self.tpm.update_from_headers(tpm_limit, tpm_remaining, tpm_reset)
+            if tpm_limit:
+                logger.debug(
+                    f"RateLimiter [{self._key}]: Learned TPM limit from API: {tpm_limit}"
+                )
+
+        # Also check Retry-After for immediate wait time
+        retry_after = self._parse_header_float(headers.get("retry-after"))
+        if retry_after:
+            self.rpm.reset_at_from_api = time.time() + retry_after
+
+    @staticmethod
+    def _parse_header_float(value: Optional[str]) -> Optional[float]:
+        """Parse a header value as a float."""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_reset_header(value: Optional[str]) -> Optional[float]:
+        """Parse a reset time header (could be seconds or ISO timestamp)."""
+        if value is None:
+            return None
+        try:
+            # Try as seconds first
+            seconds = float(value.rstrip("s").rstrip("ms"))
+            if "ms" in value:
+                seconds /= 1000
+            return time.time() + seconds
+        except ValueError:
+            pass
+        try:
+            # Try as ISO timestamp
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except ValueError:
+            return None
+
+    def get_state(self) -> dict[str, Any]:
+        """Get serializable state for persistence."""
+        return {
+            "rpm_limit": self.rpm.limit,
+            "rpm_learned": self.rpm.learned_from_api,
+            "tpm_limit": self.tpm.limit,
+            "tpm_learned": self.tpm.learned_from_api,
+            "rpd_limit": self.rpd.limit,
+            "rpd_used": self.rpd.used,
+            "rpd_window_start": self.rpd.window_start,
+        }
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        """Load state from persistence."""
+        if "rpm_limit" in state:
+            self.rpm.limit = min(state["rpm_limit"], self.rpm.max_limit)
+            self.rpm.learned_from_api = state.get("rpm_learned", False)
+        if "tpm_limit" in state:
+            self.tpm.limit = min(state["tpm_limit"], self.tpm.max_limit)
+            self.tpm.learned_from_api = state.get("tpm_learned", False)
+        if "rpd_limit" in state:
+            self.rpd.limit = min(state["rpd_limit"], self.rpd.max_limit)
+        # Restore daily usage if within the same day
+        if "rpd_window_start" in state:
+            saved_start = state["rpd_window_start"]
+            current_midnight = RateLimitDimension.get_utc_midnight_timestamp()
+            # If saved window start is from today, restore usage
+            if saved_start >= current_midnight:
+                self.rpd.window_start = saved_start
+                self.rpd.used = state.get("rpd_used", 0)
 
 
 class RateLimitManager:
-    _instance = None
+    """
+    Manages rate limiters for all provider/model combinations.
+    Handles persistence of learned limits.
+    """
 
-    def __init__(self):
-        self.limiters: Dict[str, AdaptiveRateLimiter] = {}
+    _instance: Optional["RateLimitManager"] = None
+
+    def __init__(self) -> None:
+        self.limiters: dict[str, MultiDimensionalRateLimiter] = {}
         self.state_file = "rate_limits.json"
-
-        # Default RPM limits
-        self.defaults = {
-            # OpenAI Tier 5 Limits (High Concurrency)
-            # Tier 5 allows ~10,000 RPM. We'll set a high initial to allow maximum throughput.
-            "openai": {"initial": 10000, "max": 30000},
-            "anthropic": {"initial": 50, "max": 200},
-            "deepseek": {"initial": 50, "max": 200},
-            # Google Services
-            "google_text": {"initial": 5, "max": 25},
-            "google_image": {"initial": 5, "max": 20},
-            "google_tts": {"initial": 2, "max": 10},
-            # Fallback
-            "google": {"initial": 5, "max": 20},
-            # TTS
-            "elevenLabs": {"initial": 10, "max": 60},
-            "azure": {"initial": 30, "max": 120},
-            # Image
-            "replicate": {"initial": 5, "max": 50},
-        }
-
-        self.loaded_state = self._load_state()
-
-    def _load_state(self) -> Dict[str, float]:
-        try:
-            path = get_file_path(self.state_file)
-            if os.path.exists(path):
-                with open(path, encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load rate limits: {e}")
-        return {}
-
-    def save_state(self):
-        try:
-            path = get_file_path(self.state_file)
-            state = {k: v._rpm for k, v in self.limiters.items()}
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(state, f)
-        except Exception as e:
-            logger.error(f"Failed to save rate limits: {e}")
+        self._loaded_state = self._load_state()
+        self._save_lock = (
+            asyncio.Lock() if asyncio.get_event_loop().is_running() else None
+        )
 
     @classmethod
-    def get_instance(cls):
+    def get_instance(cls) -> "RateLimitManager":
         if cls._instance is None:
             cls._instance = RateLimitManager()
         return cls._instance
 
-    def get_limiter(self, provider: str) -> AdaptiveRateLimiter:
-        if provider not in self.limiters:
-            config = self.defaults.get(provider, {"initial": 10, "max": 60})
+    def get_limiter(
+        self, provider: str, model: str = ""
+    ) -> MultiDimensionalRateLimiter:
+        """Get or create a rate limiter for a provider/model combination."""
+        key = f"{provider}:{model}" if model else provider
 
-            initial_rpm = config["initial"]
-
-            # Load saved state
-            if provider in self.loaded_state:
-                saved_rpm = self.loaded_state[provider]
-                # Sanity check saved value
-                if (
-                    1 <= saved_rpm <= config["max"] * 1.5
-                ):  # Allow slight overage if config changed
-                    initial_rpm = saved_rpm
-                # Cap it at current max if strictly enforced
-                initial_rpm = min(initial_rpm, config["max"])
-
-            self.limiters[provider] = AdaptiveRateLimiter(
-                initial_rpm=initial_rpm,
-                max_rpm=config["max"],
-                manager=self,
-                provider_name=provider,
+        if key not in self.limiters:
+            # Try to get model-specific config, fall back to provider
+            config = DEFAULT_RATE_LIMITS.get(
+                key, DEFAULT_RATE_LIMITS.get(provider, ModelRateLimitConfig())
             )
 
-        return self.limiters[provider]
+            limiter = MultiDimensionalRateLimiter(
+                provider=provider,
+                model=model,
+                config=config,
+                manager=self,
+            )
+
+            # Load saved state
+            if key in self._loaded_state:
+                limiter.load_state(self._loaded_state[key])
+
+            self.limiters[key] = limiter
+            logger.debug(
+                f"Created rate limiter [{key}]: "
+                f"RPM={limiter.rpm.limit:.0f}, "
+                f"TPM={limiter.tpm.limit:.0f}, "
+                f"RPD={limiter.rpd.limit:.0f}"
+            )
+
+        return self.limiters[key]
+
+    def _load_state(self) -> dict[str, dict[str, Any]]:
+        """Load saved state from disk."""
+        try:
+            path = get_file_path(self.state_file)
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                    # Handle old format (just rpm values)
+                    if data and isinstance(next(iter(data.values())), (int, float)):
+                        # Migrate old format
+                        return {k: {"rpm_limit": v} for k, v in data.items()}
+                    return data
+        except Exception as e:
+            logger.error(f"Failed to load rate limits: {e}")
+        return {}
+
+    def save_state(self) -> None:
+        """Save current state to disk."""
+        try:
+            path = get_file_path(self.state_file)
+            state = {key: limiter.get_state() for key, limiter in self.limiters.items()}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save rate limits: {e}")
+
+    def get_all_limits_summary(self) -> dict[str, dict[str, float]]:
+        """Get a summary of all current rate limits for reporting."""
+        return {
+            key: {
+                "rpm": limiter.rpm.limit,
+                "rpm_used": limiter.rpm.used,
+                "tpm": limiter.tpm.limit,
+                "tpm_used": limiter.tpm.used,
+                "rpd": limiter.rpd.limit,
+                "rpd_used": limiter.rpd.used,
+            }
+            for key, limiter in self.limiters.items()
+        }
 
 
-# Global accessor
-def get_rate_limiter(provider: str) -> AdaptiveRateLimiter:
-    return RateLimitManager.get_instance().get_limiter(provider)
+def get_rate_limiter(provider: str, model: str = "") -> MultiDimensionalRateLimiter:
+    """Global accessor for rate limiters."""
+    return RateLimitManager.get_instance().get_limiter(provider, model)
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    Estimate token count for a text string.
+    Uses a rough heuristic: ~4 characters per token for English.
+    This is intentionally conservative (overestimates).
+    """
+    if not text:
+        return 0
+    # Rough estimate: 1 token ≈ 4 characters for English
+    # Use 3.5 to be slightly conservative (overestimate tokens)
+    return max(1, int(len(text) / 3.5))
+
+
+def extract_rate_limit_headers(headers: Any) -> dict[str, str]:
+    """
+    Extract rate limit related headers from API response.
+
+    Handles OpenAI-style headers:
+    - x-ratelimit-limit-requests / x-ratelimit-remaining-requests
+    - x-ratelimit-limit-tokens / x-ratelimit-remaining-tokens
+    - x-ratelimit-reset-requests / x-ratelimit-reset-tokens
+    - retry-after
+    """
+    rate_limit_headers: dict[str, str] = {}
+    for key in headers:
+        key_lower = key.lower()
+        if "ratelimit" in key_lower or "retry-after" in key_lower:
+            rate_limit_headers[key_lower] = headers[key]
+    return rate_limit_headers
+
+
+def parse_retry_after(headers: Any) -> Optional[float]:
+    """Parse Retry-After header value to seconds."""
+    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    return None
+
+
+def extract_google_token_usage(response_bytes: bytes, fallback: int = 0) -> int:
+    """
+    Extract token usage from Google API response body.
+
+    Google returns usageMetadata in the response body, not in headers:
+    { "usageMetadata": { "promptTokenCount": X, "candidatesTokenCount": Y, "totalTokenCount": Z } }
+    """
+    try:
+        data = json.loads(response_bytes)
+        usage = data.get("usageMetadata", {})
+        # Prefer totalTokenCount if available, otherwise sum prompt + candidates
+        total = usage.get("totalTokenCount")
+        if total is not None:
+            return int(total)
+        prompt_tokens = usage.get("promptTokenCount", 0)
+        candidates_tokens = usage.get("candidatesTokenCount", 0)
+        if prompt_tokens or candidates_tokens:
+            return prompt_tokens + candidates_tokens
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        pass
+    return fallback
+
+
+def extract_openai_token_usage(response: dict) -> int:
+    """
+    Extract token usage from OpenAI-style API response.
+
+    OpenAI and compatible APIs return:
+    { "usage": { "prompt_tokens": X, "completion_tokens": Y, "total_tokens": Z } }
+    """
+    try:
+        usage = response.get("usage", {})
+        return usage.get("total_tokens", 0) or (
+            usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+        )
+    except (KeyError, TypeError, AttributeError):
+        return 0

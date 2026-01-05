@@ -167,9 +167,7 @@ class ImageOptions(QWidget):
         standard_providers = ["replicate", "google", "openai"]
 
         # Remove custom providers from provider_models
-        keys_to_remove = [
-            k for k in provider_models if k not in standard_providers
-        ]
+        keys_to_remove = [k for k in provider_models if k not in standard_providers]
         for k in keys_to_remove:
             del provider_models[k]
             if k in provider_labels:

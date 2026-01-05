@@ -46,6 +46,7 @@ from aqt import (
     QWidget,
 )
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QColor
 
 from ..config import config
 from ..constants import GLOBAL_DECK_ID
@@ -532,11 +533,22 @@ class AddonOptionsDialog(QDialog):
                         ),
                     ]
                     enabled = extras["automatic"]
+                    always_overwrite = extras.get("regenerate_when_batching", False)
                     for i, item in enumerate(items):
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                         item.setTextAlignment(
                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
                         )
+
+                        if always_overwrite:
+                            item.setBackground(QColor(255, 193, 7, 50))
+                            current_tooltip = item.toolTip()
+                            item.setToolTip(
+                                f"{current_tooltip}\n(Always overwrites)"
+                                if current_tooltip
+                                else "(Always overwrites)"
+                            )
+
                         self.table.setItem(row, i, item)
 
                         if search_text and i in [0, 1, 2, 4]:
@@ -842,9 +854,8 @@ class AddonOptionsDialog(QDialog):
                 logger.debug(f"Setting: {k}: {v}")
                 config.__setattr__(k, v)
 
-        if not old_debug and self.state.s["debug"]:
-            if not silent:
-                show_message_box("Debug mode enabled. Please restart Anki.")
+        if not old_debug and self.state.s["debug"] and not silent:
+            show_message_box("Debug mode enabled. Please restart Anki.")
 
         return True
 

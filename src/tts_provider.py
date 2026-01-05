@@ -20,6 +20,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 import asyncio
 import base64
 import io
+import json
 import wave
 from typing import Optional
 
@@ -30,7 +31,13 @@ from .config import config
 from .constants import MAX_RETRIES, RETRY_BASE_SECONDS, TTS_PROVIDER_TIMEOUT_SEC
 from .logger import logger
 from .models import TTSModels, TTSProviders
-from .rate_limiter import get_rate_limiter
+from .rate_limiter import (
+    estimate_tokens,
+    extract_google_token_usage,
+    extract_rate_limit_headers,
+    get_rate_limiter,
+    parse_retry_after,
+)
 
 
 class TTSProvider:
@@ -78,45 +85,67 @@ class TTSProvider:
         json_payload: Optional[dict],
         timeout_sec: int,
         provider: str,
+        model: str = "",
         retry_count: int = 0,
+        estimated_tokens: int = 0,
         **kwargs,
     ) -> bytes:
-        limiter = get_rate_limiter(provider)
+        # Get per-model rate limiter
+        limiter = get_rate_limiter(provider, model)
 
         try:
-            async with limiter:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        url,
-                        headers=headers,
-                        json=json_payload,
-                        timeout=timeout_sec,
-                        **kwargs,
-                    ) as response:
-                        if response.status == 429:
-                            await limiter.report_failure()
+            # Acquire rate limit slot with token estimate
+            await limiter.acquire(estimated_tokens)
 
-                            if retry_count < MAX_RETRIES:
-                                wait_time = (2**retry_count) * RETRY_BASE_SECONDS
-                                logger.debug(
-                                    f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}"
-                                )
-                                await asyncio.sleep(wait_time)
-                                return await self._execute_request(
-                                    url,
-                                    headers,
-                                    json_payload,
-                                    timeout_sec,
-                                    provider,
-                                    retry_count + 1,
-                                    **kwargs,
-                                )
+            async with (
+                aiohttp.ClientSession() as session,
+                session.post(
+                    url,
+                    headers=headers,
+                    json=json_payload,
+                    timeout=timeout_sec,
+                    **kwargs,
+                ) as response,
+            ):
+                # Extract headers for rate limit learning
+                response_headers = extract_rate_limit_headers(response.headers)
 
-                            response.raise_for_status()
+                if response.status == 429:
+                    retry_after = parse_retry_after(response.headers)
+                    await limiter.report_failure(response_headers, retry_after)
 
-                        response.raise_for_status()
-                        await limiter.report_success()
-                        return await response.read()
+                    if retry_count < MAX_RETRIES:
+                        wait_time = retry_after or (2**retry_count) * RETRY_BASE_SECONDS
+                        logger.debug(
+                            f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}"
+                        )
+                        await asyncio.sleep(wait_time)
+                        return await self._execute_request(
+                            url,
+                            headers,
+                            json_payload,
+                            timeout_sec,
+                            provider,
+                            model,
+                            retry_count + 1,
+                            estimated_tokens,
+                            **kwargs,
+                        )
+
+                    response.raise_for_status()
+
+                response.raise_for_status()
+                response_bytes = await response.read()
+
+                # For Google providers, extract actual token usage from response body
+                actual_tokens = estimated_tokens
+                if "google" in provider:
+                    actual_tokens = extract_google_token_usage(
+                        response_bytes, estimated_tokens
+                    )
+
+                await limiter.report_success(actual_tokens, response_headers)
+                return response_bytes
 
         except asyncio.TimeoutError:
             logger.warning(f"{provider} request timed out")
@@ -131,7 +160,9 @@ class TTSProvider:
                     json_payload,
                     timeout_sec,
                     provider,
+                    model,
                     retry_count + 1,
+                    estimated_tokens,
                     **kwargs,
                 )
             raise
@@ -178,8 +209,17 @@ class TTSProvider:
             "voice": voice,
         }
 
+        # Estimate tokens for rate limiting
+        estimated_tokens = estimate_tokens(text)
+
         return await self._execute_request(
-            url, headers, payload, TTS_PROVIDER_TIMEOUT_SEC, provider_name
+            url,
+            headers,
+            payload,
+            TTS_PROVIDER_TIMEOUT_SEC,
+            provider_name,
+            model,
+            estimated_tokens=estimated_tokens,
         )
 
     async def _get_elevenlabs_tts(self, text: str, model: str, voice: str) -> bytes:
@@ -198,8 +238,17 @@ class TTSProvider:
             "model_id": model,
         }
 
+        # Estimate tokens for rate limiting
+        estimated_tokens = estimate_tokens(text)
+
         return await self._execute_request(
-            url, headers, payload, TTS_PROVIDER_TIMEOUT_SEC, "elevenLabs"
+            url,
+            headers,
+            payload,
+            TTS_PROVIDER_TIMEOUT_SEC,
+            "elevenLabs",
+            model,
+            estimated_tokens=estimated_tokens,
         )
 
     async def _get_google_tts(self, text: str, model: str, voice: str) -> bytes:
@@ -219,15 +268,22 @@ class TTSProvider:
             "audioConfig": {"audioEncoding": "MP3"},
         }
 
+        # Estimate tokens for rate limiting
+        estimated_tokens = estimate_tokens(text)
+
         # Google Cloud TTS has high limits, but usually uses standard cloud quotas
         # Note: Google TTS returns JSON with content, not raw bytes. _execute_request returns raw bytes.
         # We need to handle this.
 
         data_bytes = await self._execute_request(
-            url, None, payload, TTS_PROVIDER_TIMEOUT_SEC, "google"
+            url,
+            None,
+            payload,
+            TTS_PROVIDER_TIMEOUT_SEC,
+            "google",
+            model,
+            estimated_tokens=estimated_tokens,
         )
-
-        import json
 
         data = json.loads(data_bytes)
         return base64.b64decode(data["audioContent"])
@@ -251,12 +307,19 @@ class TTSProvider:
 
         headers = {"Content-Type": "application/json"}
 
+        # Estimate tokens for rate limiting
+        estimated_tokens = estimate_tokens(text)
+
         # Use specific limiter for Gemini TTS which has restrictive quotas (10 RPM)
         data_bytes = await self._execute_request(
-            url, headers, payload, TTS_PROVIDER_TIMEOUT_SEC, "google_tts"
+            url,
+            headers,
+            payload,
+            TTS_PROVIDER_TIMEOUT_SEC,
+            "google_tts",
+            model,
+            estimated_tokens=estimated_tokens,
         )
-
-        import json
 
         data = json.loads(data_bytes)
 
@@ -277,9 +340,11 @@ class TTSProvider:
 
             return wav_buffer.getvalue()
 
-        except (KeyError, IndexError):
+        except (KeyError, IndexError) as e:
             logger.error(f"Unexpected response format from Google Gemini TTS: {data}")
-            raise Exception("Failed to extract audio from Google Gemini response")
+            raise Exception(
+                "Failed to extract audio from Google Gemini response"
+            ) from e
 
 
 tts_provider = TTSProvider()

@@ -19,6 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio
 import base64
+import json
 from typing import Any, Optional
 
 import aiohttp
@@ -30,8 +31,15 @@ from .constants import (
     MAX_RETRIES,
     RETRY_BASE_SECONDS,
 )
+from .logger import logger
 from .models import ImageAspectRatio, ImageModels, ImageProviders, ImageResolution
-from .rate_limiter import get_rate_limiter
+from .rate_limiter import (
+    estimate_tokens,
+    extract_google_token_usage,
+    extract_rate_limit_headers,
+    get_rate_limiter,
+    parse_retry_after,
+)
 
 REPLICATE_API_BASE = "https://api.replicate.com/v1"
 
@@ -95,49 +103,69 @@ class ImageProvider:
         json_payload: Optional[dict],
         timeout_sec: int,
         provider: str,
+        model: str = "",
         retry_count: int = 0,
+        estimated_tokens: int = 0,
         **kwargs,
     ) -> bytes:
-        limiter = get_rate_limiter(provider)
+        # Get per-model rate limiter
+        limiter = get_rate_limiter(provider, model)
 
         try:
-            async with limiter:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        url,
-                        headers=headers,
-                        json=json_payload,
-                        timeout=timeout_sec,
-                        **kwargs,
-                    ) as response:
-                        if response.status == 429:
-                            await limiter.report_failure()
+            # Acquire rate limit slot with token estimate
+            await limiter.acquire(estimated_tokens)
 
-                            if retry_count < MAX_RETRIES:
-                                wait_time = (2**retry_count) * RETRY_BASE_SECONDS
-                                logger.debug(
-                                    f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}"
-                                )
-                                await asyncio.sleep(wait_time)
-                                return await self._execute_request(
-                                    url,
-                                    headers,
-                                    json_payload,
-                                    timeout_sec,
-                                    provider,
-                                    retry_count + 1,
-                                    **kwargs,
-                                )
+            async with (
+                aiohttp.ClientSession() as session,
+                session.post(
+                    url,
+                    headers=headers,
+                    json=json_payload,
+                    timeout=timeout_sec,
+                    **kwargs,
+                ) as response,
+            ):
+                # Extract headers for rate limit learning
+                response_headers = extract_rate_limit_headers(response.headers)
 
-                            response.raise_for_status()
+                if response.status == 429:
+                    retry_after = parse_retry_after(response.headers)
+                    await limiter.report_failure(response_headers, retry_after)
 
-                        response.raise_for_status()
-                        await limiter.report_success()
-                        return await response.read()
+                    if retry_count < MAX_RETRIES:
+                        wait_time = retry_after or (2**retry_count) * RETRY_BASE_SECONDS
+                        logger.debug(
+                            f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}"
+                        )
+                        await asyncio.sleep(wait_time)
+                        return await self._execute_request(
+                            url,
+                            headers,
+                            json_payload,
+                            timeout_sec,
+                            provider,
+                            model,
+                            retry_count + 1,
+                            estimated_tokens,
+                            **kwargs,
+                        )
+
+                    response.raise_for_status()
+
+                response.raise_for_status()
+                response_bytes = await response.read()
+
+                # For Google providers, extract actual token usage from response body
+                actual_tokens = estimated_tokens
+                if "google" in provider:
+                    actual_tokens = extract_google_token_usage(
+                        response_bytes, estimated_tokens
+                    )
+
+                await limiter.report_success(actual_tokens, response_headers)
+                return response_bytes
 
         except asyncio.TimeoutError:
-            from .logger import logger
-
             logger.warning(f"{provider} request timed out")
             await limiter.report_timeout()
 
@@ -150,7 +178,9 @@ class ImageProvider:
                     json_payload,
                     timeout_sec,
                     provider,
+                    model,
                     retry_count + 1,
+                    estimated_tokens,
                     **kwargs,
                 )
             raise
@@ -160,8 +190,6 @@ class ImageProvider:
             # We might want to back off, but maybe not as aggressively as a 429?
             # For now, let's treat it as failure but log it clearly.
             if e.status != 429:
-                from .logger import logger
-
                 logger.warning(f"{provider} returned status {e.status}: {e.message}")
 
             await limiter.report_failure()
@@ -226,75 +254,99 @@ class ImageProvider:
         # For now, let's implement basic retry for the CREATION request.
         # If creation succeeds but polling fails/times out, we don't retry currently.
 
+        # Estimate tokens for rate limiting (prompt only for image gen)
+        estimated_tokens = estimate_tokens(prompt)
+
         return await self._get_replicate_image_with_retry(
-            url, headers, payload, "replicate"
+            url, headers, payload, "replicate", model, estimated_tokens=estimated_tokens
         )
 
     async def _get_replicate_image_with_retry(
-        self, url, headers, payload, provider, retry_count=0
+        self,
+        url: str,
+        headers: dict,
+        payload: dict,
+        provider: str,
+        model: str,
+        retry_count: int = 0,
+        estimated_tokens: int = 0,
     ) -> bytes:
-        limiter = get_rate_limiter(provider)
+        # Get per-model rate limiter
+        limiter = get_rate_limiter(provider, model)
 
         try:
-            async with limiter:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        url,
-                        headers=headers,
-                        json=payload,
-                        timeout=IMAGE_PROVIDER_TIMEOUT_SEC,
-                    ) as response:
-                        if response.status == 429:
-                            await limiter.report_failure()
-                            if retry_count < MAX_RETRIES:
-                                wait_time = (2**retry_count) * RETRY_BASE_SECONDS
-                                await asyncio.sleep(wait_time)
-                                return await self._get_replicate_image_with_retry(
-                                    url, headers, payload, provider, retry_count + 1
-                                )
-                            response.raise_for_status()
+            await limiter.acquire(estimated_tokens)
 
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=IMAGE_PROVIDER_TIMEOUT_SEC,
+                ) as response:
+                    response_headers = self._extract_rate_limit_headers(
+                        response.headers
+                    )
+
+                    if response.status == 429:
+                        retry_after = self._parse_retry_after(response.headers)
+                        await limiter.report_failure(response_headers, retry_after)
+
+                        if retry_count < MAX_RETRIES:
+                            wait_time = (
+                                retry_after or (2**retry_count) * RETRY_BASE_SECONDS
+                            )
+                            await asyncio.sleep(wait_time)
+                            return await self._get_replicate_image_with_retry(
+                                url,
+                                headers,
+                                payload,
+                                provider,
+                                model,
+                                retry_count + 1,
+                                estimated_tokens,
+                            )
                         response.raise_for_status()
-                        prediction = await response.json()
 
-                    # Check prediction status immediately if 'Prefer: wait' worked
-                    if prediction.get("status") == "succeeded":
-                        await limiter.report_success()
-                        output_url = prediction["output"][0]
-                        async with aiohttp.ClientSession() as dl_session:
-                            return await self._download_image(dl_session, output_url)
+                    response.raise_for_status()
+                    prediction = await response.json()
 
-                    get_url = prediction["urls"]["get"]
-                    start_time = asyncio.get_event_loop().time()
+                # Check prediction status immediately if 'Prefer: wait' worked
+                if prediction.get("status") == "succeeded":
+                    await limiter.report_success(estimated_tokens, response_headers)
+                    output_url = prediction["output"][0]
+                    async with aiohttp.ClientSession() as dl_session:
+                        return await self._download_image(dl_session, output_url)
 
-                    await limiter.report_success()
+                get_url = prediction["urls"]["get"]
+                start_time = asyncio.get_event_loop().time()
 
-                    async with aiohttp.ClientSession() as session:
-                        while True:
-                            if (
-                                asyncio.get_event_loop().time() - start_time
-                                > IMAGE_PROVIDER_TIMEOUT_SEC
-                            ):
-                                raise TimeoutError("Replicate prediction timed out.")
+                await limiter.report_success(estimated_tokens, response_headers)
 
-                            await asyncio.sleep(1)
+                async with aiohttp.ClientSession() as session:
+                    while True:
+                        if (
+                            asyncio.get_event_loop().time() - start_time
+                            > IMAGE_PROVIDER_TIMEOUT_SEC
+                        ):
+                            raise TimeoutError("Replicate prediction timed out.")
 
-                            async with session.get(
-                                get_url, headers=headers
-                            ) as response:
-                                response.raise_for_status()
-                                prediction = await response.json()
+                        await asyncio.sleep(1)
 
-                            status = prediction.get("status")
-                            if status == "succeeded":
-                                output_url = prediction["output"][0]
-                                return await self._download_image(session, output_url)
-                            if status == "failed":
-                                raise Exception(
-                                    f"Replicate prediction failed: {prediction.get('error')}"
-                                )
-                            if status == "canceled":
-                                raise Exception("Replicate prediction canceled.")
+                        async with session.get(get_url, headers=headers) as response:
+                            response.raise_for_status()
+                            prediction = await response.json()
+
+                        status = prediction.get("status")
+                        if status == "succeeded":
+                            output_url = prediction["output"][0]
+                            return await self._download_image(session, output_url)
+                        if status == "failed":
+                            raise Exception(
+                                f"Replicate prediction failed: {prediction.get('error')}"
+                            )
+                        if status == "canceled":
+                            raise Exception("Replicate prediction canceled.")
 
         except Exception:
             # If we retry, we handle it above. If we get here, it's a hard fail.
@@ -341,12 +393,19 @@ class ImageProvider:
             "generationConfig": {"imageConfig": image_config},
         }
 
+        # Estimate tokens for rate limiting
+        estimated_tokens = estimate_tokens(prompt)
+
         # Use specific limiter for Gemini Image generation
         data_bytes = await self._execute_request(
-            url, headers, payload, IMAGE_PROVIDER_TIMEOUT_SEC, "google_image"
+            url,
+            headers,
+            payload,
+            IMAGE_PROVIDER_TIMEOUT_SEC,
+            "google_image",
+            model,
+            estimated_tokens=estimated_tokens,
         )
-
-        import json
 
         data = json.loads(data_bytes)
 
@@ -361,32 +420,34 @@ class ImageProvider:
 
         # New API format (gemini-3-pro-image-preview)
         # { "candidates": [ { "content": { "parts": [ { "inlineData": { ... } } ] } } ] }
-        if candidates := data.get("candidates"):
-            if isinstance(candidates, list) and candidates:
-                first_candidate = candidates[0]
-                if content := first_candidate.get("content"):
-                    if parts := content.get("parts"):
-                        for part in parts:
-                            if inline_data := part.get("inlineData"):
-                                if image_bytes := inline_data.get("data"):
-                                    return image_bytes
+        if (
+            (candidates := data.get("candidates"))
+            and isinstance(candidates, list)
+            and candidates
+        ):
+            first_candidate = candidates[0]
+            if (content := first_candidate.get("content")) and (
+                parts := content.get("parts")
+            ):
+                for part in parts:
+                    if (inline_data := part.get("inlineData")) and (
+                        image_bytes := inline_data.get("data")
+                    ):
+                        return image_bytes
 
         # Legacy formats
-        if image := data.get("image"):
-            if image_bytes := image.get("imageBytes"):
+        if (image := data.get("image")) and (image_bytes := image.get("imageBytes")):
+            return image_bytes
+        if (images := data.get("images")) and isinstance(images, list) and images:
+            first = images[0]
+            if image_bytes := first.get("imageBytes"):
                 return image_bytes
-        if images := data.get("images"):
-            if isinstance(images, list) and images:
-                first = images[0]
-                if image_bytes := first.get("imageBytes"):
-                    return image_bytes
         if image_bytes := data.get("imageBytes"):
             return image_bytes
-        if outputs := data.get("outputs"):
-            if isinstance(outputs, list) and outputs:
-                first = outputs[0]
-                if image_bytes := first.get("imageBytes"):
-                    return image_bytes
+        if (outputs := data.get("outputs")) and isinstance(outputs, list) and outputs:
+            first = outputs[0]
+            if image_bytes := first.get("imageBytes"):
+                return image_bytes
         return None
 
     async def _get_openai_image(
@@ -420,24 +481,6 @@ class ImageProvider:
             "Content-Type": "application/json",
         }
 
-        # Handle size
-        size = "1024x1024"
-        if aspect_ratio:
-            if aspect_ratio == "1:1":
-                size = "1024x1024"
-            elif aspect_ratio == "16:9":
-                size = "1792x1024"  # Closest to 16:9 for DALL-E 3/GPT-Image
-            elif aspect_ratio == "9:16":
-                size = "1024x1792"
-            # For other ratios, default to square or closest available if model supports it.
-            # DALL-E 3 standard sizes are 1024x1024, 1024x1792, 1792x1024.
-            # GPT-Image models might support "auto" or these sizes.
-            # Using 1024x1024 as safe default if ratio isn't standard supported by model.
-
-        # Use resolution parameter if provided and valid for standard square
-        if resolution == "2048x2048" and model == "dall-e-3":
-            pass
-
         # Construct payload
         payload: dict[str, Any] = {
             "model": model,
@@ -465,19 +508,26 @@ class ImageProvider:
             else:
                 payload["size"] = "1024x1024"
 
-        data_bytes = await self._execute_request(
-            url, headers, payload, IMAGE_PROVIDER_TIMEOUT_SEC, provider_name
-        )
+        # Estimate tokens for rate limiting
+        estimated_tokens = estimate_tokens(prompt)
 
-        import json
+        data_bytes = await self._execute_request(
+            url,
+            headers,
+            payload,
+            IMAGE_PROVIDER_TIMEOUT_SEC,
+            provider_name,
+            model,
+            estimated_tokens=estimated_tokens,
+        )
 
         data = json.loads(data_bytes)
 
         try:
             b64_json = data["data"][0]["b64_json"]
             return base64.b64decode(b64_json)
-        except (KeyError, IndexError):
-            raise Exception("Invalid response format from OpenAI Image API")
+        except (KeyError, IndexError) as e:
+            raise Exception("Invalid response format from OpenAI Image API") from e
 
 
 image_provider = ImageProvider()

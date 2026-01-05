@@ -22,15 +22,14 @@ Setup the hooks for the Anki plugin
 """
 
 
-from collections.abc import Sequence
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from anki.cards import Card
 from aqt import QAction, QMenu, browser, editor, gui_hooks, mw
 from aqt.addcards import AddCards
 from aqt.browser.sidebar.item import SidebarItemType
 
-from .config import config
+from .config import bump_usage_counter, config
 from .decks import deck_id_to_name_map
 from .logger import logger, setup_logger
 from .migrations import migrate_models
@@ -43,6 +42,9 @@ from .ui.changelog import perform_update_check
 from .ui.field_menu import FieldMenu
 from .ui.sparkle import Sparkle
 from .ui.ui_utils import show_message_box
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def with_processor(fn: Any):
@@ -205,13 +207,21 @@ def make_on_batch_success(
             debug_parts.append(f"Skipped: {len(skipped)}")
 
             if updated_fields:
-                field_list = ", ".join(sorted(list(updated_fields)))
+                field_list = ", ".join(sorted(updated_fields))
                 debug_parts.append(f"Fields processed: {field_list}")
 
             if stats.rate_limits:
-                debug_parts.append("\n--- Rate Limits (RPM) ---")
-                for provider, rpm in stats.rate_limits.items():
-                    debug_parts.append(f"{provider}: {rpm:.1f}")
+                debug_parts.append("\n--- Rate Limits ---")
+                for provider, limits in stats.rate_limits.items():
+                    rpm = limits.get("rpm", 0)
+                    rpm_used = limits.get("rpm_used", 0)
+                    tpm = limits.get("tpm", 0)
+                    rpd = limits.get("rpd", 0)
+                    rpd_used = limits.get("rpd_used", 0)
+                    debug_parts.append(
+                        f"{provider}: RPM={rpm:.0f} (used:{rpm_used:.0f}), "
+                        f"TPM={tpm:.0f}, RPD={rpd:.0f} (used:{rpd_used:.0f})"
+                    )
 
             if errors:
                 debug_parts.append("\n--- Failures ---")

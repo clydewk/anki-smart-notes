@@ -55,7 +55,7 @@ class BatchStatistics:
     start_time: float
     end_time: float
     db_writes: int
-    rate_limits: dict[str, float]
+    rate_limits: dict[str, dict[str, float]]
     logs: list[str]
     was_cancelled: bool = False
 
@@ -77,8 +77,11 @@ class ProgressDialog(QDialog):
     def __init__(self, label: str, max_val: int, on_cancel: Callable[[], None]):
         super().__init__(mw)
         self.setWindowTitle("Smart Notes")
+        # NonModal prevents blocking other windows
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setMinimumWidth(400)
+        # Prevent focus stealing - show without activating
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
         layout = QVBoxLayout()
 
@@ -218,7 +221,33 @@ class NoteProcessor:
                 return
 
             if updated:
-                mw.col.update_notes(updated)
+                # Temporarily block Anki's progress manager from showing dialogs
+                # to prevent focus-stealing "Processing..." popup during DB writes.
+                # mw.progress uses a timer that shows a dialog after ~600ms of main
+                # thread blocking, so we suppress it during our update.
+                progress_blocked = False
+                if hasattr(mw, "progress") and hasattr(mw.progress, "_win"):
+                    # If a progress window already exists, don't interfere
+                    pass
+                elif hasattr(mw, "progress"):
+                    # Block the progress manager's timer
+                    try:
+                        if hasattr(mw.progress, "_timer"):
+                            mw.progress._timer.stop()
+                            progress_blocked = True
+                    except Exception:
+                        pass
+
+                try:
+                    mw.col.update_notes(updated)
+                finally:
+                    # Restore progress timer if we blocked it
+                    if progress_blocked:
+                        try:
+                            if hasattr(mw.progress, "_timer"):
+                                mw.progress._timer.start()
+                        except Exception:
+                            pass
 
             if not finished:
                 if progress:
@@ -284,14 +313,13 @@ class NoteProcessor:
                     try:
                         n = mw.col.get_note(nid)
                         return (n, e, [])
-                    except:
+                    except Exception:
                         return (None, e, [])
 
             while to_process_ids or active_tasks:
-                if cancellation_state["cancelled"]:
+                if cancellation_state["cancelled"] and not active_tasks:
                     # Wait for active tasks to drain then break
-                    if not active_tasks:
-                        break
+                    break
 
                 # Fill the pool
                 while to_process_ids and len(active_tasks) < concurrency_limit:
@@ -340,22 +368,24 @@ class NoteProcessor:
 
                     # Flush buffer periodically (DB write)
                     batch_to_update = []
-                    # Increase buffer size to reduce Anki backup/undo creation spam
-                    if len(update_buffer) >= 50:
+                    # Use larger buffer (100 notes) to reduce DB operations and avoid
+                    # triggering Anki's internal "Processing..." dialog which appears
+                    # when main thread is blocked for more than ~600ms
+                    if len(update_buffer) >= 100:
                         batch_to_update = update_buffer[:]
                         update_buffer.clear()
 
                     # Update UI/DB
-                    # We always want to call this if we have DB updates
-                    # If no DB updates, we only want to call it occasionally to save UI repaints
-                    if batch_to_update or processed_count % 5 == 0:
-                        if batch_to_update:
-                            db_writes += 1
-                        run_on_main(
-                            lambda u=batch_to_update, p=processed_count: on_update(
-                                u, p, False
-                            )
+                    # Progress bar updates are cheap (just Qt widget updates)
+                    # DB writes are expensive but batched (every 100 notes) and protected
+                    # by progress manager suppression, so it's safe to update on every note
+                    if batch_to_update:
+                        db_writes += 1
+                    run_on_main(
+                        lambda u=batch_to_update, p=processed_count: on_update(
+                            u, p, False
                         )
+                    )
 
             # Final flush
             if update_buffer:
@@ -367,9 +397,7 @@ class NoteProcessor:
                 run_on_main(lambda u=[], p=processed_count: on_update(u, p, True))
 
             end_time = time.time()
-            rate_limits = {
-                k: v._rpm for k, v in RateLimitManager.get_instance().limiters.items()
-            }
+            rate_limits = RateLimitManager.get_instance().get_all_limits_summary()
 
             # Retrieve logs from the handler
             logs = list(log_handler.logs)

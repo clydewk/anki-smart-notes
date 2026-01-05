@@ -432,7 +432,7 @@ class TTSOptions(QWidget):
         self._inject_custom_models()
 
         # Update state
-        available_models = [ALL] + sorted(list({v["model"] for v in voices}))
+        available_models = [ALL] + sorted({v["model"] for v in voices})
 
         self.state.update({"providers": providers[:], "models": available_models})
 
@@ -582,7 +582,7 @@ class TTSOptions(QWidget):
             for v in voices
             if provider == ALL or v["tts_provider"] == provider
         }
-        new_models = [ALL] + sorted(list(available_models))
+        new_models = [ALL] + sorted(available_models)
 
         self.state.update(
             {
@@ -812,7 +812,7 @@ class TTSOptions(QWidget):
             "selected_gender": ALL,
             "languages": languages,
             "selected_language": ALL,
-            "models": [ALL] + sorted(list({v["model"] for v in voices})),
+            "models": [ALL] + sorted({v["model"] for v in voices}),
             "selected_filter_model": ALL,
             "test_text": default_texts[ALL],
             "test_enabled": True,

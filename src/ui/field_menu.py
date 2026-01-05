@@ -79,12 +79,14 @@ class FieldMenu:
                 ):  # type: ignore
                     parent._previewer.render_card()  # type: ignore
 
+            # Use show_progress=False to avoid Anki's modal progress dialog
+            # which steals focus and blocks interaction
             self.processor.process_card(
                 self.card,
                 overwrite_fields=False,
                 target_field=self.field_upper,
                 on_success=on_success,
-                show_progress=True,
+                show_progress=False,
             )
 
         generate_item.triggered.connect(wrapped)

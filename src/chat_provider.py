@@ -38,7 +38,12 @@ from .models import (
     OpenAIReasoningEffort,
     openai_reasoning_efforts_for_model,
 )
-from .rate_limiter import get_rate_limiter
+from .rate_limiter import (
+    estimate_tokens,
+    extract_rate_limit_headers,
+    get_rate_limiter,
+    parse_retry_after,
+)
 
 OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
@@ -158,7 +163,7 @@ class ChatProvider:
             retry_count=retry_count,
             provider=provider_config["name"],
             prompt=prompt,
-            model=model,  # type: ignore
+            model=model,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
         )
@@ -197,15 +202,16 @@ class ChatProvider:
 
             # Use provided effort, or default if None/Invalid
             current_effort = reasoning_effort
-            if not current_effort or current_effort not in efforts:
-                if "none" in efforts:
-                    # If "none" is valid, it effectively means "use temperature" in my config UI logic,
-                    # but API-wise, O1 models *require* reasoning_effort or default?
-                    # Actually O1 models DON'T support temperature usually.
-                    # If user selected "none" in UI for an O1 model, what should happen?
-                    # The UI initializes to valid effort.
-                    # If passed effort is None, default to "medium" or first available.
-                    current_effort = "medium" if "medium" in efforts else efforts[0]
+            if (
+                not current_effort or current_effort not in efforts
+            ) and "none" in efforts:
+                # If "none" is valid, it effectively means "use temperature" in my config UI logic,
+                # but API-wise, O1 models *require* reasoning_effort or default?
+                # Actually O1 models DON'T support temperature usually.
+                # If user selected "none" in UI for an O1 model, what should happen?
+                # The UI initializes to valid effort.
+                # If passed effort is None, default to "medium" or first available.
+                current_effort = "medium" if "medium" in efforts else efforts[0]
 
             if current_effort == "none":
                 # If explicit "none" passed (meaning turn off reasoning if possible?),
@@ -356,8 +362,7 @@ class ChatProvider:
         # We will pass the temperature if it's not 1.0 (default in Anki Smart Notes might be 1.0)
         # But wait, existing default is 1.0 in constants.py.
         # If I pass it, is it bad? The docs say "Changing the temperature (setting it below 1.0) may lead to unexpected behavior"
-        # I'll stick to passing it if it matches the config, but users might lower it.
-        # Let's pass it for now as Smart Notes allows configuration.
+        # I'll stick to passing it for now as Smart Notes allows configuration.
 
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -387,10 +392,7 @@ class ChatProvider:
             url = url.replace("/chat/completions", "/models")
         else:
             # Fallback: assume base_url is root or v1, try appending /models
-            if url.endswith("/"):
-                url = f"{url}models"
-            else:
-                url = f"{url}/models"
+            url = f"{url}models" if url.endswith("/") else f"{url}/models"
 
         logger.debug(f"Fetching models for {provider_config['name']} from {url}")
 
@@ -400,9 +402,12 @@ class ChatProvider:
         }
 
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as session, session.get(url, headers=headers) as response:
+            async with (
+                aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as session,
+                session.get(url, headers=headers) as response,
+            ):
                 response.raise_for_status()
                 data = await response.json()
                 # Standard OpenAI response: { "data": [ { "id": "model-id", ... } ] }
@@ -424,54 +429,71 @@ class ChatProvider:
         temperature: float,
         reasoning_effort: Optional[OpenAIReasoningEffort],
     ) -> str:
-        limiter = get_rate_limiter(provider)
+        # Get per-model rate limiter
+        limiter = get_rate_limiter(provider, model)
+
+        # Estimate tokens for TPM tracking
+        estimated_tokens = estimate_tokens(prompt)
 
         try:
-            async with limiter:
-                async with (
-                    aiohttp.ClientSession(
-                        timeout=aiohttp.ClientTimeout(total=timeout_sec)
-                    ) as session,
-                    session.post(url, headers=headers, json=json_payload) as response,
-                ):
-                    if response.status == 429:
-                        logger.debug(f"Got a 429 from {provider}")
-                        await limiter.report_failure()
+            # Acquire rate limit slot with token estimate
+            await limiter.acquire(estimated_tokens)
 
-                        if retry_count < MAX_RETRIES:
-                            wait_time = (2**retry_count) * RETRY_BASE_SECONDS
-                            logger.debug(
-                                f"Retry: {retry_count} Waiting {wait_time} seconds before retrying"
-                            )
-                            await asyncio.sleep(wait_time)
-                            # Recursively call the public method to retry logic
-                            return await self.async_get_chat_response(
-                                prompt,
-                                model,
-                                provider.replace("_text", "")
-                                if provider == "google_text"
-                                else provider,  # type: ignore - Pass base provider name if needed for logic, but internally execute uses key
-                                -1,
-                                temperature,
-                                reasoning_effort,
-                                retry_count + 1,
-                            )
+            async with (
+                aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=timeout_sec)
+                ) as session,
+                session.post(url, headers=headers, json=json_payload) as response,
+            ):
+                # Extract headers for rate limit learning
+                response_headers = extract_rate_limit_headers(response.headers)
 
-                    response.raise_for_status()
-                    await limiter.report_success()
+                if response.status == 429:
+                    logger.debug(f"Got a 429 from {provider}")
 
-                    resp = await response.json()
+                    # Parse Retry-After header
+                    retry_after = parse_retry_after(response.headers)
+                    await limiter.report_failure(response_headers, retry_after)
 
-                    if "anthropic" in provider:
-                        msg = resp["content"][0]["text"]
-                    elif "google" in provider:
-                        # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
-                        msg = resp["candidates"][0]["content"]["parts"][0]["text"]
-                    else:
-                        msg = resp["choices"][0]["message"]["content"]
+                    if retry_count < MAX_RETRIES:
+                        wait_time = retry_after or (2**retry_count) * RETRY_BASE_SECONDS
+                        logger.debug(
+                            f"Retry: {retry_count} Waiting {wait_time} seconds before retrying"
+                        )
+                        await asyncio.sleep(wait_time)
+                        # Recursively call the public method to retry logic
+                        return await self.async_get_chat_response(
+                            prompt,
+                            model,
+                            provider.replace("_text", "")
+                            if provider == "google_text"
+                            else provider,  # type: ignore - Pass base provider name if needed for logic, but internally execute uses key
+                            -1,
+                            temperature,
+                            reasoning_effort,
+                            retry_count + 1,
+                        )
 
-                    logger.debug(f"Got response from {provider}: {msg}")
-                    return msg
+                response.raise_for_status()
+
+                resp = await response.json()
+
+                # Extract actual token usage from response
+                actual_tokens = self._extract_token_usage(resp, provider)
+
+                # Report success with actual tokens and headers for learning
+                await limiter.report_success(actual_tokens, response_headers)
+
+                if "anthropic" in provider:
+                    msg = resp["content"][0]["text"]
+                elif "google" in provider:
+                    # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
+                    msg = resp["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    msg = resp["choices"][0]["message"]["content"]
+
+                logger.debug(f"Got response from {provider}: {msg}")
+                return msg
 
         except asyncio.TimeoutError:
             logger.warning(f"{provider} request timed out")
@@ -508,6 +530,28 @@ class ChatProvider:
             # For safety, let's treat generic exceptions as potentially overload related
             # if we can distinguish them. But for now, just 429 and Timeout.
             raise
+
+    def _extract_token_usage(self, response: dict, provider: str) -> int:
+        """Extract total token usage from API response."""
+        try:
+            if "anthropic" in provider:
+                # Anthropic: { "usage": { "input_tokens": X, "output_tokens": Y } }
+                usage = response.get("usage", {})
+                return usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            elif "google" in provider:
+                # Google: { "usageMetadata": { "promptTokenCount": X, "candidatesTokenCount": Y } }
+                usage = response.get("usageMetadata", {})
+                return usage.get("promptTokenCount", 0) + usage.get(
+                    "candidatesTokenCount", 0
+                )
+            else:
+                # OpenAI-style: { "usage": { "prompt_tokens": X, "completion_tokens": Y, "total_tokens": Z } }
+                usage = response.get("usage", {})
+                return usage.get("total_tokens", 0) or (
+                    usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                )
+        except Exception:
+            return 0
 
 
 chat_provider = ChatProvider()
