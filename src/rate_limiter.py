@@ -29,6 +29,12 @@ from .logger import logger
 from .utils import get_file_path
 
 
+class RateLimitExceededError(Exception):
+    """Raised when rate limit wait time would exceed maximum allowed."""
+
+    pass
+
+
 @dataclass
 class RateLimitDimension:
     """Tracks usage for one dimension (RPM, TPM, or RPD)."""
@@ -354,6 +360,9 @@ class MultiDimensionalRateLimiter:
         except asyncio.CancelledError:
             raise
 
+    # Maximum time to wait for rate limits before giving up
+    MAX_WAIT_SECONDS = 120.0  # 2 minutes max wait
+
     async def _scheduler(self) -> None:
         """Background task that processes the queue respecting all rate limits."""
         while True:
@@ -363,6 +372,9 @@ class MultiDimensionalRateLimiter:
             if fut.cancelled():
                 self._queue.task_done()
                 continue
+
+            # Track total wait time
+            total_waited = 0.0
 
             # Wait until all dimensions allow us to proceed
             while True:
@@ -380,8 +392,26 @@ class MultiDimensionalRateLimiter:
                 if max_wait <= 0:
                     break
 
-                # Log if we're waiting due to limits
-                if max_wait > 1:
+                # Check if we've exceeded max wait time
+                if total_waited + max_wait > self.MAX_WAIT_SECONDS:
+                    dimension = (
+                        "RPM"
+                        if rpm_wait == max_wait
+                        else ("TPM" if tpm_wait == max_wait else "RPD")
+                    )
+                    error_msg = (
+                        f"Rate limit exceeded for {self._key}: "
+                        f"would need to wait {max_wait:.1f}s for {dimension}. "
+                        f"Try again later or delete rate_limits.json to reset."
+                    )
+                    logger.error(error_msg)
+                    if not fut.done():
+                        fut.set_exception(RateLimitExceededError(error_msg))
+                    self._queue.task_done()
+                    break
+
+                # Log if we're waiting due to limits (only for significant waits)
+                if max_wait > 5:
                     dimension = (
                         "RPM"
                         if rpm_wait == max_wait
@@ -392,27 +422,30 @@ class MultiDimensionalRateLimiter:
                     )
 
                 try:
-                    await asyncio.sleep(min(max_wait, 1.0))  # Check every second
+                    sleep_time = min(max_wait, 1.0)  # Check every second
+                    await asyncio.sleep(sleep_time)
+                    total_waited += sleep_time
                 except asyncio.CancelledError:
                     if not fut.done():
                         fut.cancel()
                     self._queue.task_done()
                     return
+            else:
+                # Only execute if we didn't break out of the loop due to max wait exceeded
+                if fut.cancelled():
+                    self._queue.task_done()
+                    continue
 
-            if fut.cancelled():
+                # Consume from all dimensions
+                async with self._lock:
+                    self.rpm.consume(1)
+                    if estimated_tokens > 0:
+                        self.tpm.consume(estimated_tokens)
+                    self.rpd.consume(1)
+
+                if not fut.done():
+                    fut.set_result(None)
                 self._queue.task_done()
-                continue
-
-            # Consume from all dimensions
-            async with self._lock:
-                self.rpm.consume(1)
-                if estimated_tokens > 0:
-                    self.tpm.consume(estimated_tokens)
-                self.rpd.consume(1)
-
-            if not fut.done():
-                fut.set_result(None)
-            self._queue.task_done()
 
     async def __aenter__(self) -> "MultiDimensionalRateLimiter":
         await self.acquire()
@@ -467,8 +500,16 @@ class MultiDimensionalRateLimiter:
         self,
         headers: Optional[dict[str, str]] = None,
         retry_after: Optional[float] = None,
+        is_daily_limit: bool = False,
     ) -> None:
-        """Called when a 429 or rate limit error occurs."""
+        """
+        Called when a 429 or rate limit error occurs.
+
+        Args:
+            headers: Response headers (may contain rate limit info)
+            retry_after: Retry-After header value in seconds
+            is_daily_limit: Set True only if the error explicitly indicates daily quota exceeded
+        """
         async with self._lock:
             # Parse headers even on failure - we might learn the real limits
             if headers:
@@ -479,11 +520,14 @@ class MultiDimensionalRateLimiter:
                 # Set the reset time for RPM (most likely the bottleneck)
                 self.rpm.reset_at_from_api = time.time() + retry_after
 
-            # Apply backoff to all dimensions
+            # Apply backoff to RPM and TPM (the typical cause of 429 errors)
             self.rpm.apply_backoff()
             self.tpm.apply_backoff()
-            # RPD backoff is less useful but apply it anyway
-            self.rpd.apply_backoff()
+
+            # Only apply RPD backoff if we know it's specifically a daily limit error
+            # Standard 429 errors are almost always RPM/TPM related
+            if is_daily_limit:
+                self.rpd.apply_backoff()
 
             logger.warning(
                 f"RateLimiter [{self._key}]: 429/Failure. "
@@ -578,14 +622,51 @@ class MultiDimensionalRateLimiter:
 
     def load_state(self, state: dict[str, Any]) -> None:
         """Load state from persistence."""
+        # Get the original config defaults for recovery
+        config = DEFAULT_RATE_LIMITS.get(
+            self._key, DEFAULT_RATE_LIMITS.get(self._provider, ModelRateLimitConfig())
+        )
+
         if "rpm_limit" in state:
-            self.rpm.limit = min(state["rpm_limit"], self.rpm.max_limit)
+            loaded_limit = min(state["rpm_limit"], self.rpm.max_limit)
+            # If backed off to near min_limit and not learned from API, reset to default
+            if loaded_limit <= self.rpm.min_limit * 2 and not state.get(
+                "rpm_learned", False
+            ):
+                logger.debug(
+                    f"RateLimiter [{self._key}]: Resetting RPM from {loaded_limit:.0f} to default {config.rpm}"
+                )
+                self.rpm.limit = float(config.rpm)
+            else:
+                self.rpm.limit = loaded_limit
             self.rpm.learned_from_api = state.get("rpm_learned", False)
+
         if "tpm_limit" in state:
-            self.tpm.limit = min(state["tpm_limit"], self.tpm.max_limit)
+            loaded_limit = min(state["tpm_limit"], self.tpm.max_limit)
+            # Reset if backed off too much and not learned
+            if loaded_limit <= self.tpm.min_limit * 2 and not state.get(
+                "tpm_learned", False
+            ):
+                logger.debug(
+                    f"RateLimiter [{self._key}]: Resetting TPM from {loaded_limit:.0f} to default {config.tpm}"
+                )
+                self.tpm.limit = float(config.tpm)
+            else:
+                self.tpm.limit = loaded_limit
             self.tpm.learned_from_api = state.get("tpm_learned", False)
+
         if "rpd_limit" in state:
-            self.rpd.limit = min(state["rpd_limit"], self.rpd.max_limit)
+            loaded_limit = min(state["rpd_limit"], self.rpd.max_limit)
+            # Always reset RPD to default on new session if it was backed off
+            # Daily limits should reset each day anyway
+            if loaded_limit < config.rpd:
+                logger.debug(
+                    f"RateLimiter [{self._key}]: Resetting RPD from {loaded_limit:.0f} to default {config.rpd}"
+                )
+                self.rpd.limit = float(config.rpd)
+            else:
+                self.rpd.limit = loaded_limit
+
         # Restore daily usage if within the same day
         if "rpd_window_start" in state:
             saved_start = state["rpd_window_start"]
@@ -594,6 +675,10 @@ class MultiDimensionalRateLimiter:
             if saved_start >= current_midnight:
                 self.rpd.window_start = saved_start
                 self.rpd.used = state.get("rpd_used", 0)
+            else:
+                # New day - reset usage
+                self.rpd.used = 0
+                self.rpd.window_start = current_midnight
 
 
 class RateLimitManager:
