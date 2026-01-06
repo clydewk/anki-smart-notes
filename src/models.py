@@ -94,6 +94,10 @@ legacy_openai_chat_models: list[str] = [
 ]
 
 # Reasoning Efforts
+# "none" is a UI concept meaning "don't use reasoning, use temperature instead"
+# gpt-5: added "minimal"
+# gpt-5.1: dropped "minimal", added "none"
+# gpt-5.2: added "xhigh"
 OpenAIReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 OPENAI_DEFAULT_REASONING_EFFORTS: tuple[OpenAIReasoningEffort, ...] = (
     "low",
@@ -102,8 +106,8 @@ OPENAI_DEFAULT_REASONING_EFFORTS: tuple[OpenAIReasoningEffort, ...] = (
 )
 OPENAI_REASONING_EFFORTS_BY_MODEL: dict[str, tuple[OpenAIReasoningEffort, ...]] = {
     "gpt-5": ("minimal", "low", "medium", "high"),
-    "gpt-5.1": ("none", "minimal", "low", "medium", "high"),
-    "gpt-5.2": ("none", "minimal", "low", "medium", "high", "xhigh"),
+    "gpt-5.1": ("none", "low", "medium", "high"),
+    "gpt-5.2": ("none", "low", "medium", "high", "xhigh"),
 }
 
 

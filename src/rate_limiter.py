@@ -375,6 +375,7 @@ class MultiDimensionalRateLimiter:
 
             # Track total wait time
             total_waited = 0.0
+            exceeded_limit = False
 
             # Wait until all dimensions allow us to proceed
             while True:
@@ -390,6 +391,7 @@ class MultiDimensionalRateLimiter:
                 max_wait = max(rpm_wait, tpm_wait, rpd_wait)
 
                 if max_wait <= 0:
+                    # Ready to proceed
                     break
 
                 # Check if we've exceeded max wait time
@@ -408,6 +410,7 @@ class MultiDimensionalRateLimiter:
                     if not fut.done():
                         fut.set_exception(RateLimitExceededError(error_msg))
                     self._queue.task_done()
+                    exceeded_limit = True
                     break
 
                 # Log if we're waiting due to limits (only for significant waits)
@@ -430,22 +433,26 @@ class MultiDimensionalRateLimiter:
                         fut.cancel()
                     self._queue.task_done()
                     return
-            else:
-                # Only execute if we didn't break out of the loop due to max wait exceeded
-                if fut.cancelled():
-                    self._queue.task_done()
-                    continue
 
-                # Consume from all dimensions
-                async with self._lock:
-                    self.rpm.consume(1)
-                    if estimated_tokens > 0:
-                        self.tpm.consume(estimated_tokens)
-                    self.rpd.consume(1)
+            # If we broke out due to max wait exceeded, skip to next item
+            if exceeded_limit:
+                continue
 
-                if not fut.done():
-                    fut.set_result(None)
+            # Check if cancelled while waiting
+            if fut.cancelled():
                 self._queue.task_done()
+                continue
+
+            # Consume from all dimensions
+            async with self._lock:
+                self.rpm.consume(1)
+                if estimated_tokens > 0:
+                    self.tpm.consume(estimated_tokens)
+                self.rpd.consume(1)
+
+            if not fut.done():
+                fut.set_result(None)
+            self._queue.task_done()
 
     async def __aenter__(self) -> "MultiDimensionalRateLimiter":
         await self.acquire()

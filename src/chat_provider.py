@@ -18,6 +18,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import asyncio
+import time
 from typing import Optional
 
 import aiohttp
@@ -437,7 +438,16 @@ class ChatProvider:
 
         try:
             # Acquire rate limit slot with token estimate
+            acquire_start = time.time()
             await limiter.acquire(estimated_tokens)
+            acquire_time = time.time() - acquire_start
+            if acquire_time > 0.5:  # Only log if acquire took significant time
+                logger.debug(
+                    f"[{provider}] Rate limiter acquire took {acquire_time:.1f}s"
+                )
+
+            start_time = time.time()
+            logger.debug(f"[{provider}] Sending HTTP request to {url}...")
 
             async with (
                 aiohttp.ClientSession(
@@ -445,6 +455,12 @@ class ChatProvider:
                 ) as session,
                 session.post(url, headers=headers, json=json_payload) as response,
             ):
+                elapsed = time.time() - start_time
+                logger.debug(
+                    f"[{provider}] Got HTTP response: status={response.status} "
+                    f"in {elapsed:.1f}s"
+                )
+
                 # Extract headers for rate limit learning
                 response_headers = extract_rate_limit_headers(response.headers)
 
@@ -542,11 +558,15 @@ class ChatProvider:
             raise
 
         except aiohttp.ClientResponseError as e:
-            # Handle 5xx errors differently from 429s in logs
+            # Log non-429 errors
             if e.status != 429:
                 logger.warning(f"{provider} returned status {e.status}: {e.message}")
 
-            await limiter.report_failure()
+            # Only report failure to rate limiter for rate-limit related errors
+            # 429 = Too Many Requests, 5xx = Server errors (might indicate overload)
+            # Don't penalize rate limits for client errors like 400, 401, 403, 404
+            if e.status == 429 or e.status >= 500:
+                await limiter.report_failure()
             raise
 
         except Exception:

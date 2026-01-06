@@ -186,17 +186,18 @@ class ImageProvider:
             raise
 
         except aiohttp.ClientResponseError as e:
-            # If it's a 5xx error, it's not a rate limit, but the server is struggling.
-            # We might want to back off, but maybe not as aggressively as a 429?
-            # For now, let's treat it as failure but log it clearly.
             if e.status != 429:
                 logger.warning(f"{provider} returned status {e.status}: {e.message}")
 
-            await limiter.report_failure()
+            # Only report failure to rate limiter for rate-limit related errors
+            # 429 = Too Many Requests, 5xx = Server errors (might indicate overload)
+            # Don't penalize rate limits for client errors like 400, 401, 403, 404
+            if e.status == 429 or e.status >= 500:
+                await limiter.report_failure()
             raise
 
         except Exception:
-            await limiter.report_failure()
+            # Don't report generic exceptions to rate limiter - they're not rate limit issues
             raise
 
     async def _get_replicate_image(
@@ -348,12 +349,14 @@ class ImageProvider:
                         if status == "canceled":
                             raise Exception("Replicate prediction canceled.")
 
+        except aiohttp.ClientResponseError as e:
+            # Only report failure for rate limit related errors (429, 5xx)
+            if e.status == 429 or e.status >= 500:
+                await limiter.report_failure()
+            raise
+
         except Exception:
-            # If we retry, we handle it above. If we get here, it's a hard fail.
-            # Only catch if we want to report failure to limiter.
-            # Limiter report failure was called if 429.
-            # If other exception, report failure too.
-            await limiter.report_failure()
+            # Don't report generic exceptions to rate limiter
             raise
 
     async def _download_image(self, session: aiohttp.ClientSession, url: str) -> bytes:

@@ -171,11 +171,15 @@ class TTSProvider:
             if e.status != 429:
                 logger.warning(f"{provider} returned status {e.status}: {e.message}")
 
-            await limiter.report_failure()
+            # Only report failure to rate limiter for rate-limit related errors
+            # 429 = Too Many Requests, 5xx = Server errors (might indicate overload)
+            # Don't penalize rate limits for client errors like 400, 401, 403, 404
+            if e.status == 429 or e.status >= 500:
+                await limiter.report_failure()
             raise
 
         except Exception:
-            await limiter.report_failure()
+            # Don't report generic exceptions to rate limiter
             raise
 
     async def _get_openai_tts(
