@@ -409,8 +409,25 @@ class ImageProvider:
 
         data = json.loads(data_bytes)
 
+        # Check for error in response body (Google sometimes returns 200 with error)
+        if "error" in data:
+            error_msg = data.get("error", {})
+            if isinstance(error_msg, dict):
+                error_text = error_msg.get("message", str(error_msg))
+                error_code = error_msg.get("code", "unknown")
+                error_status = error_msg.get("status", "")
+            else:
+                error_text = str(error_msg)
+                error_code = "unknown"
+                error_status = ""
+            logger.error(
+                f"Google Image API returned error: [{error_code}] {error_status}: {error_text}"
+            )
+            raise Exception(f"Google Image API error: {error_text}")
+
         image_bytes = self._extract_google_image_bytes(data)
         if not image_bytes:
+            logger.error(f"No image bytes in response: {data}")
             raise Exception("No image bytes returned from Google.")
         return base64.b64decode(image_bytes)
 

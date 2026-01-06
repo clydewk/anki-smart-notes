@@ -317,8 +317,23 @@ class NoteProcessor:
                         return (None, e, [])
 
             while to_process_ids or active_tasks:
-                if cancellation_state["cancelled"] and not active_tasks:
-                    # Wait for active tasks to drain then break
+                # If cancelled, force-cancel all active tasks instead of waiting
+                if cancellation_state["cancelled"]:
+                    if active_tasks:
+                        logger.info(f"Cancelling {len(active_tasks)} active tasks...")
+                        for task in active_tasks:
+                            task.cancel()
+                        # Wait for cancelled tasks to finish (with timeout)
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*active_tasks, return_exceptions=True),
+                                timeout=5.0,  # Give tasks 5 seconds to clean up
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Some tasks did not cancel cleanly within timeout"
+                            )
+                        active_tasks.clear()
                     break
 
                 # Fill the pool
@@ -332,16 +347,26 @@ class NoteProcessor:
                 if not active_tasks:
                     break
 
-                # Wait for at least one task to finish
-                done, pending = await asyncio.wait(
-                    active_tasks, return_when=asyncio.FIRST_COMPLETED
-                )
+                # Wait for at least one task to finish (with timeout to check cancellation)
+                try:
+                    done, pending = await asyncio.wait(
+                        active_tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=1.0,  # Check cancellation state every second
+                    )
+                except asyncio.TimeoutError:
+                    # No task completed, but check cancellation state
+                    continue
                 active_tasks = pending
 
                 for task in done:
                     processed_count += 1
                     try:
                         note_obj, status, u_fields = await task
+                    except asyncio.CancelledError:
+                        # Task was cancelled - don't count as error
+                        logger.debug("Task was cancelled")
+                        continue
                     except Exception as e:
                         # Should be caught inside worker, but just in case
                         note_obj, status, u_fields = (None, e, [])

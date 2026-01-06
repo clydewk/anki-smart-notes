@@ -478,19 +478,43 @@ class ChatProvider:
 
                 resp = await response.json()
 
+                # Check for error in response body (Google sometimes returns 200 with error)
+                if "error" in resp:
+                    error_msg = resp.get("error", {})
+                    if isinstance(error_msg, dict):
+                        error_text = error_msg.get("message", str(error_msg))
+                        error_code = error_msg.get("code", "unknown")
+                        error_status = error_msg.get("status", "")
+                    else:
+                        error_text = str(error_msg)
+                        error_code = "unknown"
+                        error_status = ""
+                    logger.error(
+                        f"{provider} returned error in body: [{error_code}] {error_status}: {error_text}"
+                    )
+                    raise Exception(f"{provider} API error: {error_text}")
+
                 # Extract actual token usage from response
                 actual_tokens = self._extract_token_usage(resp, provider)
 
                 # Report success with actual tokens and headers for learning
                 await limiter.report_success(actual_tokens, response_headers)
 
-                if "anthropic" in provider:
-                    msg = resp["content"][0]["text"]
-                elif "google" in provider:
-                    # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
-                    msg = resp["candidates"][0]["content"]["parts"][0]["text"]
-                else:
-                    msg = resp["choices"][0]["message"]["content"]
+                try:
+                    if "anthropic" in provider:
+                        msg = resp["content"][0]["text"]
+                    elif "google" in provider:
+                        # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
+                        msg = resp["candidates"][0]["content"]["parts"][0]["text"]
+                    else:
+                        msg = resp["choices"][0]["message"]["content"]
+                except (KeyError, IndexError) as e:
+                    logger.error(
+                        f"{provider} returned unexpected response format: {resp}"
+                    )
+                    raise Exception(
+                        f"{provider} returned unexpected response: {e}"
+                    ) from e
 
                 logger.debug(f"Got response from {provider}: {msg}")
                 return msg
