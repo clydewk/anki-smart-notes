@@ -120,7 +120,7 @@ def openai_reasoning_efforts_for_model(model: str) -> list[OpenAIReasoningEffort
 
 # TTS Models
 
-OpenAITTSModels = Literal["tts-1"]
+OpenAITTSModels = Literal["tts-1", "tts-1-hd", "gpt-4o-mini-tts"]
 ElevenTTSModels = Literal["eleven_multilingual_v2"]
 GoogleModels = Literal[
     "standard",
@@ -134,13 +134,22 @@ TTSModels = Union[OpenAITTSModels, ElevenTTSModels, GoogleModels, AzureModels]
 
 # TTS Voices
 
+# Legacy voices for tts-1/tts-1-hd: alloy, ash, coral, echo, fable, onyx, nova, sage, shimmer
+# All voices for gpt-4o-mini-tts: alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer, verse, marin, cedar
 OpenAIVoices = Literal[
     "alloy",
+    "ash",
+    "ballad",
+    "coral",
     "echo",
     "fable",
-    "onyx",
     "nova",
+    "onyx",
+    "sage",
     "shimmer",
+    "verse",
+    "marin",
+    "cedar",
 ]
 
 ElevenVoices = Literal["male-1", "male-2", "female-1", "female-2"]

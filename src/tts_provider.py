@@ -49,6 +49,7 @@ class TTSProvider:
         voice: str,
         strip_html: bool,
         note_id: int = -1,
+        instructions: Optional[str] = None,
     ) -> bytes:
         text = input
         if strip_html:
@@ -59,10 +60,12 @@ class TTSProvider:
             (p for p in (config.custom_providers or []) if p["name"] == provider), None
         )
         if custom_provider:
-            return await self._get_openai_tts(text, model, voice, custom_provider)
+            return await self._get_openai_tts(
+                text, model, voice, custom_provider, instructions
+            )
 
         if provider == "openai":
-            return await self._get_openai_tts(text, model, voice)
+            return await self._get_openai_tts(text, model, voice, None, instructions)
         elif provider == "elevenLabs":
             return await self._get_elevenlabs_tts(text, model, voice)
         elif provider == "google":
@@ -183,7 +186,12 @@ class TTSProvider:
             raise
 
     async def _get_openai_tts(
-        self, text: str, model: str, voice: str, provider_config: Optional[dict] = None
+        self,
+        text: str,
+        model: str,
+        voice: str,
+        provider_config: Optional[dict] = None,
+        instructions: Optional[str] = None,
     ) -> bytes:
         if provider_config:
             api_key = provider_config["api_key"]
@@ -207,11 +215,15 @@ class TTSProvider:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
+        payload: dict[str, str] = {
             "model": model,
             "input": text,
             "voice": voice,
         }
+
+        # Add instructions for gpt-4o-mini-tts model
+        if instructions and model == "gpt-4o-mini-tts":
+            payload["instructions"] = instructions
 
         # Estimate tokens for rate limiting
         estimated_tokens = estimate_tokens(text)

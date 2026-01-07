@@ -103,6 +103,15 @@ class FieldProcessor:
             if tts_style and tts_provider == "google" and "gemini" in tts_model:
                 input_text = f"{tts_style} {input}"
 
+            # For OpenAI gpt-4o-mini-tts, pass style as instructions parameter
+            instructions: Optional[str] = None
+            if (
+                tts_style
+                and tts_provider == "openai"
+                and tts_model == "gpt-4o-mini-tts"
+            ):
+                instructions = tts_style
+
             tts_response = await self.get_tts_response(
                 note=note,
                 input_text=input_text,
@@ -111,6 +120,7 @@ class FieldProcessor:
                 provider=tts_provider,
                 strip_html=should_strip_html,
                 show_error_box=show_error_box,
+                instructions=instructions,
             )
 
             if not tts_response:
@@ -235,6 +245,7 @@ class FieldProcessor:
         voice: str,
         strip_html: bool,
         show_error_box: bool = True,
+        instructions: Optional[str] = None,
     ) -> Optional[bytes]:
         interpolated_prompt = interpolate_prompt(input_text, note)
 
@@ -251,6 +262,7 @@ class FieldProcessor:
             voice=voice,
             note_id=note.id,
             strip_html=strip_html,
+            instructions=instructions,
         )
 
     async def get_image_response(

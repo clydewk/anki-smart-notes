@@ -111,62 +111,89 @@ class TTSState(TypedDict):
     search_text: str
 
 
-openai_voices: list[TTSMeta] = [
-    {
-        "tts_provider": "openai",
-        "voice": "alloy",
-        "model": "tts-1",
-        "friendly_voice": "alloy",
-        "gender": "Female",
-        "language": ALL,
-        "price_tier": "standard",
-    },
-    {
-        "tts_provider": "openai",
-        "voice": "echo",
-        "model": "tts-1",
-        "friendly_voice": "echo",
-        "gender": "Male",
-        "language": ALL,
-        "price_tier": "standard",
-    },
-    {
-        "tts_provider": "openai",
-        "voice": "fable",
-        "model": "tts-1",
-        "friendly_voice": "fable",
-        "gender": "Female",
-        "language": ALL,
-        "price_tier": "standard",
-    },
-    {
-        "tts_provider": "openai",
-        "voice": "onyx",
-        "model": "tts-1",
-        "friendly_voice": "onyx",
-        "gender": "Male",
-        "language": ALL,
-        "price_tier": "standard",
-    },
-    {
-        "tts_provider": "openai",
-        "voice": "nova",
-        "model": "tts-1",
-        "friendly_voice": "nova",
-        "gender": "Female",
-        "language": ALL,
-        "price_tier": "standard",
-    },
-    {
-        "tts_provider": "openai",
-        "voice": "shimmer",
-        "model": "tts-1",
-        "friendly_voice": "shimmer",
-        "gender": "Female",
-        "language": ALL,
-        "price_tier": "standard",
-    },
+# OpenAI TTS voice/gender mappings
+OPENAI_VOICE_GENDERS: dict[str, Literal["Male", "Female"]] = {
+    "alloy": "Female",
+    "ash": "Male",
+    "ballad": "Male",
+    "coral": "Female",
+    "echo": "Male",
+    "fable": "Female",
+    "nova": "Female",
+    "onyx": "Male",
+    "sage": "Female",
+    "shimmer": "Female",
+    "verse": "Male",
+    "marin": "Female",
+    "cedar": "Male",
+}
+
+# Voices available for each model
+OPENAI_TTS1_VOICES = [
+    "alloy",
+    "ash",
+    "coral",
+    "echo",
+    "fable",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
 ]
+OPENAI_GPT4O_VOICES = OPENAI_TTS1_VOICES + ["ballad", "verse", "marin", "cedar"]
+
+
+def generate_openai_voices() -> list[TTSMeta]:
+    """Generate OpenAI TTS voice entries for all models."""
+    voices: list[TTSMeta] = []
+
+    # gpt-4o-mini-tts voices (13 voices, recommended model)
+    for voice in OPENAI_GPT4O_VOICES:
+        suffix = " ⭐" if voice in ("marin", "cedar") else ""
+        voices.append(
+            {
+                "tts_provider": "openai",
+                "voice": voice,
+                "model": "gpt-4o-mini-tts",
+                "friendly_voice": f"{voice} (gpt-4o-mini-tts){suffix}",
+                "gender": OPENAI_VOICE_GENDERS[voice],
+                "language": ALL,
+                "price_tier": "standard",
+            }
+        )
+
+    # tts-1-hd voices (9 voices, higher quality)
+    for voice in OPENAI_TTS1_VOICES:
+        voices.append(
+            {
+                "tts_provider": "openai",
+                "voice": voice,
+                "model": "tts-1-hd",
+                "friendly_voice": f"{voice} (tts-1-hd)",
+                "gender": OPENAI_VOICE_GENDERS[voice],
+                "language": ALL,
+                "price_tier": "standard",
+            }
+        )
+
+    # tts-1 voices (9 voices, lower latency)
+    for voice in OPENAI_TTS1_VOICES:
+        voices.append(
+            {
+                "tts_provider": "openai",
+                "voice": voice,
+                "model": "tts-1",
+                "friendly_voice": f"{voice} (tts-1)",
+                "gender": OPENAI_VOICE_GENDERS[voice],
+                "language": ALL,
+                "price_tier": "low",
+            }
+        )
+
+    return voices
+
+
+openai_voices: list[TTSMeta] = generate_openai_voices()
 
 
 class GoogleVoice(TypedDict):
@@ -350,7 +377,7 @@ providers: list[AllTTSProviders] = base_providers.copy()
 
 def format_voice(voice: TTSMeta) -> str:
     language_display = "Multilingual" if voice["language"] == ALL else voice["language"]
-    return f"{voice['tts_provider'].capitalize()} - {language_display} - {voice['gender'].capitalize()} - {voice['friendly_voice'].title()} ({price_tier_copy[voice['price_tier']]})"
+    return f"{voice['tts_provider'].capitalize()} - {language_display} - {voice['gender'].capitalize()} - {voice['friendly_voice']} ({price_tier_copy[voice['price_tier']]})"
 
 
 voice_search_cache: dict[tuple[str, str, str], list[str]] = {
