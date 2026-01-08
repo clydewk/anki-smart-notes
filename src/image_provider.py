@@ -29,6 +29,7 @@ from .constants import (
     GOOGLE_IMAGE_BASE_URL,
     IMAGE_PROVIDER_TIMEOUT_SEC,
     MAX_RETRIES,
+    MAX_RETRY_WAIT_SECONDS,
     RETRY_BASE_SECONDS,
 )
 from .logger import logger
@@ -133,7 +134,10 @@ class ImageProvider:
                     await limiter.report_failure(response_headers, retry_after)
 
                     if retry_count < MAX_RETRIES:
-                        wait_time = retry_after or (2**retry_count) * RETRY_BASE_SECONDS
+                        wait_time = min(
+                            retry_after or (2**retry_count) * RETRY_BASE_SECONDS,
+                            MAX_RETRY_WAIT_SECONDS,
+                        )
                         logger.debug(
                             f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}"
                         )
@@ -170,7 +174,10 @@ class ImageProvider:
             await limiter.report_timeout()
 
             if retry_count < MAX_RETRIES:
-                wait_time = (2**retry_count) * RETRY_BASE_SECONDS
+                wait_time = min(
+                    (2**retry_count) * RETRY_BASE_SECONDS,
+                    MAX_RETRY_WAIT_SECONDS,
+                )
                 await asyncio.sleep(wait_time)
                 return await self._execute_request(
                     url,
@@ -294,8 +301,9 @@ class ImageProvider:
                         await limiter.report_failure(response_headers, retry_after)
 
                         if retry_count < MAX_RETRIES:
-                            wait_time = (
-                                retry_after or (2**retry_count) * RETRY_BASE_SECONDS
+                            wait_time = min(
+                                retry_after or (2**retry_count) * RETRY_BASE_SECONDS,
+                                MAX_RETRY_WAIT_SECONDS,
                             )
                             await asyncio.sleep(wait_time)
                             return await self._get_replicate_image_with_retry(

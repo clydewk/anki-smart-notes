@@ -24,7 +24,8 @@ from anki.decks import DeckId
 from .models import ChatModels, ChatProviders
 
 RETRY_BASE_SECONDS = 5
-MAX_RETRIES = 10
+MAX_RETRIES = 5
+MAX_RETRY_WAIT_SECONDS = 60  # Cap exponential backoff to prevent extremely long waits
 CHAT_CLIENT_TIMEOUT_SEC = 300
 REASONING_CLIENT_TIMEOUT_SEC = 1200
 TTS_PROVIDER_TIMEOUT_SEC = 30

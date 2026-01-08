@@ -28,7 +28,7 @@ import aiohttp
 from anki.utils import strip_html as anki_strip_html
 
 from .config import config
-from .constants import MAX_RETRIES, RETRY_BASE_SECONDS, TTS_PROVIDER_TIMEOUT_SEC
+from .constants import MAX_RETRIES, MAX_RETRY_WAIT_SECONDS, RETRY_BASE_SECONDS, TTS_PROVIDER_TIMEOUT_SEC
 from .logger import logger
 from .models import TTSModels, TTSProviders
 from .rate_limiter import (
@@ -118,7 +118,10 @@ class TTSProvider:
                     await limiter.report_failure(response_headers, retry_after)
 
                     if retry_count < MAX_RETRIES:
-                        wait_time = retry_after or (2**retry_count) * RETRY_BASE_SECONDS
+                        wait_time = min(
+                            retry_after or (2**retry_count) * RETRY_BASE_SECONDS,
+                            MAX_RETRY_WAIT_SECONDS,
+                        )
                         logger.debug(
                             f"{provider} 429: Waiting {wait_time}s before retry {retry_count + 1}"
                         )
@@ -155,7 +158,10 @@ class TTSProvider:
             await limiter.report_timeout()
 
             if retry_count < MAX_RETRIES:
-                wait_time = (2**retry_count) * RETRY_BASE_SECONDS
+                wait_time = min(
+                    (2**retry_count) * RETRY_BASE_SECONDS,
+                    MAX_RETRY_WAIT_SECONDS,
+                )
                 await asyncio.sleep(wait_time)
                 return await self._execute_request(
                     url,

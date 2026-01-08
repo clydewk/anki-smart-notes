@@ -28,6 +28,7 @@ from .constants import (
     CHAT_CLIENT_TIMEOUT_SEC,
     DEFAULT_TEMPERATURE,
     MAX_RETRIES,
+    MAX_RETRY_WAIT_SECONDS,
     REASONING_CLIENT_TIMEOUT_SEC,
     RETRY_BASE_SECONDS,
 )
@@ -472,7 +473,10 @@ class ChatProvider:
                     await limiter.report_failure(response_headers, retry_after)
 
                     if retry_count < MAX_RETRIES:
-                        wait_time = retry_after or (2**retry_count) * RETRY_BASE_SECONDS
+                        wait_time = min(
+                            retry_after or (2**retry_count) * RETRY_BASE_SECONDS,
+                            MAX_RETRY_WAIT_SECONDS,
+                        )
                         logger.debug(
                             f"Retry: {retry_count} Waiting {wait_time} seconds before retrying"
                         )
@@ -542,7 +546,10 @@ class ChatProvider:
             await limiter.report_timeout()
 
             if retry_count < MAX_RETRIES:
-                wait_time = (2**retry_count) * RETRY_BASE_SECONDS
+                wait_time = min(
+                    (2**retry_count) * RETRY_BASE_SECONDS,
+                    MAX_RETRY_WAIT_SECONDS,
+                )
                 await asyncio.sleep(wait_time)
                 return await self.async_get_chat_response(
                     prompt,
