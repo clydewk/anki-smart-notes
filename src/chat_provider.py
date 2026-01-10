@@ -45,6 +45,7 @@ from .rate_limiter import (
     extract_rate_limit_headers,
     get_rate_limiter,
     parse_retry_after,
+    ProviderUnavailableError,
 )
 
 OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
@@ -437,6 +438,12 @@ class ChatProvider:
         # Estimate tokens for TPM tracking
         estimated_tokens = estimate_tokens(prompt)
 
+        # Check circuit breaker first
+        if limiter.is_circuit_open:
+            raise ProviderUnavailableError(
+                f"{provider} is temporarily unavailable (circuit breaker open)"
+            )
+
         try:
             # Acquire rate limit slot with token estimate
             acquire_start = time.time()
@@ -467,10 +474,19 @@ class ChatProvider:
 
                 if response.status == 429:
                     logger.debug(f"Got a 429 from {provider}")
+                    
+                    error_text = await response.text()
+                    is_daily_limit = self._is_daily_quota_error(error_text)
 
                     # Parse Retry-After header
                     retry_after = parse_retry_after(response.headers)
-                    await limiter.report_failure(response_headers, retry_after)
+                    await limiter.report_failure(response_headers, retry_after, is_daily_limit=is_daily_limit)
+                    
+                    if is_daily_limit:
+                        # Fail fast if daily quota exhausted
+                        raise ProviderUnavailableError(
+                            f"{provider} daily quota exhausted: {error_text[:200]}"
+                        )
 
                     if retry_count < MAX_RETRIES:
                         wait_time = min(
@@ -603,6 +619,16 @@ class ChatProvider:
                 )
         except Exception:
             return 0
+
+    def _is_daily_quota_error(self, error_text: str) -> bool:
+        """Check if error indicates daily quota exhaustion."""
+        text = error_text.lower()
+        return (
+            "quota" in text 
+            or "daily limit" in text 
+            or "insufficient_quota" in text
+            or "RESOURCE_EXHAUSTED" in text  # Google style
+        )
 
 
 chat_provider = ChatProvider()

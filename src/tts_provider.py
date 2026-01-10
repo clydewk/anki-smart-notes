@@ -37,6 +37,7 @@ from .rate_limiter import (
     extract_rate_limit_headers,
     get_rate_limiter,
     parse_retry_after,
+    ProviderUnavailableError,
 )
 
 
@@ -81,6 +82,16 @@ class TTSProvider:
         else:
             raise ValueError(f"Unknown TTS provider: {provider}")
 
+    def _is_daily_quota_error(self, error_text: str) -> bool:
+        """Check if error indicates daily quota exhaustion."""
+        text = error_text.lower()
+        return (
+            "quota" in text 
+            or "daily limit" in text 
+            or "insufficient_quota" in text
+            or "RESOURCE_EXHAUSTED" in text  # Google style
+        )
+
     async def _execute_request(
         self,
         url: str,
@@ -95,6 +106,12 @@ class TTSProvider:
     ) -> bytes:
         # Get per-model rate limiter
         limiter = get_rate_limiter(provider, model)
+
+        # Check circuit breaker first
+        if limiter.is_circuit_open:
+            raise ProviderUnavailableError(
+                f"{provider} is temporarily unavailable (circuit breaker open)"
+            )
 
         try:
             # Acquire rate limit slot with token estimate
@@ -114,8 +131,17 @@ class TTSProvider:
                 response_headers = extract_rate_limit_headers(response.headers)
 
                 if response.status == 429:
+                    error_text = await response.text()
+                    is_daily_limit = self._is_daily_quota_error(error_text)
+                    
                     retry_after = parse_retry_after(response.headers)
-                    await limiter.report_failure(response_headers, retry_after)
+                    await limiter.report_failure(response_headers, retry_after, is_daily_limit=is_daily_limit)
+                    
+                    if is_daily_limit:
+                        # Fail fast if daily quota exhausted
+                        raise ProviderUnavailableError(
+                            f"{provider} daily quota exhausted: {error_text[:200]}"
+                        )
 
                     if retry_count < MAX_RETRIES:
                         wait_time = min(

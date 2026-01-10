@@ -35,6 +35,12 @@ class RateLimitExceededError(Exception):
     pass
 
 
+class ProviderUnavailableError(Exception):
+    """Raised when a provider's circuit breaker is open (too many consecutive failures)."""
+
+    pass
+
+
 @dataclass
 class RateLimitDimension:
     """Tracks usage for one dimension (RPM, TPM, or RPD)."""
@@ -334,15 +340,89 @@ class MultiDimensionalRateLimiter:
         # Track estimated vs actual tokens for learning
         self._last_estimated_tokens = 0
 
+        # Circuit breaker state - prevents endless retries
+        self._consecutive_429s = 0
+        self._first_429_time: Optional[float] = None
+        self._circuit_open_until: Optional[float] = None
+        # Import thresholds from constants
+        from .constants import (
+            CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+            CIRCUIT_BREAKER_THRESHOLD,
+            CIRCUIT_BREAKER_WINDOW_SECONDS,
+        )
+        self._cb_threshold = CIRCUIT_BREAKER_THRESHOLD
+        self._cb_window = CIRCUIT_BREAKER_WINDOW_SECONDS
+        self._cb_cooldown = CIRCUIT_BREAKER_COOLDOWN_SECONDS
+
     @property
     def key(self) -> str:
         return self._key
+
+    @property
+    def is_circuit_open(self) -> bool:
+        """Check if the circuit breaker is currently open (blocking requests)."""
+        if self._circuit_open_until is None:
+            return False
+        now = time.time()
+        if now >= self._circuit_open_until:
+            # Circuit has cooled down, reset state
+            self._circuit_open_until = None
+            self._consecutive_429s = 0
+            self._first_429_time = None
+            logger.info(f"RateLimiter [{self._key}]: Circuit breaker reset after cooldown")
+            return False
+        return True
+
+    def _record_429(self) -> bool:
+        """
+        Record a 429 error and check if circuit should trip.
+        Returns True if circuit just tripped.
+        """
+        now = time.time()
+
+        # Reset counter if outside the window
+        if self._first_429_time is not None and (now - self._first_429_time) > self._cb_window:
+            self._consecutive_429s = 0
+            self._first_429_time = None
+
+        # Record this 429
+        if self._first_429_time is None:
+            self._first_429_time = now
+        self._consecutive_429s += 1
+
+        # Check if we should trip the circuit
+        if self._consecutive_429s >= self._cb_threshold:
+            self._circuit_open_until = now + self._cb_cooldown
+            logger.warning(
+                f"RateLimiter [{self._key}]: Circuit breaker TRIPPED after "
+                f"{self._consecutive_429s} consecutive 429s. "
+                f"Blocking requests for {self._cb_cooldown}s."
+            )
+            return True
+        return False
+
+    def _reset_429_counter(self) -> None:
+        """Reset the consecutive 429 counter on success."""
+        if self._consecutive_429s > 0:
+            logger.debug(f"RateLimiter [{self._key}]: Reset 429 counter after success")
+        self._consecutive_429s = 0
+        self._first_429_time = None
 
     async def acquire(self, estimated_tokens: int = 0) -> None:
         """
         Wait until it's safe to make a request.
         Pass estimated_tokens for TPM tracking (will be corrected later via report_success).
+        
+        Raises:
+            ProviderUnavailableError: If the circuit breaker is open.
         """
+        # Check circuit breaker first - fail fast if provider is unavailable
+        if self.is_circuit_open:
+            raise ProviderUnavailableError(
+                f"Provider {self._key} is temporarily unavailable "
+                f"(circuit breaker open, resets at {self._circuit_open_until:.0f})"
+            )
+        
         # Ensure scheduler is running
         if self._scheduler_task is None or self._scheduler_task.done():
             self._scheduler_task = asyncio.create_task(self._scheduler())
@@ -502,6 +582,9 @@ class MultiDimensionalRateLimiter:
             # Save state
             if self._manager:
                 self._manager.save_state()
+            
+            # Reset circuit breaker counter on successful request
+            self._reset_429_counter()
 
     async def report_failure(
         self,
@@ -540,6 +623,17 @@ class MultiDimensionalRateLimiter:
                 f"RateLimiter [{self._key}]: 429/Failure. "
                 f"RPM: {self.rpm.limit:.0f}, TPM: {self.tpm.limit:.0f}, RPD: {self.rpd.limit:.0f}"
             )
+
+            # Record 429 in circuit breaker - may trip the circuit
+            circuit_tripped = self._record_429()
+            
+            # If daily limit detected, trip circuit immediately
+            if is_daily_limit and not circuit_tripped:
+                self._circuit_open_until = time.time() + self._cb_cooldown
+                logger.warning(
+                    f"RateLimiter [{self._key}]: Daily quota exhausted. "
+                    f"Circuit breaker tripped for {self._cb_cooldown}s."
+                )
 
             if self._manager:
                 self._manager.save_state()

@@ -35,6 +35,11 @@ GOOGLE_IMAGE_DEFAULT_SIZE = "1024x1024"
 
 STANDARD_BATCH_LIMIT = 500
 
+# Circuit breaker settings - prevents endless retries when a provider is unavailable
+CIRCUIT_BREAKER_THRESHOLD = 10  # Consecutive 429s to trip the circuit
+CIRCUIT_BREAKER_WINDOW_SECONDS = 120  # Window for counting consecutive 429s
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = 300  # Cooldown period after circuit trips (5 min)
+
 DEFAULT_CHAT_MODEL: ChatModels = "gpt-4o-mini"
 DEFAULT_CHAT_PROVIDER: ChatProviders = "openai"
 
