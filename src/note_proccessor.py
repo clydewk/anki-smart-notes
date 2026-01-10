@@ -561,10 +561,28 @@ class NoteProcessor:
                     for node in next_batch
                 }
 
-                responses = await asyncio.gather(*batch_tasks.values())
+                responses = await asyncio.gather(
+                    *batch_tasks.values(), return_exceptions=True
+                )
 
                 for field, response in zip(batch_tasks.keys(), responses):
                     node = dag[field]
+
+                    # Handle field-level exceptions gracefully
+                    if isinstance(response, Exception):
+                        logger.warning(
+                            f"Field '{field}' failed: {response}. Continuing with other fields."
+                        )
+                        # Mark node as aborted so downstream fields are skipped
+                        node.abort = True
+                        # Remove from DAG and continue processing other fields
+                        for out_node in node.out_nodes:
+                            out_node.in_nodes.remove(node)
+                            # Mark downstream nodes as aborted since their dependency failed
+                            out_node.abort = True
+                        dag.pop(field)
+                        continue
+
                     if response is not None:
                         current_val = note[node.field_upper]
                         if response != current_val:
