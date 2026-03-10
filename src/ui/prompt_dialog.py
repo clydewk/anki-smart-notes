@@ -645,22 +645,10 @@ class PromptDialog(QDialog):
         return f"{{{{{source}}}}}"
 
     def on_target_field_changed(self, field: Optional[str]) -> None:
-        # This shouldn't happen
         if not field:
             return
 
-        prompt = (
-            self.get_tts_prompt(self.state.s["selected_tts_source_field"])
-            if self.state.s["type"] == "tts"
-            else ""
-        )
-
-        self.state.update(
-            {
-                "prompt": prompt,
-                "selected_note_field": field,
-            }
-        )
+        self.state.update({"selected_note_field": field})
         self._sync_regenerate_flag()
 
     def render_buttons(self) -> None:

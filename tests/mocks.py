@@ -29,10 +29,26 @@ class MockConfig:
     chat_provider: str = "openai"
     chat_model: str = "gpt-4o-mini"
     chat_temperature: int = 0
+    chat_reasoning_effort: Any = None
+    chat_markdown_to_html: bool = False
     tts_provider: str = "openai"
     tts_voice: str = "alloy"
     tts_model: str = "tts-1"
-    openai_api_key: str = ""
+    tts_strip_html: bool = True
+    image_provider: str = "openai"
+    image_model: str = "gpt-image-1.5"
+    image_aspect_ratio: Any = None
+    image_resolution: Any = None
+    image_output_format: Any = None
+    image_quality: Any = None
+    openai_api_key: str = "test-openai-key"
+    anthropic_api_key: str = ""
+    deepseek_api_key: str = ""
+    google_api_key: str = ""
+    elevenlabs_api_key: str = ""
+    replicate_api_key: str = ""
+    custom_providers: Any = None
+    provider_settings: Any = None
     auth_token: str = ""
     uuid: str = "test-uuid-12345"
     debug: bool = True
@@ -69,42 +85,3 @@ class MockNote:
 
 def p(str) -> str:
     return f"p_{str}"
-
-
-class MockOpenAIClient:
-    async def async_get_chat_response(self, prompt: str):
-        return p(prompt)
-
-
-class MockChatClient:
-    async def async_get_chat_response(
-        self,
-        prompt: str,
-        model: str,
-        provider: str,
-        note_id: int,
-        temperature: int = 0,
-        retry_count: int = 0,
-    ) -> str:
-        return p(prompt)
-
-
-class MockAppState:
-    """Mock app state that simulates an unlocked app with unlimited capacity"""
-
-    state = {
-        "subscription": "PAID_PLAN_ACTIVE",  # Unlocked state
-        "plan": {
-            "planId": "test_plan",
-            "planName": "Test Plan",
-            "notesUsed": 0,
-            "notesLimit": 1000,
-            "daysLeft": 30,
-            "textCreditsUsed": 0,
-            "textCreditsCapacity": 1000,
-            "voiceCreditsUsed": 0,
-            "voiceCreditsCapacity": 1000,
-            "imageCreditsUsed": 0,
-            "imageCreditsCapacity": 1000,
-        },
-    }

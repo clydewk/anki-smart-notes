@@ -664,8 +664,10 @@ class NoteProcessor:
 
         value = note[node.field_upper]
 
-        # If not target and manual, skip
+        # Let downstream generated fields depend on existing manual values.
         if node.manual and not (node.is_target or node.generate_despite_manual):
+            if value:
+                return value
             node.abort = True
             logger.debug(f"Skipping field {node.field}")
             return None

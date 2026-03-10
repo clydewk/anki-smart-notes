@@ -28,8 +28,12 @@ from tests.mocks import MockConfig
 # Mock anki modules before they are imported
 sys.modules["aqt"] = MagicMock()
 sys.modules["aqt.addons"] = MagicMock()
+sys.modules["aqt.qt"] = MagicMock()
 sys.modules["anki"] = MagicMock()
+sys.modules["anki.cards"] = MagicMock()
 sys.modules["anki.decks"] = MagicMock()
+sys.modules["anki.notes"] = MagicMock()
+sys.modules["aiohttp"] = MagicMock()
 
 os.environ["IS_TEST"] = "True"
 

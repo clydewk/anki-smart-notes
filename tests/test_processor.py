@@ -1,5 +1,3 @@
-# type: ignore
-
 """
 Copyright (C) 2024 Michael Piazza
 
@@ -19,80 +17,83 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import sys
+import types
+
 import pytest
 
 from tests.mocks import (
-    MockAppState,
-    MockChatClient,
     MockConfig,
     MockNote,
-    MockOpenAIClient,
     p,
 )
 
 NOTE_TYPE_NAME = "note_type_1"
 
 
+class FakeFieldProcessor:
+    async def resolve(self, node, note, show_error_box=False):
+        from src.prompts import interpolate_prompt
+
+        del show_error_box
+
+        interpolated = interpolate_prompt(node.input, note)
+        if not interpolated:
+            return None
+
+        return p(interpolated)
+
+
 def setup_data(monkeypatch, note, prompts_map, options, allow_empty_fields):
-    import src.app_state
+    import src.config
     import src.dag
     import src.prompts
-    from src.field_processor import FieldProcessor
+
+    fake_field_processor_module = types.ModuleType("src.field_processor")
+    fake_field_processor_module.FieldProcessor = object
+    monkeypatch.setitem(sys.modules, "src.field_processor", fake_field_processor_module)
+
+    fake_sentry_module = types.ModuleType("src.sentry")
+    fake_sentry_module.run_async_in_background_with_sentry = (
+        lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(sys.modules, "src.sentry", fake_sentry_module)
+
+    fake_ui_utils_module = types.ModuleType("src.ui.ui_utils")
+    fake_ui_utils_module.show_message_box = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "src.ui.ui_utils", fake_ui_utils_module)
+
     from src.note_proccessor import NoteProcessor
 
-    openai = MockOpenAIClient()
-    chat = MockChatClient()
-
-    # Create extras for all fields with prompts, with defaults for fields not in options
-    extras = {}
-    for field in prompts_map:
-        if field in options:
-            extras[field] = {
-                "automatic": not options[field]["manual"],
-                "type": "chat",
-                "use_custom_model": False,
-                # Add the config values that key_or_config_val looks for
-                "chat_model": "gpt-4o-mini",
-                "chat_provider": "openai",
-                "chat_temperature": 0,
-                "chat_markdown_to_html": False,
-            }
-        else:
-            extras[field] = {
-                "automatic": True,
-                "type": "chat",
-                "use_custom_model": False,
-                # Add the config values that key_or_config_val looks for
-                "chat_model": "gpt-4o-mini",
-                "chat_provider": "openai",
-                "chat_temperature": 0,
-                "chat_markdown_to_html": False,
-            }  # Default extras
+    extras = {
+        field: {
+            "automatic": not options.get(field, {}).get("manual", False),
+            "type": "chat",
+            "use_custom_model": False,
+            "chat_model": "gpt-4o-mini",
+            "chat_provider": "openai",
+            "chat_temperature": 0,
+            "chat_reasoning_effort": None,
+            "chat_markdown_to_html": False,
+        }
+        for field in prompts_map
+    }
 
     prompts_map = {
         "note_types": {NOTE_TYPE_NAME: {"1": {"fields": prompts_map, "extras": extras}}}
     }
 
     c = MockConfig(prompts_map=prompts_map, allow_empty_fields=allow_empty_fields)
-    f = FieldProcessor(
-        openai_provider=openai,
-        chat_provider=chat,
-        tts_provider=chat,
-        image_provider=chat,
-    )  # type: ignore
+    f = FakeFieldProcessor()
     p = NoteProcessor(field_processor=f, config=c)
 
     monkeypatch.setattr(
         src.dag,
         "get_fields",
-        lambda _: note.fields(),  # type: ignore
+        lambda _: note.fields(),
     )
 
-    # Replace config and app_state with mocks - cleaner than patching individual functions
-    mock_app_state = MockAppState()
-    monkeypatch.setattr(src.app_state, "config", c)
-    monkeypatch.setattr(src.app_state, "app_state", mock_app_state)
-
+    monkeypatch.setattr(src.config, "config", c)
     monkeypatch.setattr(src.prompts, "config", c)
     monkeypatch.setattr(
         src.prompts,
@@ -377,6 +378,24 @@ Example: ("basic", {"f1": "1", "f2": ""}, {"f2": "{{f1}}"}, {"f2": "p_1"}, {})
                 "f3": {"manual": True},
             },
         ),
+        (
+            "manual dependency with value keeps chain alive",
+            {"f1": "1", "f2": "existing", "f3": ""},
+            {"f2": "{{f1}}", "f3": "{{f2}}"},
+            {"f2": "existing", "f3": p("existing")},
+            {
+                "f2": {"manual": True},
+            },
+        ),
+        (
+            "manual dependency without value still stops chain",
+            {"f1": "1", "f2": "", "f3": ""},
+            {"f2": "{{f1}}", "f3": "{{f2}}"},
+            {"f2": "", "f3": ""},
+            {
+                "f2": {"manual": True},
+            },
+        ),
         # B)case
         # Self is target, should generate self + any manual BEFORE self
         # f1 -> f2 -> f3 -> f4 -> f5 -> f6
@@ -538,5 +557,7 @@ async def test_returns_if_updated(note, prompts_map, expected, monkeypatch):
         allow_empty_fields=False,
     )
 
-    res = await p._process_note(n, deck_id=1, overwrite_fields=False, target_field=None)  # type: ignore
-    assert res == expected
+    did_update, _ = await p._process_note(  # type: ignore
+        n, deck_id=1, overwrite_fields=False, target_field=None
+    )
+    assert did_update == expected
