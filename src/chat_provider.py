@@ -41,11 +41,11 @@ from .models import (
     openai_reasoning_efforts_for_model,
 )
 from .rate_limiter import (
+    ProviderUnavailableError,
     estimate_tokens,
     extract_rate_limit_headers,
     get_rate_limiter,
     parse_retry_after,
-    ProviderUnavailableError,
 )
 
 OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
@@ -184,10 +184,12 @@ class ChatProvider:
             raise Exception("OpenAI API key not found. Please set it in the settings.")
 
         # Check reasoning
+        # New reasoning model gpt-5.4 behaves like gpt-5.2
         is_reasoning = model.lower().startswith("o") or model in (
             "gpt-5",
             "gpt-5.1",
             "gpt-5.2",
+            "gpt-5.4",
         )
 
         logger.debug(
@@ -474,14 +476,16 @@ class ChatProvider:
 
                 if response.status == 429:
                     logger.debug(f"Got a 429 from {provider}")
-                    
+
                     error_text = await response.text()
                     is_daily_limit = self._is_daily_quota_error(error_text)
 
                     # Parse Retry-After header
                     retry_after = parse_retry_after(response.headers)
-                    await limiter.report_failure(response_headers, retry_after, is_daily_limit=is_daily_limit)
-                    
+                    await limiter.report_failure(
+                        response_headers, retry_after, is_daily_limit=is_daily_limit
+                    )
+
                     if is_daily_limit:
                         # Fail fast if daily quota exhausted
                         raise ProviderUnavailableError(
@@ -624,8 +628,8 @@ class ChatProvider:
         """Check if error indicates daily quota exhaustion."""
         text = error_text.lower()
         return (
-            "quota" in text 
-            or "daily limit" in text 
+            "quota" in text
+            or "daily limit" in text
             or "insufficient_quota" in text
             or "RESOURCE_EXHAUSTED" in text  # Google style
         )

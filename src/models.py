@@ -28,7 +28,8 @@ ChatProviders = Literal["openai", "anthropic", "deepseek", "google"]
 
 OpenAIModels = Literal[
     "gpt-5.2",
-    "gpt-5.2-chat-latest",
+    "gpt-5.4",
+    "gpt-5.3-chat-latest",
     "gpt-5",
     "gpt-5-mini",
     "gpt-5-nano",
@@ -48,9 +49,10 @@ openai_chat_models: list[ChatModels] = [
     "gpt-5-nano",
     "gpt-4o-mini",
     "gpt-5-mini",
-    "gpt-5.2-chat-latest",
+    "gpt-5.3-chat-latest",
     "gpt-5",
     "gpt-5.2",
+    "gpt-5.4",
 ]
 
 anthropic_chat_models: list[ChatModels] = [
@@ -75,8 +77,9 @@ provider_model_map: dict[ChatProviders, list[ChatModels]] = {
 
 
 legacy_openai_chat_models: list[str] = [
-    "gpt-5.2-chat-latest",
+    "gpt-5.3-chat-latest",
     "gpt-5.2",
+    "gpt-5.4",
     "gpt-5",
     "gpt-5-nano",
     "gpt-5-mini",
@@ -108,6 +111,7 @@ OPENAI_REASONING_EFFORTS_BY_MODEL: dict[str, tuple[OpenAIReasoningEffort, ...]] 
     "gpt-5": ("minimal", "low", "medium", "high"),
     "gpt-5.1": ("none", "low", "medium", "high"),
     "gpt-5.2": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.4": ("none", "low", "medium", "high", "xhigh"),
 }
 
 

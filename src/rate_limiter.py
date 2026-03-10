@@ -199,6 +199,15 @@ DEFAULT_RATE_LIMITS: dict[str, ModelRateLimitConfig] = {
         rpd=100000,
         rpd_max=10000000,
     ),
+    # gpt-5.4 shares the same tier and limits as 5.2
+    "openai:gpt-5.4": ModelRateLimitConfig(
+        rpm=1000,
+        rpm_max=15000,
+        tpm=1000000,
+        tpm_max=40000000,
+        rpd=100000,
+        rpd_max=10000000,
+    ),
     "openai:gpt-5.1": ModelRateLimitConfig(
         rpm=1000,
         rpm_max=15000,
@@ -350,6 +359,7 @@ class MultiDimensionalRateLimiter:
             CIRCUIT_BREAKER_THRESHOLD,
             CIRCUIT_BREAKER_WINDOW_SECONDS,
         )
+
         self._cb_threshold = CIRCUIT_BREAKER_THRESHOLD
         self._cb_window = CIRCUIT_BREAKER_WINDOW_SECONDS
         self._cb_cooldown = CIRCUIT_BREAKER_COOLDOWN_SECONDS
@@ -369,7 +379,9 @@ class MultiDimensionalRateLimiter:
             self._circuit_open_until = None
             self._consecutive_429s = 0
             self._first_429_time = None
-            logger.info(f"RateLimiter [{self._key}]: Circuit breaker reset after cooldown")
+            logger.info(
+                f"RateLimiter [{self._key}]: Circuit breaker reset after cooldown"
+            )
             return False
         return True
 
@@ -381,7 +393,10 @@ class MultiDimensionalRateLimiter:
         now = time.time()
 
         # Reset counter if outside the window
-        if self._first_429_time is not None and (now - self._first_429_time) > self._cb_window:
+        if (
+            self._first_429_time is not None
+            and (now - self._first_429_time) > self._cb_window
+        ):
             self._consecutive_429s = 0
             self._first_429_time = None
 
@@ -412,7 +427,7 @@ class MultiDimensionalRateLimiter:
         """
         Wait until it's safe to make a request.
         Pass estimated_tokens for TPM tracking (will be corrected later via report_success).
-        
+
         Raises:
             ProviderUnavailableError: If the circuit breaker is open.
         """
@@ -422,7 +437,7 @@ class MultiDimensionalRateLimiter:
                 f"Provider {self._key} is temporarily unavailable "
                 f"(circuit breaker open, resets at {self._circuit_open_until:.0f})"
             )
-        
+
         # Ensure scheduler is running
         if self._scheduler_task is None or self._scheduler_task.done():
             self._scheduler_task = asyncio.create_task(self._scheduler())
@@ -582,7 +597,7 @@ class MultiDimensionalRateLimiter:
             # Save state
             if self._manager:
                 self._manager.save_state()
-            
+
             # Reset circuit breaker counter on successful request
             self._reset_429_counter()
 
@@ -626,7 +641,7 @@ class MultiDimensionalRateLimiter:
 
             # Record 429 in circuit breaker - may trip the circuit
             circuit_tripped = self._record_429()
-            
+
             # If daily limit detected, trip circuit immediately
             if is_daily_limit and not circuit_tripped:
                 self._circuit_open_until = time.time() + self._cb_cooldown

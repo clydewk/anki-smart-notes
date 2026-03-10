@@ -1,4 +1,7 @@
 
+# v2.14.1
+- Add support for new reasoning model **gpt-5.4**; behaves like gpt-5.2 in temperature/effort UI and rate limits.
+
 # v2.14.0
 - Unify credits: text, TTS, and image generation now all draw from the same credits pool. This should result in increased credit limits across all plans, potentially substantially, depending on your use case. 
 
