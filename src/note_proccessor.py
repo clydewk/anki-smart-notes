@@ -24,7 +24,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Optional
 
-import aiohttp
 from anki.cards import Card, CardId
 from anki.decks import DeckId
 from anki.notes import Note, NoteId
@@ -39,23 +38,47 @@ from .logger import logger
 from .nodes import FieldNode
 from .notes import get_note_type
 from .prompts import get_prompts_for_note
-from .rate_limiter import RateLimitManager
+from .provider_runtime import ProviderHTTPError, provider_runtime
 from .sentry import run_async_in_background_with_sentry
 from .ui.ui_utils import show_message_box
 from .utils import run_on_main
 
 
+@dataclass(frozen=True)
+class FieldFailureDetail:
+    field: str
+    error: str
+    aborted_dependents: tuple[str, ...] = ()
+
+    def summary(self) -> str:
+        if not self.aborted_dependents:
+            return f"{self.field}: {self.error}"
+
+        blocked = ", ".join(self.aborted_dependents)
+        return f"{self.field}: {self.error}. Blocked downstream: {blocked}"
+
+
+@dataclass(frozen=True)
+class NoteProcessingResult:
+    did_update: bool
+    updated_fields: list[str]
+    field_failures: list[FieldFailureDetail]
+
+
 @dataclass
 class BatchStatistics:
     processed: list[Note]
+    partial: list[Note]
     failed: list[Note]
-    skipped: list[Note]
+    blocked: list[Note]
+    no_updates: list[Note]
     updated_fields: set[str]
     error_details: dict[int, str]
+    field_error_details: dict[int, list[FieldFailureDetail]]
     start_time: float
     end_time: float
     db_writes: int
-    rate_limits: dict[str, dict[str, float]]
+    transport_metrics: dict[str, dict[str, float]]
     logs: list[str]
     was_cancelled: bool = False
 
@@ -71,6 +94,12 @@ class ListHandler(logging.Handler):
             self.logs.append(msg)
         except Exception:
             self.handleError(record)
+
+
+def describe_exception(error: BaseException) -> str:
+    message = str(error).strip()
+    error_type = type(error).__name__
+    return f"{error_type}: {message}" if message else error_type
 
 
 class ProgressDialog(QDialog):
@@ -140,9 +169,6 @@ class NoteProcessor:
 
         logger.debug("Processing notes...")
 
-        # Relax global concurrency limit to allow specialized limiters (per-provider) to control flow.
-        # We set it to STANDARD_BATCH_LIMIT to prevent OOM/file descriptor exhaustion, but the actual rate limiting
-        # happens inside the providers.
         initial_limit = STANDARD_BATCH_LIMIT
         logger.debug(f"Global concurrency limit: {initial_limit}")
 
@@ -264,17 +290,16 @@ class NoteProcessor:
         async def op():
             start_time = time.time()
 
-            # Worker Pool with relaxed global limit
-            # We set a high fixed concurrency limit (safeguard) and rely on
-            # provider-specific RPM limiters for actual flow control.
-
             concurrency_limit = STANDARD_BATCH_LIMIT
 
-            total_updated = []
+            total_processed = []
+            total_partial = []
             total_failed = []
-            total_skipped = []
+            total_blocked = []
+            total_no_updates = []
             all_updated_fields: set[str] = set()
             error_details: dict[int, str] = {}
+            field_error_details: dict[int, list[FieldFailureDetail]] = {}
 
             update_buffer: list[Note] = []
             processed_count = 0
@@ -285,9 +310,16 @@ class NoteProcessor:
 
             async def worker(
                 nid: NoteId,
-            ) -> tuple[Optional[Note], bool | Exception, list[str]]:
+            ) -> tuple[Optional[Note], NoteProcessingResult | Exception]:
                 if cancellation_state["cancelled"]:
-                    return (None, False, [])
+                    return (
+                        None,
+                        NoteProcessingResult(
+                            did_update=False,
+                            updated_fields=[],
+                            field_failures=[],
+                        ),
+                    )
 
                 try:
                     # Note: Accessing mw.col in background thread.
@@ -299,22 +331,29 @@ class NoteProcessor:
                     note_type = get_note_type(note)
                     prompts = get_prompts_for_note(note_type, did_map[nid])
                     if not prompts:
-                        return (note, False, [])  # Treated as skipped
+                        return (
+                            note,
+                            NoteProcessingResult(
+                                did_update=False,
+                                updated_fields=[],
+                                field_failures=[],
+                            ),
+                        )
 
-                    # Process
-                    # This will internally hit provider-specific rate limiters and block if needed
-                    did_update, updated_fields = await self._process_note(
-                        note, deck_id=did_map[nid], overwrite_fields=overwrite_fields
+                    result = await self._process_note(
+                        note,
+                        deck_id=did_map[nid],
+                        overwrite_fields=overwrite_fields,
                     )
-                    return (note, did_update, updated_fields)
+                    return (note, result)
 
                 except Exception as e:
                     # Try to retrieve note just for reporting purposes
                     try:
                         n = mw.col.get_note(nid)
-                        return (n, e, [])
+                        return (n, e)
                     except Exception:
-                        return (None, e, [])
+                        return (None, e)
 
             while to_process_ids or active_tasks:
                 # If cancelled, force-cancel all active tasks instead of waiting
@@ -362,34 +401,45 @@ class NoteProcessor:
                 for task in done:
                     processed_count += 1
                     try:
-                        note_obj, status, u_fields = await task
+                        note_obj, status = await task
                     except asyncio.CancelledError:
                         # Task was cancelled - don't count as error
                         logger.debug("Task was cancelled")
                         continue
                     except Exception as e:
                         # Should be caught inside worker, but just in case
-                        note_obj, status, u_fields = (None, e, [])
+                        note_obj, status = (None, e)
 
                     if isinstance(status, Exception):
                         if note_obj:
                             total_failed.append(note_obj)
-                            error_details[note_obj.id] = str(status)
+                            error_details[note_obj.id] = describe_exception(status)
                             logger.error(
-                                f"Error processing note {note_obj.id}: {status}"
+                                f"Error processing note {note_obj.id}: {describe_exception(status)}"
                             )
                         else:
-                            logger.error(f"Error processing note: {status}")
+                            logger.error(
+                                f"Error processing note: {describe_exception(status)}"
+                            )
 
                     else:
-                        # Success
-                        if status is True:
-                            # Note updated
-                            total_updated.append(note_obj)
+                        if note_obj is None:
+                            continue
+
+                        if status.field_failures:
+                            field_error_details[note_obj.id] = status.field_failures
+
+                        if status.did_update:
                             update_buffer.append(note_obj)
-                            all_updated_fields.update(u_fields)
-                        elif status is False:
-                            total_skipped.append(note_obj)
+                            all_updated_fields.update(status.updated_fields)
+                            if status.field_failures:
+                                total_partial.append(note_obj)
+                            else:
+                                total_processed.append(note_obj)
+                        elif status.field_failures:
+                            total_blocked.append(note_obj)
+                        else:
+                            total_no_updates.append(note_obj)
 
                     # Flush buffer periodically (DB write)
                     batch_to_update = []
@@ -422,21 +472,24 @@ class NoteProcessor:
                 run_on_main(lambda u=[], p=processed_count: on_update(u, p, True))
 
             end_time = time.time()
-            rate_limits = RateLimitManager.get_instance().get_all_limits_summary()
+            transport_metrics = provider_runtime.get_metrics_summary()
 
             # Retrieve logs from the handler
             logs = list(log_handler.logs)
 
             return BatchStatistics(
-                processed=total_updated,
+                processed=total_processed,
+                partial=total_partial,
                 failed=total_failed,
-                skipped=total_skipped,
+                blocked=total_blocked,
+                no_updates=total_no_updates,
                 updated_fields=all_updated_fields,
                 error_details=error_details,
+                field_error_details=field_error_details,
                 start_time=start_time,
                 end_time=end_time,
                 db_writes=db_writes,
-                rate_limits=rate_limits,
+                transport_metrics=transport_metrics,
                 logs=logs,
                 was_cancelled=cancellation_state["cancelled"],
             )
@@ -497,7 +550,7 @@ class NoteProcessor:
                 on_field_update=on_field_update,
                 show_progress=show_progress,
             ),
-            wrapped_on_success,
+            lambda result: wrapped_on_success(result.did_update),
             wrapped_failure,
         )
 
@@ -513,15 +566,19 @@ class NoteProcessor:
         target_field: Optional[str] = None,
         on_field_update: Optional[Callable[[], None]] = None,
         show_progress: bool = False,
-    ) -> tuple[bool, list[str]]:
-        """Process a single note, returns (updated_status, updated_fields). Optionally can target specific fields. Caller responsible for handling any exceptions."""
+    ) -> NoteProcessingResult:
+        """Process a single note and return updated fields plus any field-level failures."""
 
         note_type = get_note_type(note)
         prompts_for_note = get_prompts_for_note(note_type, deck_id)
 
         if not prompts_for_note:
             logger.debug("no prompts found for note type")
-            return (False, [])
+            return NoteProcessingResult(
+                did_update=False,
+                updated_fields=[],
+                field_failures=[],
+            )
 
         # Topsort + parallel process the DAG
         dag = generate_fields_dag(
@@ -533,6 +590,7 @@ class NoteProcessor:
 
         did_update = False
         updated_fields: list[str] = []
+        field_failures: list[FieldFailureDetail] = []
 
         will_show_progress = show_progress and len(dag)
         if will_show_progress:
@@ -570,8 +628,16 @@ class NoteProcessor:
 
                     # Handle field-level exceptions gracefully
                     if isinstance(response, Exception):
+                        failure_detail = FieldFailureDetail(
+                            field=field,
+                            error=describe_exception(response),
+                            aborted_dependents=tuple(
+                                sorted(out_node.field for out_node in node.out_nodes)
+                            ),
+                        )
+                        field_failures.append(failure_detail)
                         logger.warning(
-                            f"Field '{field}' failed: {response}. Continuing with other fields."
+                            f"Field '{field}' failed: {failure_detail.summary()}. Continuing with other fields."
                         )
                         # Mark node as aborted so downstream fields are skipped
                         node.abort = True
@@ -613,13 +679,17 @@ class NoteProcessor:
             if will_show_progress:
                 run_on_main(lambda: mw.progress.finish())  # type: ignore
 
-        return (did_update, updated_fields)
+        return NoteProcessingResult(
+            did_update=did_update,
+            updated_fields=updated_fields,
+            field_failures=field_failures,
+        )
 
     def _handle_failure(self, e: Exception) -> None:
         logger.debug("Handling failure")
 
         # Simplified error handling for BYOK
-        if isinstance(e, aiohttp.ClientResponseError):
+        if isinstance(e, ProviderHTTPError):
             status = e.status
             logger.debug(f"Got status: {status}")
 
@@ -656,30 +726,42 @@ class NoteProcessor:
     async def _process_node(
         self, node: FieldNode, note: Note, show_error_message_box: bool
     ) -> Optional[str]:
-        if node.abort:
-            # logger.debug(f"Skipping field {node.field}")
-            return None
+        started_at = time.perf_counter()
+        status = "completed"
 
-        # logger.debug(f"Processing field {node.field}")
+        try:
+            if node.abort:
+                return None
 
-        value = note[node.field_upper]
+            value = note[node.field_upper]
 
-        # Let downstream generated fields depend on existing manual values.
-        if node.manual and not (node.is_target or node.generate_despite_manual):
-            if value:
+            if node.manual and not (node.is_target or node.generate_despite_manual):
+                if value:
+                    return value
+                node.abort = True
+                logger.debug(f"Skipping field {node.field}")
+                return None
+
+            if value and not (node.is_target or node.overwrite):
                 return value
-            node.abort = True
-            logger.debug(f"Skipping field {node.field}")
-            return None
 
-        # Skip it if there's a value and we don't want to overwrite
-        if value and not (node.is_target or node.overwrite):
-            return value
+            new_value = await self.field_processor.resolve(
+                node, note, show_error_message_box
+            )
+            if new_value:
+                node.did_update = True
 
-        new_value = await self.field_processor.resolve(
-            node, note, show_error_message_box
-        )
-        if new_value:
-            node.did_update = True
-
-        return new_value
+            return new_value
+        except Exception:
+            status = "failed"
+            raise
+        finally:
+            duration = time.perf_counter() - started_at
+            if duration >= 1.0 or status == "failed":
+                logger.debug(
+                    "Field %s (%s) %s in %.1fs",
+                    node.field,
+                    node.field_type,
+                    status,
+                    duration,
+                )

@@ -33,8 +33,7 @@ sys.modules["anki"] = MagicMock()
 sys.modules["anki.cards"] = MagicMock()
 sys.modules["anki.decks"] = MagicMock()
 sys.modules["anki.notes"] = MagicMock()
-sys.modules["aiohttp"] = MagicMock()
-
+sys.modules["anki.utils"] = MagicMock(strip_html=lambda text: text)
 os.environ["IS_TEST"] = "True"
 
 

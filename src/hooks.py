@@ -177,11 +177,14 @@ def make_on_batch_success(
     browser: browser.Browser,  # type: ignore
 ) -> Callable[[BatchStatistics], None]:
     def wrapped_on_batch_success(stats: BatchStatistics):
-        updated = stats.processed
+        processed = stats.processed
+        partial = stats.partial
         errors = stats.failed
-        skipped = stats.skipped
+        blocked = stats.blocked
+        no_updates = stats.no_updates
         updated_fields = stats.updated_fields
         error_details = stats.error_details
+        field_error_details = stats.field_error_details
 
         browser.on_all_or_selected_rows_changed()
 
@@ -190,10 +193,14 @@ def make_on_batch_success(
 
         debug_info = ""
         was_cancelled = stats.was_cancelled
+        updated_count = len(processed) + len(partial)
+        completed_count = (
+            len(processed) + len(partial) + len(errors) + len(blocked) + len(no_updates)
+        )
 
         if config.debug:
             duration = stats.end_time - stats.start_time
-            notes_per_sec = len(updated) / duration if duration > 0 else 0
+            notes_per_sec = completed_count / duration if duration > 0 else 0
 
             debug_parts = []
             debug_parts.append("--- Batch Processing Report ---")
@@ -202,25 +209,29 @@ def make_on_batch_success(
             debug_parts.append(f"Time Taken: {duration:.2f}s")
             debug_parts.append(f"Processing Speed: {notes_per_sec:.2f} notes/sec")
             debug_parts.append(f"Database Writes: {stats.db_writes}")
-            debug_parts.append(f"Processed: {len(updated)}")
+            debug_parts.append(f"Updated: {updated_count}")
+            debug_parts.append(f"Processed Cleanly: {len(processed)}")
+            debug_parts.append(f"Processed With Field Failures: {len(partial)}")
             debug_parts.append(f"Failed: {len(errors)}")
-            debug_parts.append(f"Skipped: {len(skipped)}")
+            debug_parts.append(f"Blocked By Field Failures: {len(blocked)}")
+            debug_parts.append(f"No Updates: {len(no_updates)}")
 
             if updated_fields:
                 field_list = ", ".join(sorted(updated_fields))
-                debug_parts.append(f"Fields processed: {field_list}")
+                debug_parts.append(f"Fields updated: {field_list}")
 
-            if stats.rate_limits:
-                debug_parts.append("\n--- Rate Limits ---")
-                for provider, limits in stats.rate_limits.items():
-                    rpm = limits.get("rpm", 0)
-                    rpm_used = limits.get("rpm_used", 0)
-                    tpm = limits.get("tpm", 0)
-                    rpd = limits.get("rpd", 0)
-                    rpd_used = limits.get("rpd_used", 0)
+            if stats.transport_metrics:
+                debug_parts.append("\n--- Transport Metrics ---")
+                for provider, metrics in stats.transport_metrics.items():
+                    window = metrics.get("window", 0)
+                    inflight = metrics.get("inflight", 0)
+                    retries = metrics.get("retries", 0)
+                    throttles = metrics.get("throttles", 0)
+                    timeouts = metrics.get("timeouts", 0)
                     debug_parts.append(
-                        f"{provider}: RPM={rpm:.0f} (used:{rpm_used:.0f}), "
-                        f"TPM={tpm:.0f}, RPD={rpd:.0f} (used:{rpd_used:.0f})"
+                        f"{provider}: window={window:.0f}, inflight={inflight:.0f}, "
+                        f"retries={retries:.0f}, throttles={throttles:.0f}, "
+                        f"timeouts={timeouts:.0f}"
                     )
 
             if errors:
@@ -229,36 +240,51 @@ def make_on_batch_success(
                     msg = error_details.get(note.id, "Unknown error")
                     debug_parts.append(f"Note ID {note.id} failed: {msg}")
 
+            if field_error_details:
+                debug_parts.append("\n--- Field Failures ---")
+                for note_id in sorted(field_error_details):
+                    debug_parts.append(f"Note ID {note_id}:")
+                    for detail in field_error_details[note_id]:
+                        debug_parts.append(f"  - {detail.summary()}")
+
             if stats.logs:
                 debug_parts.append("\n--- Execution Logs ---")
                 debug_parts.extend(stats.logs)
 
             debug_info = "\n".join(debug_parts)
 
-        if not len(updated) and len(errors):
+        if not updated_count and not len(no_updates) and (len(errors) or len(blocked)):
             show_message_box(
-                "All notes failed. Check your API keys and configuration.",
+                "No notes were updated. Check the field failure details in Debug Info.",
                 copy_button_text="Copy Debug Info" if debug_info else None,
                 copy_button_content=debug_info if debug_info else None,
             )
         else:
             parts = []
-            if len(updated):
+            if len(processed):
+                parts.append(f"Updated {pluralize('note', len(processed))}")
+
+            if len(partial):
                 parts.append(
-                    f"Processed {pluralize('note', len(updated))} successfully"
+                    f"{pluralize('note', len(partial))} updated with field failures"
                 )
 
             if len(errors):
                 parts.append(f"{pluralize('note', len(errors))} failed")
 
-            if len(skipped):
-                parts.append(f"{pluralize('note', len(skipped))} skipped")
+            if len(blocked):
+                parts.append(
+                    f"{pluralize('note', len(blocked))} blocked by field failures"
+                )
+
+            if len(no_updates):
+                parts.append(f"{pluralize('note', len(no_updates))} had no updates")
 
             if was_cancelled:
                 parts.append("Batch processing cancelled")
 
             show_message_box(
-                ". ".join(parts) + ".",
+                (". ".join(parts) + ".") if parts else "No notes were processed.",
                 copy_button_text="Copy Debug Info" if debug_info else None,
                 copy_button_content=debug_info if debug_info else None,
             )

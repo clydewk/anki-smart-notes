@@ -17,622 +17,1128 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import asyncio
-import time
-from typing import Optional
+from __future__ import annotations
 
-import aiohttp
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from .config import config
-from .constants import (
-    CHAT_CLIENT_TIMEOUT_SEC,
-    DEFAULT_TEMPERATURE,
-    MAX_RETRIES,
-    MAX_RETRY_WAIT_SECONDS,
-    REASONING_CLIENT_TIMEOUT_SEC,
-    RETRY_BASE_SECONDS,
-)
+from .constants import DEFAULT_TEMPERATURE
 from .logger import logger
 from .models import (
     ChatModels,
     ChatProviders,
     CustomProvider,
     OpenAIReasoningEffort,
+    openai_chat_models,
     openai_reasoning_efforts_for_model,
+    provider_model_map,
 )
-from .rate_limiter import (
-    ProviderUnavailableError,
-    estimate_tokens,
-    extract_rate_limit_headers,
-    get_rate_limiter,
-    parse_retry_after,
+from .provider_runtime import (
+    ProviderHTTPError,
+    ProviderTimeoutError,
+    RequestTimeouts,
+    ResponseFormatError,
+    StreamingNotSupportedError,
+    provider_runtime,
 )
 
-OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+OPENAI_BASE_URL = "https://api.openai.com"
 ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
 DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
 GOOGLE_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
+TextEventType = Literal[
+    "response_started",
+    "text_delta",
+    "tool_call",
+    "usage_reported",
+    "response_completed",
+]
+ResolvedApiMode = Literal["responses", "chat_completions"]
+
+
+@dataclass(frozen=True)
+class TextGenerationRequest:
+    prompt: str
+    model: str
+    provider: str
+    temperature: float
+    reasoning_effort: OpenAIReasoningEffort | None
+    prompt_cache_key: str | None = None
+
+
+@dataclass(frozen=True)
+class TextGenerationEvent:
+    type: TextEventType
+    text: str = ""
+    response_id: str | None = None
+    usage: dict[str, Any] | None = None
+    tool_name: str | None = None
+    tool_arguments: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class TextGenerationResult:
+    text: str
+    response_id: str | None
+    usage: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class CustomProviderVerification:
+    models: list[str]
+    chat_api_mode: ResolvedApiMode
+
+
+def normalize_api_base_url(base_url: str) -> str:
+    clean = base_url.rstrip("/")
+    suffixes = (
+        "/v1/responses",
+        "/responses",
+        "/v1/chat/completions",
+        "/chat/completions",
+        "/v1/models",
+        "/models",
+        "/v1/audio/speech",
+        "/v1/images/generations",
+    )
+
+    for suffix in suffixes:
+        if clean.endswith(suffix):
+            clean = clean[: -len(suffix)]
+            break
+
+    return clean.rstrip("/")
+
+
+def build_v1_base_url(base_url: str) -> str:
+    normalized = normalize_api_base_url(base_url)
+    if normalized.endswith("/v1"):
+        return normalized
+    return f"{normalized}/v1"
+
+
+def build_v1_endpoint(base_url: str, path: str) -> str:
+    return f"{build_v1_base_url(base_url)}{path}"
+
+
+def text_initial_window(provider: str) -> int:
+    lower_provider = provider.lower()
+    if lower_provider in {"anthropic", "deepseek", "google"}:
+        return 2
+    return 4
+
+
+def is_reasoning_model(model: str) -> bool:
+    lowered = model.lower()
+    return lowered.startswith(("o", "gpt-5"))
+
+
+def responses_timeouts(
+    reasoning_effort: OpenAIReasoningEffort | None,
+) -> RequestTimeouts:
+    first_event_timeout = 90.0 if reasoning_effort in {"high", "xhigh"} else 45.0
+    return RequestTimeouts(
+        connect_timeout_sec=10.0,
+        sock_read_timeout_sec=None,
+        first_event_timeout_sec=first_event_timeout,
+        stream_idle_timeout_sec=first_event_timeout,
+    )
+
+
+def json_timeouts(sock_read_timeout_sec: float = 30.0) -> RequestTimeouts:
+    return RequestTimeouts(
+        connect_timeout_sec=10.0, sock_read_timeout_sec=sock_read_timeout_sec
+    )
+
+
+def looks_like_reasoning_schema_error(body: str) -> bool:
+    text = body.lower()
+    return "reasoning" in text and (
+        "unknown" in text or "invalid" in text or "unsupported" in text
+    )
+
+
+def looks_like_unsupported_api(error: ProviderHTTPError) -> bool:
+    if error.status in {404, 405, 415}:
+        return True
+
+    if error.status not in {400, 422}:
+        return False
+
+    text = error.body.lower()
+    return (
+        "responses" in text
+        or "chat/completions" in text
+        or "unknown field" in text
+        or "unexpected field" in text
+        or "unsupported" in text
+        or "schema" in text
+    )
+
+
+def prompt_cache_key_for_request(model: str, prompt: str) -> str:
+    prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()
+    return f"smart-notes:{model}:{prompt_hash}"
+
+
+def choose_reasoning_effort(
+    model: str, reasoning_effort: OpenAIReasoningEffort | None
+) -> OpenAIReasoningEffort | None:
+    if not is_reasoning_model(model):
+        return None
+
+    efforts = openai_reasoning_efforts_for_model(model)
+    if reasoning_effort in efforts:
+        return reasoning_effort
+    if "none" in efforts:
+        return "none"
+    return efforts[0] if efforts else None
+
+
+def update_openai_chat_models(models: list[str]) -> None:
+    openai_chat_models.clear()
+    openai_chat_models.extend(cast("list[ChatModels]", models))
+    provider_model_map["openai"] = openai_chat_models
+
+
+def filter_openai_text_models(models: list[str]) -> list[str]:
+    blocked_fragments = (
+        "audio",
+        "tts",
+        "transcribe",
+        "embedding",
+        "moderation",
+        "realtime",
+        "image",
+        "dall-e",
+        "whisper",
+        "search-preview",
+    )
+
+    filtered = [
+        model
+        for model in models
+        if model.startswith(("gpt-", "o1", "o3", "o4"))
+        and not any(fragment in model for fragment in blocked_fragments)
+    ]
+
+    def sort_key(model: str) -> tuple[int, str]:
+        if model == "gpt-5-nano":
+            return (0, model)
+        if model == "gpt-4o-mini":
+            return (1, model)
+        if model == "gpt-5-mini":
+            return (2, model)
+        if model == "gpt-5.3-chat-latest":
+            return (3, model)
+        if model == "gpt-5-chat-latest":
+            return (4, model)
+        if model == "gpt-5":
+            return (5, model)
+        return (6, model)
+
+    return sorted(dict.fromkeys(filtered), key=sort_key)
+
 
 class ChatProvider:
+    def __init__(self) -> None:
+        self._openai_models_cache: list[str] = list(openai_chat_models)
+
     async def async_get_chat_response(
         self,
         prompt: str,
         model: ChatModels,
         provider: ChatProviders,
-        note_id: int,  # Kept for compatibility but unused
+        note_id: int,
         temperature: float = DEFAULT_TEMPERATURE,
-        reasoning_effort: Optional[OpenAIReasoningEffort] = None,
+        reasoning_effort: OpenAIReasoningEffort | None = None,
+        prompt_cache_key: str | None = None,
         retry_count: int = 0,
     ) -> str:
-        # Check custom providers
-        custom_provider = next(
-            (p for p in (config.custom_providers or []) if p["name"] == provider), None
-        )
-        if custom_provider:
-            return await self._get_openai_compatible_response(
-                prompt,
-                model,
-                temperature,
-                reasoning_effort,
-                retry_count,
-                custom_provider,
-            )
-
-        if provider == "openai":
-            return await self._get_openai_response(
-                prompt, model, temperature, reasoning_effort, retry_count
-            )
-        elif provider == "anthropic":
-            return await self._get_anthropic_response(
-                prompt, model, temperature, retry_count
-            )
-        elif provider == "deepseek":
-            return await self._get_deepseek_response(
-                prompt, model, temperature, retry_count
-            )
-        elif provider == "google":
-            return await self._get_google_response(
-                prompt, model, temperature, retry_count
-            )
-        else:
-            raise ValueError(f"Unknown provider: {provider}")
-
-    async def _get_openai_compatible_response(
-        self,
-        prompt: str,
-        model: str,
-        temperature: float,
-        reasoning_effort: Optional[OpenAIReasoningEffort],
-        retry_count: int,
-        provider_config: CustomProvider,
-    ) -> str:
-        api_key = provider_config["api_key"]
-        base_url = provider_config["base_url"].rstrip("/")
-
-        # Intelligent URL guessing
-        if not base_url.endswith("/chat/completions"):
-            # If it ends in /v1, just append chat/completions
-            if base_url.endswith("/v1"):
-                url = f"{base_url}/chat/completions"
-            else:
-                # Otherwise assume it's a base URL and append full path
-                url = f"{base_url}/v1/chat/completions"
-        else:
-            url = base_url
-
-        logger.debug(
-            f"Custom Provider {provider_config['name']}: hitting {url} model: {model} retries {retry_count}"
-        )
-
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature,
-        }
-
-        # Pass reasoning effort if set? Most compatible providers probably ignore it or use temperature.
-        if reasoning_effort and reasoning_effort != "none":
-            payload["reasoning_effort"] = reasoning_effort
-            # Some might error if both are sent, similar to OpenAI logic
-            if "temperature" in payload:
-                del payload["temperature"]
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        # Check for reasoning models to allow longer timeouts
-        timeout = CHAT_CLIENT_TIMEOUT_SEC
-        lower_model = model.lower()
-        if (
-            "o1-" in lower_model
-            or "o3-" in lower_model
-            or "gemini-3" in lower_model
-            or "reasoning" in lower_model
-            or "thinking" in lower_model
-        ):
-            timeout = REASONING_CLIENT_TIMEOUT_SEC
-            logger.debug(
-                f"Custom Provider: Detected reasoning model {model}, using extended timeout {timeout}s"
-            )
-
-        return await self._execute_request(
-            url=url,
-            headers=headers,
-            json_payload=payload,
-            timeout_sec=timeout,
-            retry_count=retry_count,
-            provider=provider_config["name"],
+        del note_id, retry_count
+        request = TextGenerationRequest(
             prompt=prompt,
-            model=model,
+            model=str(model),
+            provider=str(provider),
             temperature=temperature,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=choose_reasoning_effort(str(model), reasoning_effort),
+            prompt_cache_key=(prompt_cache_key if provider == "openai" else None),
+        )
+        result = await self.generate_text(request)
+        return result.text
+
+    async def generate_text(
+        self, request: TextGenerationRequest
+    ) -> TextGenerationResult:
+        text_parts: list[str] = []
+        response_id: str | None = None
+        usage: dict[str, Any] | None = None
+
+        async for event in self.async_iter_text_events(request):
+            if event.type == "text_delta":
+                text_parts.append(event.text)
+            elif event.type == "usage_reported":
+                usage = event.usage
+            elif event.type == "response_started":
+                response_id = event.response_id
+            elif event.type == "response_completed":
+                response_id = event.response_id or response_id
+                usage = event.usage or usage
+
+        return TextGenerationResult(
+            text="".join(text_parts),
+            response_id=response_id,
+            usage=usage,
         )
 
-    async def _get_openai_response(
-        self,
-        prompt: str,
-        model: ChatModels,
-        temperature: float,
-        reasoning_effort: Optional[OpenAIReasoningEffort],
-        retry_count: int,
-    ) -> str:
+    async def async_iter_text_events(
+        self, request: TextGenerationRequest
+    ) -> AsyncIterator[TextGenerationEvent]:
+        custom_provider = next(
+            (
+                p
+                for p in (config.custom_providers or [])
+                if p["name"] == request.provider
+            ),
+            None,
+        )
+
+        if custom_provider is not None:
+            async for event in self._iterate_custom_provider_events(
+                request, custom_provider
+            ):
+                yield event
+            return
+
+        if request.provider == "openai":
+            async for event in self._iterate_official_openai_events(request):
+                yield event
+            return
+
+        if request.provider == "anthropic":
+            async for event in self._iterate_anthropic_events(request):
+                yield event
+            return
+
+        if request.provider == "deepseek":
+            async for event in self._iterate_deepseek_events(request):
+                yield event
+            return
+
+        if request.provider == "google":
+            async for event in self._iterate_google_events(request):
+                yield event
+            return
+
+        raise ValueError(f"Unknown provider: {request.provider}")
+
+    async def verify_custom_provider(
+        self, provider_config: CustomProvider
+    ) -> CustomProviderVerification:
+        models = await self._fetch_custom_provider_models(provider_config)
+        configured_mode = provider_config.get("chat_api_mode", "auto")
+        chat_api_mode: ResolvedApiMode
+        if configured_mode == "chat_completions":
+            chat_api_mode = "chat_completions"
+        elif configured_mode == "responses":
+            chat_api_mode = "responses"
+        else:
+            probe_model = self._pick_probe_model(models)
+            chat_api_mode = await self._probe_custom_provider_api_mode(
+                provider_config, probe_model
+            )
+
+        return CustomProviderVerification(models=models, chat_api_mode=chat_api_mode)
+
+    async def fetch_openai_chat_models(self) -> list[str]:
+        api_key = config.openai_api_key
+        if not api_key:
+            return list(self._openai_models_cache)
+
+        base_url = config.openai_endpoint or OPENAI_BASE_URL
+        try:
+            payload = await provider_runtime.request_json(
+                key="models:openai",
+                initial_window=1,
+                method="GET",
+                url=build_v1_endpoint(base_url, "/models"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                provider="openai",
+                model="models",
+                timeouts=json_timeouts(sock_read_timeout_sec=10.0),
+                max_retries=1,
+            )
+            models = filter_openai_text_models(self._extract_model_ids(payload))
+        except Exception as exc:
+            logger.warning(f"Failed to auto-detect OpenAI models: {exc}")
+            return list(self._openai_models_cache)
+
+        if models:
+            self._openai_models_cache = models
+            update_openai_chat_models(models)
+        return list(self._openai_models_cache)
+
+    def get_cached_openai_chat_models(self) -> list[str]:
+        return list(self._openai_models_cache)
+
+    async def _iterate_official_openai_events(
+        self, request: TextGenerationRequest
+    ) -> AsyncIterator[TextGenerationEvent]:
         api_key = config.openai_api_key
         if not api_key:
             raise Exception("OpenAI API key not found. Please set it in the settings.")
 
-        # Check reasoning
-        # New reasoning model gpt-5.4 behaves like gpt-5.2
-        is_reasoning = model.lower().startswith("o") or model in (
-            "gpt-5",
-            "gpt-5.1",
-            "gpt-5.2",
-            "gpt-5.4",
+        base_url = config.openai_endpoint or OPENAI_BASE_URL
+        async for event in self._iterate_openai_compatible_responses_events(
+            request,
+            provider_name="openai",
+            base_url=base_url,
+            api_key=api_key,
+            use_stream=True,
+            include_prompt_cache_key=True,
+        ):
+            yield event
+
+    async def _iterate_openai_compatible_responses_events(
+        self,
+        request: TextGenerationRequest,
+        *,
+        provider_name: str,
+        base_url: str,
+        api_key: str,
+        use_stream: bool,
+        include_prompt_cache_key: bool = False,
+    ) -> AsyncIterator[TextGenerationEvent]:
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        url = build_v1_endpoint(base_url, "/responses")
+        payload = self._responses_payload(
+            request,
+            include_prompt_cache_key=include_prompt_cache_key,
         )
+        if use_stream:
+            payload["stream"] = True
 
-        logger.debug(
-            f"OpenAI: hitting {OPENAI_ENDPOINT} model: {model} retries {retry_count} for prompt: {prompt}"
-        )
+        if not use_stream:
+            response = await provider_runtime.request_json(
+                key=f"text:{provider_name}:{request.model}",
+                initial_window=text_initial_window(provider_name),
+                method="POST",
+                url=url,
+                headers=headers,
+                json_payload=payload,
+                provider=provider_name,
+                model=request.model,
+                timeouts=json_timeouts(),
+            )
+            if not isinstance(response, dict):
+                raise ResponseFormatError("Responses API returned an invalid payload.")
 
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-        }
+            response_id = self._response_id(response)
+            usage = self._extract_usage(response)
+            final_text = self._extract_openai_responses_text(response)
 
-        timeout_val = CHAT_CLIENT_TIMEOUT_SEC
-        if is_reasoning:
-            efforts = openai_reasoning_efforts_for_model(model)
+            yield TextGenerationEvent(type="response_started", response_id=response_id)
+            if final_text:
+                yield TextGenerationEvent(
+                    type="text_delta",
+                    text=final_text,
+                    response_id=response_id,
+                )
+            if usage:
+                yield TextGenerationEvent(
+                    type="usage_reported",
+                    usage=usage,
+                    response_id=response_id,
+                )
+            yield TextGenerationEvent(
+                type="response_completed",
+                response_id=response_id,
+                usage=usage,
+            )
+            return
 
-            # Use provided effort, or default if None/Invalid
-            current_effort = reasoning_effort
-            if (
-                not current_effort or current_effort not in efforts
-            ) and "none" in efforts:
-                # If "none" is valid, it effectively means "use temperature" in my config UI logic,
-                # but API-wise, O1 models *require* reasoning_effort or default?
-                # Actually O1 models DON'T support temperature usually.
-                # If user selected "none" in UI for an O1 model, what should happen?
-                # The UI initializes to valid effort.
-                # If passed effort is None, default to "medium" or first available.
-                current_effort = "medium" if "medium" in efforts else efforts[0]
+        started = False
+        accumulated_text = ""
+        last_response_id: str | None = None
+        last_usage: dict[str, Any] | None = None
 
-            if current_effort == "none":
-                # If explicit "none" passed (meaning turn off reasoning if possible?),
-                # but this block is `if is_reasoning`.
-                # For models that support BOTH (like gpt-5.2 in the list), if effort is "none", use temperature?
-                # My UI logic disables temperature if effort != "none".
-                # So if effort IS "none", we should use temperature.
-                pass
-
-            if current_effort and current_effort != "none":
-                payload["reasoning_effort"] = current_effort
-                # Reasoning models usually don't support temperature
-                # But check model specs. Assuming mutually exclusive here based on UI.
-            else:
-                payload["temperature"] = temperature
-
-            if current_effort in ("high", "xhigh"):
-                timeout_val = REASONING_CLIENT_TIMEOUT_SEC
-        else:
-            payload["temperature"] = temperature
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        return await self._execute_request(
-            url=config.openai_endpoint or OPENAI_ENDPOINT,
+        async for event in provider_runtime.stream_sse_json(
+            key=f"text:{provider_name}:{request.model}",
+            initial_window=text_initial_window(provider_name),
+            method="POST",
+            url=url,
             headers=headers,
             json_payload=payload,
-            timeout_sec=timeout_val,
-            retry_count=retry_count,
-            provider="openai",
-            prompt=prompt,
-            model=model,
-            temperature=temperature,
-            reasoning_effort=reasoning_effort,
+            provider=provider_name,
+            model=request.model,
+            timeouts=responses_timeouts(request.reasoning_effort),
+        ):
+            event_type = str(event.get("type", ""))
+
+            if event_type == "done":
+                continue
+
+            if not started:
+                response_data = event.get("response")
+                response_id = (
+                    response_data.get("id")
+                    if isinstance(response_data, dict)
+                    else event.get("response_id")
+                )
+                last_response_id = cast("str | None", response_id)
+                started = True
+                logger.debug(
+                    "Provider %s stream started via responses at %s",
+                    provider_name,
+                    url,
+                )
+                yield TextGenerationEvent(
+                    type="response_started",
+                    response_id=last_response_id,
+                )
+
+            if event_type == "response.output_text.delta":
+                delta = str(event.get("delta", ""))
+                if delta:
+                    accumulated_text += delta
+                    yield TextGenerationEvent(type="text_delta", text=delta)
+                continue
+
+            if event_type == "response.completed":
+                response_data = event.get("response", {})
+                if isinstance(response_data, dict):
+                    last_response_id = cast(
+                        "str | None", response_data.get("id", last_response_id)
+                    )
+                    usage = self._extract_usage(response_data)
+                    if usage:
+                        last_usage = usage
+                        yield TextGenerationEvent(
+                            type="usage_reported",
+                            usage=usage,
+                            response_id=last_response_id,
+                        )
+
+                    if not accumulated_text:
+                        final_text = self._extract_openai_responses_text(response_data)
+                        if final_text:
+                            accumulated_text = final_text
+                            yield TextGenerationEvent(
+                                type="text_delta",
+                                text=final_text,
+                                response_id=last_response_id,
+                            )
+
+                yield TextGenerationEvent(
+                    type="response_completed",
+                    response_id=last_response_id,
+                    usage=last_usage,
+                )
+                continue
+
+            if event_type in {"response.failed", "error", "response.incomplete"}:
+                raise Exception(self._describe_event_error(event))
+
+            if event_type == "response.output_item.done":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    arguments = item.get("arguments")
+                    parsed_arguments: dict[str, Any] | None = None
+                    if isinstance(arguments, dict):
+                        parsed_arguments = arguments
+                    yield TextGenerationEvent(
+                        type="tool_call",
+                        tool_name=cast("str | None", item.get("name")),
+                        tool_arguments=parsed_arguments,
+                    )
+
+    async def _iterate_custom_provider_events(
+        self,
+        request: TextGenerationRequest,
+        provider_config: CustomProvider,
+    ) -> AsyncIterator[TextGenerationEvent]:
+        api_mode = self._resolve_custom_provider_api_mode(provider_config)
+        use_stream = self._custom_provider_streaming_enabled(provider_config)
+        provider_name = provider_config["name"]
+        base_url = normalize_api_base_url(provider_config["base_url"])
+        api_key = provider_config["api_key"]
+
+        logger.debug(
+            "Custom provider %s using %s at %s (streaming=%s, model=%s)",
+            provider_name,
+            api_mode,
+            base_url,
+            use_stream,
+            request.model,
         )
 
-    async def _get_anthropic_response(
+        reasoning_candidates = self._reasoning_candidates(request.reasoning_effort)
+        for reasoning_effort in reasoning_candidates:
+            adjusted_request = TextGenerationRequest(
+                prompt=request.prompt,
+                model=request.model,
+                provider=provider_name,
+                temperature=request.temperature,
+                reasoning_effort=reasoning_effort,
+                prompt_cache_key=None,
+            )
+            try:
+                if api_mode == "responses":
+                    async for event in self._iterate_openai_compatible_responses_events(
+                        adjusted_request,
+                        provider_name=provider_name,
+                        base_url=base_url,
+                        api_key=api_key,
+                        use_stream=use_stream,
+                    ):
+                        yield event
+                else:
+                    async for event in self._iterate_openai_compatible_chat_events(
+                        request=adjusted_request,
+                        provider_name=provider_name,
+                        base_url=base_url,
+                        api_key=api_key,
+                        use_stream=use_stream,
+                    ):
+                        yield event
+                return
+            except ProviderTimeoutError as exc:
+                logger.warning(
+                    "Custom provider %s timed out via %s at %s: phase=%s last_event=%s",
+                    provider_name,
+                    api_mode,
+                    exc.url,
+                    exc.phase,
+                    exc.last_event_type,
+                )
+                raise
+            except ProviderHTTPError as exc:
+                if reasoning_effort is not None and looks_like_reasoning_schema_error(
+                    exc.body
+                ):
+                    logger.info(
+                        "Custom provider %s rejected reasoning_effort on %s; retrying without it.",
+                        provider_name,
+                        api_mode,
+                    )
+                    continue
+
+                if provider_config.get(
+                    "chat_api_mode", "responses"
+                ) == "auto" and looks_like_unsupported_api(exc):
+                    raise Exception(
+                        f"Custom provider {provider_name} still uses legacy Auto mode. Re-open the provider settings and choose Responses or Chat Completions explicitly."
+                    ) from exc
+
+                raise
+
+    async def _iterate_openai_compatible_chat_events(
         self,
-        prompt: str,
-        model: ChatModels,
-        temperature: float,
-        retry_count: int,
-    ) -> str:
+        *,
+        request: TextGenerationRequest,
+        provider_name: str,
+        base_url: str,
+        api_key: str,
+        use_stream: bool,
+    ) -> AsyncIterator[TextGenerationEvent]:
+        url = build_v1_endpoint(base_url, "/chat/completions")
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload: dict[str, Any] = {
+            "model": request.model,
+            "messages": [{"role": "user", "content": request.prompt}],
+        }
+
+        if request.reasoning_effort and request.reasoning_effort != "none":
+            payload["reasoning_effort"] = request.reasoning_effort
+        else:
+            payload["temperature"] = request.temperature
+
+        if use_stream:
+            payload["stream"] = True
+            logger.debug(
+                "Provider %s stream started via chat_completions at %s",
+                provider_name,
+                url,
+            )
+            async for event in provider_runtime.stream_sse_json(
+                key=f"text:{provider_name}:{request.model}",
+                initial_window=text_initial_window(provider_name),
+                method="POST",
+                url=url,
+                headers=headers,
+                json_payload=payload,
+                provider=provider_name,
+                model=request.model,
+                timeouts=responses_timeouts(request.reasoning_effort),
+            ):
+                event_type = str(event.get("type", ""))
+                if event_type == "done":
+                    continue
+
+                if "choices" not in event:
+                    continue
+
+                choices = event.get("choices", [])
+                if not isinstance(choices, list) or not choices:
+                    continue
+
+                choice = choices[0]
+                if not isinstance(choice, dict):
+                    continue
+
+                delta = choice.get("delta", {})
+                if not isinstance(delta, dict):
+                    continue
+
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    yield TextGenerationEvent(type="text_delta", text=content)
+            yield TextGenerationEvent(type="response_completed")
+            return
+
+        response = await provider_runtime.request_json(
+            key=f"text:{provider_name}:{request.model}",
+            initial_window=text_initial_window(provider_name),
+            method="POST",
+            url=url,
+            headers=headers,
+            json_payload=payload,
+            provider=provider_name,
+            model=request.model,
+            timeouts=json_timeouts(),
+        )
+        text = self._extract_openai_chat_text(response)
+        usage = self._extract_usage(response)
+        yield TextGenerationEvent(type="response_started")
+        yield TextGenerationEvent(type="text_delta", text=text)
+        if usage:
+            yield TextGenerationEvent(type="usage_reported", usage=usage)
+        yield TextGenerationEvent(type="response_completed", usage=usage)
+
+    async def _iterate_anthropic_events(
+        self, request: TextGenerationRequest
+    ) -> AsyncIterator[TextGenerationEvent]:
         api_key = config.anthropic_api_key
         if not api_key:
             raise Exception(
                 "Anthropic API key not found. Please set it in the settings."
             )
 
-        logger.debug(
-            f"Anthropic: hitting {ANTHROPIC_ENDPOINT} model: {model} retries {retry_count}"
-        )
-
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-
         payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 4096,  # Anthropic requires max_tokens
-            "temperature": temperature,
+            "model": request.model,
+            "messages": [{"role": "user", "content": request.prompt}],
+            "max_tokens": 4096,
+            "temperature": request.temperature,
         }
-
-        return await self._execute_request(
+        response = await provider_runtime.request_json(
+            key=f"text:anthropic:{request.model}",
+            initial_window=text_initial_window("anthropic"),
+            method="POST",
             url=ANTHROPIC_ENDPOINT,
-            headers=headers,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
             json_payload=payload,
-            timeout_sec=CHAT_CLIENT_TIMEOUT_SEC,
-            retry_count=retry_count,
             provider="anthropic",
-            prompt=prompt,
-            model=model,
-            temperature=temperature,
-            reasoning_effort=None,
+            model=request.model,
+            timeouts=json_timeouts(),
         )
+        text = self._extract_anthropic_text(response)
+        usage = self._extract_usage(response)
+        yield TextGenerationEvent(type="response_started")
+        yield TextGenerationEvent(type="text_delta", text=text)
+        if usage:
+            yield TextGenerationEvent(type="usage_reported", usage=usage)
+        yield TextGenerationEvent(type="response_completed", usage=usage)
 
-    async def _get_deepseek_response(
-        self,
-        prompt: str,
-        model: ChatModels,
-        temperature: float,
-        retry_count: int,
-    ) -> str:
+    async def _iterate_deepseek_events(
+        self, request: TextGenerationRequest
+    ) -> AsyncIterator[TextGenerationEvent]:
         api_key = config.deepseek_api_key
         if not api_key:
             raise Exception(
                 "DeepSeek API key not found. Please set it in the settings."
             )
 
-        logger.debug(
-            f"DeepSeek: hitting {DEEPSEEK_ENDPOINT} model: {model} retries {retry_count}"
-        )
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
         payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature,
+            "model": request.model,
+            "messages": [{"role": "user", "content": request.prompt}],
+            "temperature": request.temperature,
         }
-
-        return await self._execute_request(
+        response = await provider_runtime.request_json(
+            key=f"text:deepseek:{request.model}",
+            initial_window=text_initial_window("deepseek"),
+            method="POST",
             url=DEEPSEEK_ENDPOINT,
-            headers=headers,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
             json_payload=payload,
-            timeout_sec=CHAT_CLIENT_TIMEOUT_SEC,
-            retry_count=retry_count,
             provider="deepseek",
-            prompt=prompt,
-            model=model,
-            temperature=temperature,
-            reasoning_effort=None,
+            model=request.model,
+            timeouts=json_timeouts(),
         )
+        text = self._extract_openai_chat_text(response)
+        usage = self._extract_usage(response)
+        yield TextGenerationEvent(type="response_started")
+        yield TextGenerationEvent(type="text_delta", text=text)
+        if usage:
+            yield TextGenerationEvent(type="usage_reported", usage=usage)
+        yield TextGenerationEvent(type="response_completed", usage=usage)
 
-    async def _get_google_response(
-        self,
-        prompt: str,
-        model: ChatModels,
-        temperature: float,
-        retry_count: int,
-    ) -> str:
+    async def _iterate_google_events(
+        self, request: TextGenerationRequest
+    ) -> AsyncIterator[TextGenerationEvent]:
         api_key = config.google_api_key
         if not api_key:
             raise Exception("Google API key not found. Please set it in the settings.")
 
-        logger.debug(
-            f"Google: hitting {GOOGLE_ENDPOINT_BASE} model: {model} retries {retry_count}"
+        response = await provider_runtime.request_json(
+            key=f"text:google:{request.model}",
+            initial_window=text_initial_window("google"),
+            method="POST",
+            url=f"{GOOGLE_ENDPOINT_BASE}/{request.model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json_payload={
+                "contents": [{"parts": [{"text": request.prompt}]}],
+                "generationConfig": {"temperature": request.temperature},
+            },
+            provider="google",
+            model=request.model,
+            timeouts=json_timeouts(),
         )
+        error = response.get("error")
+        if error:
+            raise Exception(f"google API error: {error}")
 
-        url = f"{GOOGLE_ENDPOINT_BASE}/{model}:generateContent?key={api_key}"
+        text = self._extract_google_text(response)
+        usage = self._extract_usage(response)
+        yield TextGenerationEvent(type="response_started")
+        yield TextGenerationEvent(type="text_delta", text=text)
+        if usage:
+            yield TextGenerationEvent(type="usage_reported", usage=usage)
+        yield TextGenerationEvent(type="response_completed", usage=usage)
+
+    async def _fetch_custom_provider_models(
+        self, provider_config: CustomProvider
+    ) -> list[str]:
+        url = build_v1_endpoint(provider_config["base_url"], "/models")
         headers = {"Content-Type": "application/json"}
-
-        # Gemini 3 defaults to dynamic thinking (high) if not specified.
-        # Use default temperature 1.0 as recommended for Gemini 3, unless user explicitly changes it?
-        # User provided code:
-        # "For Gemini 3, we strongly recommend keeping the temperature parameter at its default value of 1.0."
-        # "Gemini 3 series models use dynamic thinking by default... If thinking_level is not specified, Gemini 3 will default to high."
-
-        # We will pass the temperature if it's not 1.0 (default in Anki Smart Notes might be 1.0)
-        # But wait, existing default is 1.0 in constants.py.
-        # If I pass it, is it bad? The docs say "Changing the temperature (setting it below 1.0) may lead to unexpected behavior"
-        # I'll stick to passing it for now as Smart Notes allows configuration.
-
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": temperature},
-        }
-
-        return await self._execute_request(
+        if provider_config["api_key"]:
+            headers["Authorization"] = f"Bearer {provider_config['api_key']}"
+        payload = await provider_runtime.request_json(
+            key=f"models:{provider_config['name']}",
+            initial_window=1,
+            method="GET",
             url=url,
             headers=headers,
-            json_payload=payload,
-            timeout_sec=CHAT_CLIENT_TIMEOUT_SEC,
-            retry_count=retry_count,
-            provider="google_text",  # Use specific text quota key
-            prompt=prompt,
+            provider=provider_config["name"],
+            model="models",
+            timeouts=json_timeouts(sock_read_timeout_sec=10.0),
+            max_retries=1,
+        )
+        return self._extract_model_ids(payload)
+
+    async def _probe_custom_provider_api_mode(
+        self, provider_config: CustomProvider, model: str | None
+    ) -> ResolvedApiMode:
+        if not model:
+            return "responses"
+
+        probe_request = TextGenerationRequest(
+            prompt="Reply with OK.",
             model=model,
-            temperature=temperature,
+            provider=provider_config["name"],
+            temperature=0.0,
             reasoning_effort=None,
         )
 
-    async def fetch_models(self, provider_config: CustomProvider) -> list[str]:
-        api_key = provider_config["api_key"]
-        base_url = provider_config["base_url"]
+        for api_mode in ("responses", "chat_completions"):
+            try:
+                if api_mode == "responses":
+                    async for _ in self._iterate_openai_compatible_responses_events(
+                        probe_request,
+                        provider_name=provider_config["name"],
+                        base_url=provider_config["base_url"],
+                        api_key=provider_config["api_key"],
+                        use_stream=False,
+                    ):
+                        pass
+                else:
+                    async for _ in self._iterate_openai_compatible_chat_events(
+                        request=probe_request,
+                        provider_name=provider_config["name"],
+                        base_url=provider_config["base_url"],
+                        api_key=provider_config["api_key"],
+                        use_stream=False,
+                    ):
+                        pass
+                logger.debug(
+                    "Resolved custom provider %s to %s during model verification.",
+                    provider_config["name"],
+                    api_mode,
+                )
+                return api_mode
+            except (ResponseFormatError, StreamingNotSupportedError) as exc:
+                logger.debug(
+                    "Custom provider %s rejected %s during probe: %s",
+                    provider_config["name"],
+                    api_mode,
+                    exc,
+                )
+                continue
+            except ProviderHTTPError as exc:
+                if looks_like_unsupported_api(exc):
+                    logger.debug(
+                        "Custom provider %s rejected %s during probe: %s",
+                        provider_config["name"],
+                        api_mode,
+                        exc.body[:200],
+                    )
+                    continue
+                raise
 
-        # Try to derive models endpoint from chat completion endpoint
-        url = base_url
-        if "/chat/completions" in url:
-            url = url.replace("/chat/completions", "/models")
-        else:
-            # Fallback: assume base_url is root or v1, try appending /models
-            url = f"{url}models" if url.endswith("/") else f"{url}/models"
+        raise Exception(
+            f"Could not determine whether {provider_config['name']} uses Responses or Chat Completions. Choose the Chat API explicitly in provider settings."
+        )
 
-        logger.debug(f"Fetching models for {provider_config['name']} from {url}")
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
+    def _responses_payload(
+        self, request: TextGenerationRequest, *, include_prompt_cache_key: bool
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": request.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": request.prompt}],
+                }
+            ],
+            "store": False,
+            "truncation": "disabled",
+            "tool_choice": "none",
         }
 
-        try:
-            async with (
-                aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as session,
-                session.get(url, headers=headers) as response,
-            ):
-                response.raise_for_status()
-                data = await response.json()
-                # Standard OpenAI response: { "data": [ { "id": "model-id", ... } ] }
-                return sorted([model["id"] for model in data.get("data", [])])
-        except Exception as e:
-            logger.error(f"Failed to fetch models from {provider_config['name']}: {e}")
-            raise e
+        if request.reasoning_effort and request.reasoning_effort != "none":
+            payload["reasoning"] = {"effort": request.reasoning_effort}
+        else:
+            payload["temperature"] = request.temperature
 
-    async def _execute_request(
-        self,
-        url: str,
-        headers: dict,
-        json_payload: dict,
-        timeout_sec: int,
-        retry_count: int,
-        provider: str,
-        prompt: str,
-        model: ChatModels,
-        temperature: float,
-        reasoning_effort: Optional[OpenAIReasoningEffort],
-    ) -> str:
-        # Get per-model rate limiter
-        limiter = get_rate_limiter(provider, model)
+        if include_prompt_cache_key and request.prompt_cache_key:
+            payload["prompt_cache_key"] = request.prompt_cache_key
 
-        # Estimate tokens for TPM tracking
-        estimated_tokens = estimate_tokens(prompt)
+        return payload
 
-        # Check circuit breaker first
-        if limiter.is_circuit_open:
-            raise ProviderUnavailableError(
-                f"{provider} is temporarily unavailable (circuit breaker open)"
+    def _extract_model_ids(self, payload: Any) -> list[str]:
+        if not isinstance(payload, dict):
+            raise ResponseFormatError("Model endpoint returned an unexpected payload.")
+
+        data = payload.get("data")
+        if isinstance(data, list):
+            return sorted(
+                [
+                    str(model["id"])
+                    for model in data
+                    if isinstance(model, dict) and "id" in model
+                ]
             )
 
-        try:
-            # Acquire rate limit slot with token estimate
-            acquire_start = time.time()
-            await limiter.acquire(estimated_tokens)
-            acquire_time = time.time() - acquire_start
-            if acquire_time > 0.5:  # Only log if acquire took significant time
-                logger.debug(
-                    f"[{provider}] Rate limiter acquire took {acquire_time:.1f}s"
-                )
+        models = payload.get("models")
+        if isinstance(models, list):
+            return sorted(
+                [
+                    str(model["name"])
+                    for model in models
+                    if isinstance(model, dict) and "name" in model
+                ]
+            )
 
-            start_time = time.time()
-            logger.debug(f"[{provider}] Sending HTTP request to {url}...")
+        raise ResponseFormatError("Could not find any models in the payload.")
 
-            async with (
-                aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=timeout_sec)
-                ) as session,
-                session.post(url, headers=headers, json=json_payload) as response,
-            ):
-                elapsed = time.time() - start_time
-                logger.debug(
-                    f"[{provider}] Got HTTP response: status={response.status} "
-                    f"in {elapsed:.1f}s"
-                )
+    def _extract_openai_responses_text(self, response: Any) -> str:
+        if not isinstance(response, dict):
+            raise ResponseFormatError("Responses API returned an invalid payload.")
 
-                # Extract headers for rate limit learning
-                response_headers = extract_rate_limit_headers(response.headers)
+        direct_text = response.get("output_text")
+        if isinstance(direct_text, str):
+            return direct_text
 
-                if response.status == 429:
-                    logger.debug(f"Got a 429 from {provider}")
+        output = response.get("output", [])
+        if not isinstance(output, list):
+            return ""
 
-                    error_text = await response.text()
-                    is_daily_limit = self._is_daily_quota_error(error_text)
+        text_parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"output_text", "text"} and isinstance(
+                    part.get("text"), str
+                ):
+                    text_parts.append(str(part["text"]))
+        return "".join(text_parts)
 
-                    # Parse Retry-After header
-                    retry_after = parse_retry_after(response.headers)
-                    await limiter.report_failure(
-                        response_headers, retry_after, is_daily_limit=is_daily_limit
-                    )
+    def _extract_openai_chat_text(self, response: Any) -> str:
+        if not isinstance(response, dict):
+            raise ResponseFormatError(
+                "OpenAI-compatible response was not a JSON object."
+            )
 
-                    if is_daily_limit:
-                        # Fail fast if daily quota exhausted
-                        raise ProviderUnavailableError(
-                            f"{provider} daily quota exhausted: {error_text[:200]}"
-                        )
+        choices = response.get("choices", [])
+        if not isinstance(choices, list) or not choices:
+            raise ResponseFormatError("OpenAI-compatible response had no choices.")
 
-                    if retry_count < MAX_RETRIES:
-                        wait_time = min(
-                            retry_after or (2**retry_count) * RETRY_BASE_SECONDS,
-                            MAX_RETRY_WAIT_SECONDS,
-                        )
-                        logger.debug(
-                            f"Retry: {retry_count} Waiting {wait_time} seconds before retrying"
-                        )
-                        await asyncio.sleep(wait_time)
-                        # Recursively call the public method to retry logic
-                        return await self.async_get_chat_response(
-                            prompt,
-                            model,
-                            provider.replace("_text", "")
-                            if provider == "google_text"
-                            else provider,  # type: ignore - Pass base provider name if needed for logic, but internally execute uses key
-                            -1,
-                            temperature,
-                            reasoning_effort,
-                            retry_count + 1,
-                        )
+        message = choices[0].get("message", {})
+        if not isinstance(message, dict):
+            raise ResponseFormatError("OpenAI-compatible response had no message.")
 
-                response.raise_for_status()
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") in {"text", "output_text"}
+            )
+        raise ResponseFormatError("OpenAI-compatible message content was invalid.")
 
-                resp = await response.json()
+    def _extract_anthropic_text(self, response: Any) -> str:
+        if not isinstance(response, dict):
+            raise ResponseFormatError("Anthropic response was not a JSON object.")
 
-                # Check for error in response body (Google sometimes returns 200 with error)
-                if "error" in resp:
-                    error_msg = resp.get("error", {})
-                    if isinstance(error_msg, dict):
-                        error_text = error_msg.get("message", str(error_msg))
-                        error_code = error_msg.get("code", "unknown")
-                        error_status = error_msg.get("status", "")
-                    else:
-                        error_text = str(error_msg)
-                        error_code = "unknown"
-                        error_status = ""
-                    logger.error(
-                        f"{provider} returned error in body: [{error_code}] {error_status}: {error_text}"
-                    )
-                    raise Exception(f"{provider} API error: {error_text}")
+        content = response.get("content", [])
+        if not isinstance(content, list) or not content:
+            raise ResponseFormatError("Anthropic response had no content.")
 
-                # Extract actual token usage from response
-                actual_tokens = self._extract_token_usage(resp, provider)
+        item = content[0]
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            raise ResponseFormatError("Anthropic response content was invalid.")
+        return str(item["text"])
 
-                # Report success with actual tokens and headers for learning
-                await limiter.report_success(actual_tokens, response_headers)
+    def _extract_google_text(self, response: Any) -> str:
+        if not isinstance(response, dict):
+            raise ResponseFormatError("Google response was not a JSON object.")
 
-                try:
-                    if "anthropic" in provider:
-                        msg = resp["content"][0]["text"]
-                    elif "google" in provider:
-                        # { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
-                        msg = resp["candidates"][0]["content"]["parts"][0]["text"]
-                    else:
-                        msg = resp["choices"][0]["message"]["content"]
-                except (KeyError, IndexError) as e:
-                    logger.error(
-                        f"{provider} returned unexpected response format: {resp}"
-                    )
-                    raise Exception(
-                        f"{provider} returned unexpected response: {e}"
-                    ) from e
+        candidates = response.get("candidates", [])
+        if not isinstance(candidates, list) or not candidates:
+            raise ResponseFormatError("Google response had no candidates.")
 
-                logger.debug(f"Got response from {provider}: {msg}")
-                return msg
+        content = candidates[0].get("content", {})
+        if not isinstance(content, dict):
+            raise ResponseFormatError("Google candidate content was invalid.")
 
-        except asyncio.TimeoutError:
-            logger.warning(f"{provider} request timed out")
-            # Timeouts are also a sign of congestion, but we don't back off RPM for them
-            # as it might just be a slow provider/model.
-            await limiter.report_timeout()
+        parts = content.get("parts", [])
+        if not isinstance(parts, list):
+            raise ResponseFormatError("Google candidate parts were invalid.")
 
-            if retry_count < MAX_RETRIES:
-                wait_time = min(
-                    (2**retry_count) * RETRY_BASE_SECONDS,
-                    MAX_RETRY_WAIT_SECONDS,
-                )
-                await asyncio.sleep(wait_time)
-                return await self.async_get_chat_response(
-                    prompt,
-                    model,
-                    provider.replace("_text", "")
-                    if provider == "google_text"
-                    else provider,  # type: ignore
-                    -1,
-                    temperature,
-                    reasoning_effort,
-                    retry_count + 1,
-                )
-            raise
-
-        except aiohttp.ClientResponseError as e:
-            # Log non-429 errors
-            if e.status != 429:
-                logger.warning(f"{provider} returned status {e.status}: {e.message}")
-
-            # Only report failure to rate limiter for rate-limit related errors
-            # 429 = Too Many Requests, 5xx = Server errors (might indicate overload)
-            # Don't penalize rate limits for client errors like 400, 401, 403, 404
-            if e.status == 429 or e.status >= 500:
-                await limiter.report_failure()
-            raise
-
-        except Exception:
-            # Any other exception? Maybe report failure if it's network related?
-            # For safety, let's treat generic exceptions as potentially overload related
-            # if we can distinguish them. But for now, just 429 and Timeout.
-            raise
-
-    def _extract_token_usage(self, response: dict, provider: str) -> int:
-        """Extract total token usage from API response."""
-        try:
-            if "anthropic" in provider:
-                # Anthropic: { "usage": { "input_tokens": X, "output_tokens": Y } }
-                usage = response.get("usage", {})
-                return usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            elif "google" in provider:
-                # Google: { "usageMetadata": { "promptTokenCount": X, "candidatesTokenCount": Y } }
-                usage = response.get("usageMetadata", {})
-                return usage.get("promptTokenCount", 0) + usage.get(
-                    "candidatesTokenCount", 0
-                )
-            else:
-                # OpenAI-style: { "usage": { "prompt_tokens": X, "completion_tokens": Y, "total_tokens": Z } }
-                usage = response.get("usage", {})
-                return usage.get("total_tokens", 0) or (
-                    usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-                )
-        except Exception:
-            return 0
-
-    def _is_daily_quota_error(self, error_text: str) -> bool:
-        """Check if error indicates daily quota exhaustion."""
-        text = error_text.lower()
-        return (
-            "quota" in text
-            or "daily limit" in text
-            or "insufficient_quota" in text
-            or "RESOURCE_EXHAUSTED" in text  # Google style
+        return "".join(
+            str(part.get("text", "")) for part in parts if isinstance(part, dict)
         )
+
+    def _extract_usage(self, response: Any) -> dict[str, Any] | None:
+        if not isinstance(response, dict):
+            return None
+
+        usage = response.get("usage")
+        if isinstance(usage, dict):
+            return cast("dict[str, Any]", usage)
+
+        usage = response.get("usageMetadata")
+        if isinstance(usage, dict):
+            return cast("dict[str, Any]", usage)
+
+        return None
+
+    def _resolve_custom_provider_api_mode(
+        self, provider_config: CustomProvider
+    ) -> ResolvedApiMode:
+        configured_mode = provider_config.get("chat_api_mode", "responses")
+        if configured_mode == "chat_completions":
+            return "chat_completions"
+        if configured_mode == "responses":
+            return "responses"
+
+        logger.warning(
+            "Custom provider %s still uses legacy Auto mode; defaulting to Responses until the config is re-saved.",
+            provider_config["name"],
+        )
+        return "responses"
+
+    def _custom_provider_streaming_enabled(
+        self, provider_config: CustomProvider
+    ) -> bool:
+        return provider_config.get("streaming_mode", "enabled") != "disabled"
+
+    def _reasoning_candidates(
+        self, reasoning_effort: OpenAIReasoningEffort | None
+    ) -> list[OpenAIReasoningEffort | None]:
+        if reasoning_effort in {None, "none"}:
+            return [None]
+        return [reasoning_effort, None]
+
+    def _pick_probe_model(self, models: list[str]) -> str | None:
+        blocked_fragments = (
+            "tts",
+            "audio",
+            "speech",
+            "image",
+            "dall-e",
+            "flux",
+            "diffusion",
+            "embedding",
+            "moderation",
+            "whisper",
+        )
+        for model in models:
+            lowered = model.lower()
+            if not any(fragment in lowered for fragment in blocked_fragments):
+                return model
+        return models[0] if models else None
+
+    def _describe_event_error(self, event: Any) -> str:
+        if isinstance(event, dict):
+            error = event.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message:
+                    return message
+            message = event.get("message")
+            if isinstance(message, str) and message:
+                return message
+            return json.dumps(event, ensure_ascii=True)
+
+        return str(event)
+
+    def _response_id(self, response: dict[str, Any] | None) -> str | None:
+        if response is None:
+            return None
+        response_id = response.get("id")
+        return str(response_id) if isinstance(response_id, str) else None
 
 
 chat_provider = ChatProvider()

@@ -101,6 +101,26 @@ def highlight_match(text: str, query: str) -> str:
     return "".join(result)
 
 
+def redact_config_value(key: str, value: Any) -> Any:
+    lowered_key = key.lower()
+    if "api_key" in lowered_key or lowered_key.endswith("_key"):
+        return "***"
+
+    if key == "custom_providers" and isinstance(value, list):
+        redacted: list[dict[str, Any]] = []
+        for provider in value:
+            if not isinstance(provider, dict):
+                redacted.append({"value": "***"})
+                continue
+            provider_copy = dict(provider)
+            if provider_copy.get("api_key"):
+                provider_copy["api_key"] = "***"
+            redacted.append(provider_copy)
+        return redacted
+
+    return value
+
+
 class State(TypedDict):
     prompts_map: PromptMap
     selected_row: Optional[int]
@@ -356,7 +376,7 @@ class AddonOptionsDialog(QDialog):
         layout.addWidget(group_box)
 
         # Custom Providers
-        custom_box = QGroupBox("Custom Providers (OpenAI Compatible)")
+        custom_box = QGroupBox("Custom Providers")
         custom_layout = QVBoxLayout()
         custom_box.setLayout(custom_layout)
 
@@ -851,7 +871,7 @@ class AddonOptionsDialog(QDialog):
             for k, v in [
                 item for item in state.s.items() if item[0] in valid_config_attrs
             ]:
-                logger.debug(f"Setting: {k}: {v}")
+                logger.debug(f"Setting: {k}: {redact_config_value(k, v)}")
                 config.__setattr__(k, v)
 
         if not old_debug and self.state.s["debug"] and not silent:

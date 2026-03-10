@@ -291,6 +291,8 @@ class CustomProvider(TypedDict):
     api_key: str
     models: list[str]
     capabilities: list[str]  # "chat", "tts", "image"
+    chat_api_mode: Literal["auto", "responses", "chat_completions"]
+    streaming_mode: Literal["auto", "enabled", "disabled"]
 
     # Granular capability lists
     chat_models: Optional[list[str]]

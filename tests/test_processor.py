@@ -557,7 +557,42 @@ async def test_returns_if_updated(note, prompts_map, expected, monkeypatch):
         allow_empty_fields=False,
     )
 
-    did_update, _ = await p._process_note(  # type: ignore
+    result = await p._process_note(  # type: ignore
         n, deck_id=1, overwrite_fields=False, target_field=None
     )
-    assert did_update == expected
+    assert result.did_update == expected
+
+
+@pytest.mark.asyncio
+async def test_process_note_reports_field_failures(monkeypatch):
+    import src.prompts
+
+    note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "1", "f2": "", "f3": ""})
+    processor = setup_data(  # type: ignore
+        monkeypatch=monkeypatch,
+        note=note,
+        prompts_map={"f2": "{{f1}}", "f3": "{{f2}}"},
+        options={},
+        allow_empty_fields=False,
+    )
+
+    async def fail_resolve(node, note, show_error_box=False):
+        del show_error_box
+        if node.field == "f2":
+            raise TimeoutError()
+
+        interpolated = src.prompts.interpolate_prompt(node.input, note)
+        return p(interpolated) if interpolated else None
+
+    processor.field_processor.resolve = fail_resolve
+
+    result = await processor._process_note(  # type: ignore
+        note, deck_id=1, overwrite_fields=False, target_field=None
+    )
+
+    assert result.did_update is False
+    assert result.updated_fields == []
+    assert len(result.field_failures) == 1
+    assert result.field_failures[0].field == "f2"
+    assert result.field_failures[0].error == "TimeoutError"
+    assert result.field_failures[0].aborted_dependents == ("f3",)

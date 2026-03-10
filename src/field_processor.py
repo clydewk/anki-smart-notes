@@ -23,7 +23,7 @@ from anki.decks import DeckId
 from anki.notes import Note
 from aqt import mw
 
-from .chat_provider import ChatProvider, chat_provider
+from .chat_provider import ChatProvider, chat_provider, prompt_cache_key_for_request
 from .config import config, key_or_config_val
 from .constants import API_KEY_MISSING_MESSAGE
 from .image_provider import ImageProvider, image_provider
@@ -222,12 +222,15 @@ class FieldProcessor:
         if not self._check_api_key(provider, show_error_box):
             return None
 
+        note_type = get_note_type(note)
+        cache_seed = f"{provider}:{model}:{note_type}:{deck_id}:{field_lower}:{prompt}"
         resp = await self.chat_provider.async_get_chat_response(
             interpolated_prompt,
             model=model,
             provider=provider,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
+            prompt_cache_key=prompt_cache_key_for_request(str(model), cache_seed),
             note_id=note.id,
         )
 

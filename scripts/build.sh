@@ -18,7 +18,60 @@ set -e
 # You should have received a copy of the GNU General Public License
 # along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
+vendor_deps () {
+  python3 - <<'PY'
+from importlib.util import find_spec
+from pathlib import Path
+import shutil
 
+target = Path("dist/vendor")
+required = [
+    "anyio",
+    "certifi",
+    "dotenv",
+    "h11",
+    "httpcore",
+    "httpx",
+    "idna",
+    "sniffio",
+    "typing_extensions",
+]
+
+def copy_import(name: str) -> None:
+    spec = find_spec(name)
+    if spec is None:
+        raise SystemExit(f"Missing runtime dependency for vendoring: {name}")
+
+    if spec.submodule_search_locations:
+        source = Path(next(iter(spec.submodule_search_locations)))
+    elif spec.origin:
+        source = Path(spec.origin)
+    else:
+        raise SystemExit(f"Could not resolve vendored dependency: {name}")
+
+    destination = target / source.name
+    if destination.exists():
+        if destination.is_dir():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
+
+    if source.is_dir():
+        shutil.copytree(source, destination)
+    else:
+        shutil.copy2(source, destination)
+
+for dependency in required:
+    copy_import(dependency)
+PY
+}
+
+strip_dist_noise () {
+  find dist -name "__pycache__" -type d -prune -exec rm -rf {} +
+  find dist/vendor \( -name "_tests" -o -name "tests" \) -type d -prune -exec rm -rf {} +
+  find dist -name "*.pyc" -delete
+  find dist/vendor -name "pytest_plugin.py" -delete
+}
 
 build () {
   echo "Building..."
@@ -33,29 +86,8 @@ build () {
   cp changelog.md dist/
   echo "environment = \"PROD\"" > dist/src/env.py
 
-  # Nuke any pycache
-  rm -rf dist/__pycache__
-
-  # Copy deps
-  vendored=(
-    "aiohttp"
-    "aiosignal"
-    "async_timeout"
-    "frozenlist"
-    "attrs"
-    "multidict"
-    "yarl"
-    "idna"
-    "sentry_sdk"
-    "certifi"
-    "urllib3"
-    "dotenv"
-  )
-
-  # copy them in a loop
-  for dep in "${vendored[@]}"; do
-    cp -r ".venv/lib/python3.11/site-packages/$dep" dist/vendor/
-  done
+  vendor_deps
+  strip_dist_noise
 
   # Voices
   cp -r eleven_voices.json dist/

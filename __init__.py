@@ -25,18 +25,15 @@ def init_addon():
         import os
         import sys
 
-        # Local and prod builds have different package directories
-        # Can't use `is_production` b/c utils requires dotenv to load, and this has to run before we import an deps
-        # relative_packages_dir = (
-        #     "vendor" if environment == "PROD" else ".venv/lib/python3.11/site-packages"
-        # )
-        relative_packages_dir = "vendor"
+        addon_dir = os.path.dirname(os.path.realpath(__file__))
+        package_dirs = [
+            os.path.join(addon_dir, "dist", "vendor"),
+            os.path.join(addon_dir, "vendor"),
+        ]
 
-        packages_dir = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), relative_packages_dir
-        )
-
-        sys.path.append(packages_dir)
+        for packages_dir in package_dirs:
+            if os.path.isdir(packages_dir) and packages_dir not in sys.path:
+                sys.path.append(packages_dir)
 
     update_path()
 

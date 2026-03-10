@@ -17,10 +17,11 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Any, Optional, TypedDict
+from typing import Any, Optional, TypedDict, cast
 
 from aqt import QGroupBox, QLabel, QSpacerItem, QWidget
 
+from ..chat_provider import chat_provider
 from ..config import config, key_or_config_val
 from ..models import (
     ChatModels,
@@ -32,6 +33,7 @@ from ..models import (
     overridable_chat_options,
     provider_model_map,
 )
+from ..sentry import run_async_in_background_with_sentry
 from .reactive_check_box import ReactiveCheckBox
 from .reactive_combo_box import ReactiveComboBox
 from .reactive_spin_box import ReactiveDoubleSpinBox
@@ -97,6 +99,7 @@ class ChatOptions(QWidget):
             self.get_initial_state(chat_options or {})  # type: ignore
         )
         self._show_text_processing = show_text_processing
+        self._openai_refresh_inflight = False
         self.setup_ui()
 
     def setup_ui(self) -> None:
@@ -170,14 +173,9 @@ class ChatOptions(QWidget):
 
         self.setLayout(chat_layout)
 
-        # Initial check for enabled/disabled state
         self._on_reasoning_effort_change(self.state.s.get("chat_reasoning_effort"))
         self._on_model_change(self.state.s["chat_model"])
-
-        # Initial check for custom provider editable state
         self._update_editable_state(self.state.s["chat_provider"])
-
-        # Initialize map with current selection
         current_provider = self.state.s["chat_provider"]
         current_model = self.state.s["chat_model"]
         current_temp = self.state.s["chat_temperature"]
@@ -189,6 +187,7 @@ class ChatOptions(QWidget):
             temperature=current_temp,
             reasoning_effort=current_effort,
         )
+        self._refresh_openai_models_if_needed(current_provider)
 
     def _update_editable_state(self, provider: str) -> None:
         is_custom = provider not in all_chat_providers
@@ -198,36 +197,24 @@ class ChatOptions(QWidget):
         is_custom = text not in all_chat_providers
         models = provider_model_map.get(text, [])
 
-        # For custom providers, try to get the chat-specific model list
         if is_custom:
             custom_provider = next(
                 (p for p in (config.custom_providers or []) if p["name"] == text), None
             )
             if custom_provider:
-                # Prefer specific chat models list, fallback to general list
-                if custom_provider.get("chat_models"):
-                    models = custom_provider["chat_models"]  # type: ignore
-                elif custom_provider.get("models"):
-                    models = custom_provider["models"]  # type: ignore
+                models = cast(
+                    "list[ChatModels]",
+                    custom_provider.get("chat_models")
+                    or custom_provider.get("models")
+                    or [],
+                )
 
-        # Try to restore last settings
         last_settings = self.state.s["provider_settings"].get(text)
-
-        updates = {
-            "chat_provider": text,
-            "chat_models": models
-            if not is_custom and models
-            else models,  # Use the models we found
-        }
-
-        self._update_editable_state(text)
-
         new_model = ""
         new_temp = self.state.s["chat_temperature"]
         new_effort = self.state.s["chat_reasoning_effort"]
 
         if last_settings:
-            # If it's a standard provider, verify the model is still valid
             if is_custom or last_settings["model"] in models:
                 new_model = last_settings["model"]
             elif models:
@@ -235,66 +222,38 @@ class ChatOptions(QWidget):
 
             new_temp = last_settings["temperature"]
             new_effort = last_settings["reasoning_effort"]
-        else:
-            if not is_custom and models:
-                new_model = models[0]
-            elif is_custom and models:
-                # If we have custom models populated, pick the first one
-                new_model = models[0]  # type: ignore
-            elif is_custom:
-                new_model = ""
+        elif models:
+            new_model = models[0]
 
-            # Reset others to defaults if no history
-            # But maybe we want to keep current if not specific?
-            # The user asked to fix "switching providers always switches... to default"
-            # So if I switch to a new provider, using defaults is expected.
-            # If I switch BACK, I want restoration.
-
-            # For a fresh provider, let's stick to current or smart defaults?
-            # Let's keep existing values if we don't have stored settings?
-            # No, standard behavior is usually reset to provider defaults.
-            # But here we only have global defaults.
-            # Let's keep current values as a fallback if no specific history exists,
-            # OR reset. Resetting feels safer for temperature/effort which might be invalid.
-            pass
-
-        updates["chat_model"] = new_model
-        updates["chat_temperature"] = new_temp
-        updates["chat_reasoning_effort"] = new_effort
-
-        # Determine available reasoning efforts for the new model
         efforts = openai_reasoning_efforts_for_model(new_model)
-        updates["chat_reasoning_efforts"] = efforts
 
-        # Validate effort against new efforts
         if new_effort not in efforts:
-            # Default to none or first
-            updates["chat_reasoning_effort"] = (
+            new_effort = (
                 "none" if "none" in efforts else (efforts[0] if efforts else None)
             )
 
-        # Update map with new selection immediately so it sticks
-        self.state.update(updates)
-
-        # Ensure UI enabled state is updated (since ReactiveDoubleSpinBox logic might need trigger)
-        # Actually ReactiveDoubleSpinBox binds to state, so it will update value.
-        # But enabled state depends on logic in _on_reasoning_effort_change.
-        # _on_reasoning_effort_change is a slot for the combo box.
-        # State update triggers combo box update, but maybe not signals.
-        # We need to manually update enabled state of temperature box.
-
-        is_reasoning = (
-            updates["chat_reasoning_effort"]
-            and updates["chat_reasoning_effort"] != "none"
+        self._update_editable_state(text)
+        self.state.update(
+            {
+                "chat_provider": text,
+                "chat_models": models,
+                "chat_model": new_model,
+                "chat_temperature": new_temp,
+                "chat_reasoning_effort": new_effort,
+                "chat_reasoning_efforts": efforts,
+            }
         )
+
+        is_reasoning = new_effort and new_effort != "none"
         self.temperature.setEnabled(not is_reasoning)
 
         self._update_provider_settings(
             text,
             model=new_model,
-            temperature=updates["chat_temperature"],
-            reasoning_effort=updates["chat_reasoning_effort"],
+            temperature=new_temp,
+            reasoning_effort=new_effort,
         )  # type: ignore
+        self._refresh_openai_models_if_needed(text)
 
     def refresh_custom_providers(self) -> None:
         custom_provider_names = [p["name"] for p in (config.custom_providers or [])]
@@ -302,14 +261,14 @@ class ChatOptions(QWidget):
 
         self.state.update({"chat_providers": new_providers})
 
-        # If current provider was removed, revert to default
         current = self.state.s["chat_provider"]
         if current not in new_providers:
             self.state.update({"chat_provider": "openai"})
             self._on_provider_change("openai")
         elif current in custom_provider_names:
-            # Refresh models for current custom provider in case they changed
             self._on_provider_change(current)
+        elif current == "openai":
+            self._refresh_openai_models_if_needed(current)
 
     def get_initial_state(
         self, chat_options: OverridableChatOptionsDict
@@ -321,23 +280,36 @@ class ChatOptions(QWidget):
 
         custom_provider_names = [p["name"] for p in (config.custom_providers or [])]
         ret["chat_providers"] = all_chat_providers + custom_provider_names
-
-        # Load provider settings from config
         ret["provider_settings"] = config.provider_settings or {}
 
         current_provider = ret["chat_provider"]
         if current_provider in provider_model_map:
-            ret["chat_models"] = provider_model_map[current_provider]
+            if current_provider == "openai":
+                ret["chat_models"] = cast(
+                    "list[ChatModels]", chat_provider.get_cached_openai_chat_models()
+                )
+            else:
+                ret["chat_models"] = provider_model_map[current_provider]
         else:
-            ret["chat_models"] = []
+            custom_provider = next(
+                (
+                    p
+                    for p in (config.custom_providers or [])
+                    if p["name"] == current_provider
+                ),
+                None,
+            )
+            ret["chat_models"] = cast(
+                "list[ChatModels]",
+                (
+                    custom_provider.get("chat_models")
+                    or custom_provider.get("models")
+                    or []
+                )
+                if custom_provider
+                else [],
+            )
 
-        # If custom provider is selected initially, ensure editable
-        # We can't set editable here easily as it's state init.
-        # But we can check in setup_ui or after state update.
-        # For now, let's rely on _on_provider_change logic for updates,
-        # and do a check in setup_ui after init.
-
-        # Ensure reasoning effort is initialized properly
         current_model = ret.get("chat_model")
         efforts = (
             openai_reasoning_efforts_for_model(current_model) if current_model else []
@@ -345,7 +317,6 @@ class ChatOptions(QWidget):
         ret["chat_reasoning_efforts"] = efforts
 
         if not ret.get("chat_reasoning_effort") and efforts:
-            # Default to "none" if available, else first option
             ret["chat_reasoning_effort"] = (
                 "none" if "none" in efforts else efforts[0] if efforts else None
             )
@@ -353,7 +324,6 @@ class ChatOptions(QWidget):
         return ret
 
     def _on_model_change(self, model: str) -> None:
-        # Update available reasoning efforts for the new model
         efforts = openai_reasoning_efforts_for_model(model)
 
         provider = self.state.s["chat_provider"]
@@ -361,7 +331,6 @@ class ChatOptions(QWidget):
 
         self.state.update({"chat_reasoning_efforts": efforts})
 
-        # If current selection is not valid for new model, reset
         current_effort = self.state.s.get("chat_reasoning_effort")
         if current_effort not in efforts:
             new_effort = (
@@ -376,7 +345,6 @@ class ChatOptions(QWidget):
             self.state.s["chat_provider"], reasoning_effort=effort
         )  # type: ignore
 
-        # Disable temperature if reasoning effort is set to something other than "none" or None
         is_reasoning = effort and effort != "none"
         self.temperature.setEnabled(not is_reasoning)
 
@@ -398,3 +366,52 @@ class ChatOptions(QWidget):
     def _on_temperature_change(self, temp: float) -> None:
         self.state.update({"chat_temperature": temp})
         self._update_provider_settings(self.state.s["chat_provider"], temperature=temp)
+
+    def _refresh_openai_models_if_needed(self, provider: str) -> None:
+        if (
+            provider != "openai"
+            or not config.openai_api_key
+            or self._openai_refresh_inflight
+        ):
+            return
+
+        self._openai_refresh_inflight = True
+
+        def on_success(models: list[str]) -> None:
+            self._openai_refresh_inflight = False
+            if not models or self.state.s["chat_provider"] != "openai":
+                return
+
+            current_model = self.state.s["chat_model"]
+            next_model = current_model if current_model in models else models[0]
+            next_efforts = openai_reasoning_efforts_for_model(next_model)
+            next_effort = self.state.s["chat_reasoning_effort"]
+            if next_effort not in next_efforts:
+                next_effort = (
+                    "none"
+                    if "none" in next_efforts
+                    else (next_efforts[0] if next_efforts else None)
+                )
+
+            self.state.update(
+                {
+                    "chat_models": cast("list[ChatModels]", models),
+                    "chat_model": cast("ChatModels", next_model),
+                    "chat_reasoning_efforts": next_efforts,
+                    "chat_reasoning_effort": next_effort,
+                }
+            )
+            self._update_provider_settings(
+                "openai",
+                model=next_model,
+                reasoning_effort=next_effort,
+            )
+
+        def on_failure(_: Exception) -> None:
+            self._openai_refresh_inflight = False
+
+        run_async_in_background_with_sentry(
+            chat_provider.fetch_openai_chat_models,
+            on_success,
+            on_failure,
+        )

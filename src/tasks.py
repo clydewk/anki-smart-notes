@@ -24,6 +24,8 @@ from typing import Any, Optional
 from aqt import mw
 from aqt.operations import QueryOp
 
+from .provider_runtime import provider_runtime
+
 
 def run_async_in_background(
     op: Callable[[], Any],
@@ -37,6 +39,12 @@ def run_async_in_background(
     if not mw:
         raise Exception("Error: mw not found in run_async_in_background")
 
+    async def run_op_async() -> Any:
+        try:
+            return await op()
+        finally:
+            await provider_runtime.close_current_session()
+
     def run_op(_):
         """
         Wrapper to avoid capturing FrameLocalsProxy objects in closures.
@@ -44,7 +52,7 @@ def run_async_in_background(
         causing "Cannot pickle 'FrameLocalsProxy' object" errors when QueryOp
         tries to serialize the operation for background execution.
         """
-        return asyncio.run(op())
+        return asyncio.run(run_op_async())
 
     query_op = QueryOp(
         parent=mw,
