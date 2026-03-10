@@ -29,7 +29,7 @@ def test_migrate_chat_models_global(mock_config, mock_logger, monkeypatch):
     mock_config.chat_model = "gpt-4o"
     migrate_models()
 
-    assert mock_config.chat_model == "gpt-5.2-chat-latest"
+    assert mock_config.chat_model == "gpt-5.3-chat-latest"
 
 
 def test_migrate_tts_models_global(mock_config, mock_logger):
@@ -95,7 +95,7 @@ def test_migrate_multiple_models(mock_config, mock_logger, monkeypatch):
 
     migrate_models()
 
-    assert mock_config.chat_model == "gpt-5.2-chat-latest"
+    assert mock_config.chat_model == "gpt-5.3-chat-latest"
     assert mock_config.tts_model == "eleven_flash_v2_5"
     assert (
         mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
