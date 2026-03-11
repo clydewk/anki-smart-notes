@@ -17,53 +17,39 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+from __future__ import annotations
+
+import asyncio
 import os
+import platform
+import sys
+from importlib import import_module
+from pathlib import Path
+
+try:
+    from .runtime_dependencies import add_runtime_dependency_path
+except ImportError:
+    from runtime_dependencies import add_runtime_dependency_path
 
 
-def init_addon():
-    def update_path() -> None:
-        import os
-        import sys
+def setup_platform_specific_functionality() -> None:
+    # https://stackoverflow.com/questions/45600579/asyncio-event-loop-is-closed-when-getting-loop
+    # https://github.com/piazzatron/anki-smart-notes/issues/5
+    if platform.system() == "Windows":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
 
-        addon_dir = os.path.dirname(os.path.realpath(__file__))
-        package_dirs = [
-            os.path.join(addon_dir, "dist", "vendor"),
-            os.path.join(addon_dir, "vendor"),
-        ]
 
-        for packages_dir in package_dirs:
-            if os.path.isdir(packages_dir) and packages_dir not in sys.path:
-                sys.path.append(packages_dir)
+def init_addon() -> None:
+    addon_dir = Path(__file__).resolve().parent
+    add_runtime_dependency_path(addon_dir, sys.path)
 
-    update_path()
-
-    from dotenv import load_dotenv
-
-    from .src.logger import logger
-    from .src.utils import get_file_path
-
-    load_dotenv(dotenv_path=get_file_path(".env"))
-
-    def setup_platform_specific_functionality() -> None:
-        import asyncio
-        import platform
-
-        # https://stackoverflow.com/questions/45600579/asyncio-event-loop-is-closed-when-getting-loop
-        # https://github.com/piazzatron/anki-smart-notes/issues/5
-        if platform.system() == "Windows":
-            logger.debug(
-                "Running in windows environment, setting event loop to selector policy"
-            )
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore
+    dotenv_module = import_module("dotenv")
+    dotenv_module.load_dotenv(dotenv_path=addon_dir / ".env")
 
     setup_platform_specific_functionality()
 
-    # Import this after setting the correct path
-    from .src.main import main
-
-    main()
-
-    # Exit early if we're in test mode
+    main_module = import_module(".src.main", __name__)
+    main_module.main()
 
 
 if not os.getenv("IS_TEST"):

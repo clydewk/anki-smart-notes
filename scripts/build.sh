@@ -18,24 +18,43 @@ set -e
 # You should have received a copy of the GNU General Public License
 # along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
+resolve_python () {
+  if [ -x ".venv/Scripts/python.exe" ]; then
+    echo ".venv/Scripts/python.exe"
+    return
+  fi
+
+  if [ -x ".venv/bin/python" ]; then
+    echo ".venv/bin/python"
+    return
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    echo "python3"
+    return
+  fi
+
+  if command -v python >/dev/null 2>&1; then
+    echo "python"
+    return
+  fi
+
+  echo "Python executable not found" >&2
+  exit 1
+}
+
+PYTHON_CMD=$(resolve_python)
+
 vendor_deps () {
-  python3 - <<'PY'
+  "$PYTHON_CMD" - <<'PY'
 from importlib.util import find_spec
 from pathlib import Path
 import shutil
 
+from runtime_dependencies import REQUIRED_RUNTIME_IMPORTS
+
 target = Path("dist/vendor")
-required = [
-    "anyio",
-    "certifi",
-    "dotenv",
-    "h11",
-    "httpcore",
-    "httpx",
-    "idna",
-    "sniffio",
-    "typing_extensions",
-]
+required = list(REQUIRED_RUNTIME_IMPORTS)
 
 def copy_import(name: str) -> None:
     spec = find_spec(name)
@@ -156,27 +175,27 @@ sentry-release () {
 
 format () {
   echo "Formatting code..."
-  python3 -m ruff format .
+  "$PYTHON_CMD" -m ruff format .
 }
 
 lint () {
   echo "Linting code..."
-  python3 -m ruff check .
+  "$PYTHON_CMD" -m ruff check .
 }
 
 typecheck () {
   echo "Type checking..."
-  python3 -m pyright .
+  "$PYTHON_CMD" -m pyright .
 }
 
 check () {
   echo "Running all checks..."
-  python3 -m ruff format . --check && python3 -m ruff check . && python3 -m pyright .
+  "$PYTHON_CMD" -m ruff format . --check && "$PYTHON_CMD" -m ruff check . && "$PYTHON_CMD" -m pyright .
 }
 
 fix () {
   echo "Fixing code issues..."
-  python3 -m ruff format . && python3 -m ruff check . --fix
+  "$PYTHON_CMD" -m ruff format . && "$PYTHON_CMD" -m ruff check . --fix
 }
 
 version () {
