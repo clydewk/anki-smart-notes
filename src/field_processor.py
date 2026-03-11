@@ -23,6 +23,7 @@ from anki.decks import DeckId
 from anki.notes import Note
 from aqt import mw
 
+from .built_in_tools import BuiltInToolContext
 from .chat_provider import (
     ChatProvider,
     TextToolDefinition,
@@ -34,7 +35,6 @@ from .constants import API_KEY_MISSING_MESSAGE
 from .image_provider import ImageProvider, image_provider
 from .logger import logger
 from .markdown import convert_markdown_to_html
-from .mcp_manager import McpManager
 from .media_utils import convert_image_data, get_media_path
 from .models import (
     DEFAULT_EXTRAS,
@@ -51,10 +51,12 @@ from .models import (
     SmartFieldType,
     TTSModels,
     TTSProviders,
+    normalize_built_in_tools_config,
 )
 from .nodes import FieldNode
 from .notes import get_note_type
 from .prompts import get_extras, interpolate_prompt
+from .tool_registry import ToolRegistry
 from .tts_provider import TTSProvider, tts_provider
 from .ui.ui_utils import show_message_box
 from .utils import run_on_main
@@ -149,7 +151,7 @@ class FieldProcessor:
                 extras, "chat_reasoning_effort"
             )
             should_convert: bool = key_or_config_val(extras, "chat_markdown_to_html")
-            use_mcp: bool = key_or_config_val(extras, "chat_use_mcp")
+            use_tools: bool = key_or_config_val(extras, "chat_use_tools")
 
             return await self.get_chat_response(
                 note=note,
@@ -161,7 +163,7 @@ class FieldProcessor:
                 reasoning_effort=chat_reasoning_effort,
                 field_lower=node.field,
                 should_convert_to_html=should_convert,
-                use_mcp=use_mcp,
+                use_tools=use_tools,
                 show_error_box=show_error_box,
             )
 
@@ -219,7 +221,7 @@ class FieldProcessor:
         temperature: float,
         should_convert_to_html: bool,
         reasoning_effort: Optional[OpenAIReasoningEffort] = None,
-        use_mcp: bool = False,
+        use_tools: bool = False,
         show_error_box: bool = True,
     ) -> Optional[str]:
         interpolated_prompt = interpolate_prompt(prompt, note)
@@ -231,35 +233,32 @@ class FieldProcessor:
         if not self._check_api_key(provider, show_error_box):
             return None
 
+        note_type = get_note_type(note)
         tools: Optional[list[TextToolDefinition]] = None
         tool_executor = None
-        if use_mcp:
-            manager = McpManager(config.mcp_servers or [])
-            if not manager.enabled_servers():
-                raise Exception(
-                    "MCP is enabled for this field, but no MCP servers are enabled."
-                )
-
-            exposed_tools, warnings = await manager.build_tool_registry()
+        if use_tools:
+            registry = ToolRegistry(
+                context=BuiltInToolContext(
+                    note_id=note.id,
+                    deck_id=deck_id,
+                    note_type=note_type,
+                    field_name=field_lower,
+                    collection=mw.col if mw else None,
+                ),
+                built_in_tools=normalize_built_in_tools_config(config.built_in_tools),
+                mcp_servers=config.mcp_servers or [],
+            )
+            tools, warnings = await registry.build_tool_registry()
             for warning in warnings:
-                logger.warning("MCP warning: %s", warning)
+                logger.warning("Tools warning: %s", warning)
 
-            if not exposed_tools:
+            if not tools:
                 raise Exception(
-                    "MCP is enabled for this field, but no MCP tools were available."
+                    "Tools are enabled for this field, but no built-in tools or external MCP tools are available."
                 )
 
-            tools = [
-                TextToolDefinition(
-                    name=tool.exposed_name,
-                    description=tool.description,
-                    input_schema=tool.input_schema,
-                )
-                for tool in exposed_tools
-            ]
-            tool_executor = manager.execute_tool_call
+            tool_executor = registry.execute_tool_call
 
-        note_type = get_note_type(note)
         cache_seed = f"{provider}:{model}:{note_type}:{deck_id}:{field_lower}:{prompt}"
         resp = await self.chat_provider.async_get_chat_response(
             interpolated_prompt,

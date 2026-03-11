@@ -20,7 +20,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 import base64
 import json
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -43,9 +43,9 @@ def test_gpt_5_4_present_in_openai_models() -> None:
     assert "gpt-5.4" in models.provider_model_map["openai"]
 
 
-def test_default_extras_include_chat_use_mcp() -> None:
-    assert "chat_use_mcp" in models.DEFAULT_EXTRAS
-    assert models.DEFAULT_EXTRAS["chat_use_mcp"] is None
+def test_default_extras_include_chat_use_tools() -> None:
+    assert "chat_use_tools" in models.DEFAULT_EXTRAS
+    assert models.DEFAULT_EXTRAS["chat_use_tools"] is None
 
 
 def test_gpt_5_3_chat_latest_present() -> None:
@@ -83,6 +83,159 @@ def test_prompt_cache_key_is_stable() -> None:
     assert key1 == key2
 
 
+def openai_test_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        openai_api_key="sk-test",
+        openai_endpoint=None,
+        custom_providers=[],
+    )
+
+
+def custom_provider_test_config(
+    *,
+    name: str = "Compat",
+    base_url: str = "http://localhost:1234",
+    api_key: str = "test-key",
+    model: str = "compat-model",
+    chat_api_mode: str = "responses",
+    streaming_mode: str = "disabled",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        custom_providers=[
+            {
+                "name": name,
+                "base_url": base_url,
+                "api_key": api_key,
+                "capabilities": ["chat"],
+                "models": [model],
+                "chat_models": [model],
+                "tts_models": [],
+                "image_models": [],
+                "chat_api_mode": chat_api_mode,
+                "streaming_mode": streaming_mode,
+            }
+        ]
+    )
+
+
+def response_created_event(response_id: str) -> dict[str, Any]:
+    return {"type": "response.created", "response": {"id": response_id}}
+
+
+def response_completed_event(
+    response_id: str,
+    *,
+    text: Optional[str] = None,
+    usage: Optional[dict[str, Any]] = None,
+    output: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {"id": response_id}
+    if text is not None:
+        response["output_text"] = text
+    if usage is not None:
+        response["usage"] = usage
+    if output is not None:
+        response["output"] = output
+    return {"type": "response.completed", "response": response}
+
+
+def function_call_item(
+    *,
+    call_id: str,
+    name: str,
+    arguments: str,
+    item_id: Optional[str] = None,
+) -> dict[str, Any]:
+    return {
+        "type": "function_call",
+        "id": item_id or call_id,
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+
+
+def function_call_added_event(
+    response_id: str,
+    *,
+    output_index: int,
+    call_id: str,
+    name: str,
+    item_id: Optional[str] = None,
+) -> dict[str, Any]:
+    return {
+        "type": "response.output_item.added",
+        "response_id": response_id,
+        "output_index": output_index,
+        "item": function_call_item(
+            call_id=call_id,
+            name=name,
+            arguments="",
+            item_id=item_id,
+        ),
+    }
+
+
+def function_call_delta_event(
+    response_id: str,
+    *,
+    output_index: int,
+    item_id: str,
+    delta: str,
+) -> dict[str, Any]:
+    return {
+        "type": "response.function_call_arguments.delta",
+        "response_id": response_id,
+        "item_id": item_id,
+        "output_index": output_index,
+        "delta": delta,
+    }
+
+
+def function_call_done_event(
+    response_id: str,
+    *,
+    output_index: int,
+    call_id: str,
+    name: Optional[str],
+    arguments: str,
+    item_id: Optional[str] = None,
+    item: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": "response.function_call_arguments.done",
+        "response_id": response_id,
+        "item_id": item_id or call_id,
+        "output_index": output_index,
+        "call_id": call_id,
+        "arguments": arguments,
+    }
+    if name is not None:
+        event["name"] = name
+    if item is not None:
+        event["item"] = item
+    return event
+
+
+def make_stream_sse_json(
+    turns: list[list[dict[str, Any]]],
+    *,
+    payloads: Optional[list[dict[str, Any]]] = None,
+):
+    turn_index = 0
+
+    async def fake_stream_sse_json(**kwargs: Any):
+        nonlocal turn_index
+        if payloads is not None:
+            payloads.append(kwargs["json_payload"])
+        events = turns[turn_index]
+        turn_index += 1
+        for event in events:
+            yield event
+
+    return fake_stream_sse_json
+
+
 @pytest.mark.asyncio
 async def test_openai_payload_with_reasoning(
     monkeypatch: pytest.MonkeyPatch,
@@ -91,11 +244,7 @@ async def test_openai_payload_with_reasoning(
     captured: dict[str, Any] = {}
     monkeypatch.setattr(
         "src.chat_provider.config",
-        SimpleNamespace(
-            openai_api_key="sk-test",
-            openai_endpoint=None,
-            custom_providers=[],
-        ),
+        openai_test_config(),
     )
 
     async def fake_stream_sse_json(**kwargs: Any):
@@ -485,42 +634,76 @@ async def test_openai_responses_tool_loop_executes_tool_calls(
 ) -> None:
     cp = ChatProvider()
     payloads: list[dict[str, Any]] = []
+    request_calls = 0
 
     monkeypatch.setattr(
         "src.chat_provider.config",
-        SimpleNamespace(
-            openai_api_key="sk-test",
-            openai_endpoint=None,
-            custom_providers=[],
-        ),
+        openai_test_config(),
     )
 
     async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
-        payloads.append(kwargs["json_payload"])
-        if len(payloads) == 1:
-            return {
-                "id": "resp_1",
-                "output": [
-                    {
-                        "type": "function_call",
-                        "id": "fc_1",
-                        "call_id": "call_1",
-                        "name": "mcp_test_echo",
-                        "arguments": '{"query":"hi"}',
-                    }
-                ],
-                "usage": {"input_tokens": 2},
-            }
-
-        return {
-            "id": "resp_2",
-            "output_text": "tool-backed answer",
-            "usage": {"output_tokens": 3},
-        }
+        del kwargs
+        nonlocal request_calls
+        request_calls += 1
+        raise AssertionError(
+            "Official OpenAI tool calls should use streamed responses."
+        )
 
     monkeypatch.setattr(
         "src.chat_provider.provider_runtime.request_json",
         fake_request_json,
+    )
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    response_created_event("resp_1"),
+                    function_call_added_event(
+                        "resp_1",
+                        output_index=0,
+                        call_id="call_1",
+                        name="mcp_test_echo",
+                        item_id="fc_1",
+                    ),
+                    function_call_delta_event(
+                        "resp_1",
+                        output_index=0,
+                        item_id="fc_1",
+                        delta='{"query":"hi"}',
+                    ),
+                    function_call_done_event(
+                        "resp_1",
+                        output_index=0,
+                        call_id="call_1",
+                        name="mcp_test_echo",
+                        item_id="fc_1",
+                        arguments='{"query":"hi"}',
+                    ),
+                    response_completed_event(
+                        "resp_1",
+                        usage={"input_tokens": 2},
+                        output=[
+                            function_call_item(
+                                call_id="call_1",
+                                name="mcp_test_echo",
+                                item_id="fc_1",
+                                arguments='{"query":"hi"}',
+                            )
+                        ],
+                    ),
+                ],
+                [
+                    response_created_event("resp_2"),
+                    response_completed_event(
+                        "resp_2",
+                        text="tool-backed answer",
+                        usage={"output_tokens": 3},
+                    ),
+                ],
+            ],
+            payloads=payloads,
+        ),
     )
 
     async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
@@ -547,10 +730,13 @@ async def test_openai_responses_tool_loop_executes_tool_calls(
 
     assert result.text == "tool-backed answer"
     assert result.usage == {"input_tokens": 2, "output_tokens": 3}
+    assert request_calls == 0
     assert payloads[0]["tools"][0]["name"] == "mcp_test_echo"
     assert payloads[0]["store"] is True
+    assert payloads[0]["stream"] is True
     assert "prompt_cache_key" not in payloads[0]
     assert payloads[1]["store"] is True
+    assert payloads[1]["stream"] is True
     assert payloads[1]["previous_response_id"] == "resp_1"
     assert payloads[1]["input"] == [
         {"type": "function_call_output", "call_id": "call_1", "output": "tool:hi"}
@@ -612,6 +798,361 @@ async def test_openai_responses_tool_loop_uses_reasoning_timeout_budget(
 
 
 @pytest.mark.asyncio
+async def test_openai_responses_tool_loop_handles_message_output_items_without_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        openai_test_config(),
+    )
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    response_created_event("resp_1"),
+                    {
+                        "type": "response.output_item.added",
+                        "response_id": "resp_1",
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    },
+                    {
+                        "type": "response.output_text.delta",
+                        "response_id": "resp_1",
+                        "delta": "No tool needed",
+                    },
+                    response_completed_event(
+                        "resp_1",
+                        usage={"output_tokens": 3},
+                    ),
+                ]
+            ],
+        ),
+    )
+
+    async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
+        del name, arguments
+        raise AssertionError("Tool executor should not be called.")
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.4",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort=None,
+            tools=[
+                TextToolDefinition(
+                    name="anki_search_notes",
+                    description="Search notes",
+                    input_schema={"type": "object"},
+                )
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert result.text == "No tool needed"
+    assert result.usage == {"output_tokens": 3}
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_loop_streams_multiple_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    payloads: list[dict[str, Any]] = []
+    seen_tool_calls: list[tuple[str, dict[str, Any]]] = []
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        openai_test_config(),
+    )
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    response_created_event("resp_1"),
+                    {
+                        "type": "response.output_text.delta",
+                        "response_id": "resp_1",
+                        "delta": "Looking at similar notes...",
+                    },
+                    function_call_added_event(
+                        "resp_1",
+                        output_index=0,
+                        call_id="call_1",
+                        name="anki_search_notes",
+                        item_id="fc_1",
+                    ),
+                    function_call_delta_event(
+                        "resp_1",
+                        output_index=0,
+                        item_id="fc_1",
+                        delta='{"query":"漢字"}',
+                    ),
+                    function_call_done_event(
+                        "resp_1",
+                        output_index=0,
+                        call_id="call_1",
+                        name="anki_search_notes",
+                        item_id="fc_1",
+                        arguments='{"query":"漢字"}',
+                    ),
+                    function_call_added_event(
+                        "resp_1",
+                        output_index=1,
+                        call_id="call_2",
+                        name="anki_get_deck_overview",
+                        item_id="fc_2",
+                    ),
+                    function_call_delta_event(
+                        "resp_1",
+                        output_index=1,
+                        item_id="fc_2",
+                        delta='{"deck_name":"',
+                    ),
+                    function_call_delta_event(
+                        "resp_1",
+                        output_index=1,
+                        item_id="fc_2",
+                        delta='Japanese"}',
+                    ),
+                    function_call_done_event(
+                        "resp_1",
+                        output_index=1,
+                        call_id="call_2",
+                        name="anki_get_deck_overview",
+                        item_id="fc_2",
+                        arguments='{"deck_name":"Japanese"}',
+                    ),
+                    response_completed_event(
+                        "resp_1",
+                        usage={"input_tokens": 4, "output_tokens": 2},
+                    ),
+                ],
+                [
+                    response_created_event("resp_2"),
+                    response_completed_event(
+                        "resp_2",
+                        text="Done",
+                        usage={"output_tokens": 1},
+                    ),
+                ],
+            ],
+            payloads=payloads,
+        ),
+    )
+
+    async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
+        seen_tool_calls.append((name, arguments))
+        return f"tool:{name}"
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.4",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort=None,
+            tools=[
+                TextToolDefinition(
+                    name="anki_search_notes",
+                    description="Search notes",
+                    input_schema={"type": "object"},
+                ),
+                TextToolDefinition(
+                    name="anki_get_deck_overview",
+                    description="Get deck overview",
+                    input_schema={"type": "object"},
+                ),
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert payloads[0]["stream"] is True
+    assert payloads[1]["stream"] is True
+    assert result.response_id == "resp_2"
+    assert result.text == "Done"
+    assert result.usage == {"input_tokens": 4, "output_tokens": 3}
+    assert seen_tool_calls == [
+        ("anki_search_notes", {"query": "漢字"}),
+        ("anki_get_deck_overview", {"deck_name": "Japanese"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_loop_uses_completed_response_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    seen_tool_calls: list[tuple[str, dict[str, Any]]] = []
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        openai_test_config(),
+    )
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    response_created_event("resp_1"),
+                    function_call_added_event(
+                        "resp_1",
+                        output_index=0,
+                        call_id="call_1",
+                        name="mcp_test_echo",
+                        item_id="fc_1",
+                    ),
+                    function_call_delta_event(
+                        "resp_1",
+                        output_index=0,
+                        item_id="fc_1",
+                        delta='{"query":"hi"}',
+                    ),
+                    response_completed_event(
+                        "resp_1",
+                        usage={"input_tokens": 2},
+                        output=[
+                            function_call_item(
+                                call_id="call_1",
+                                name="mcp_test_echo",
+                                item_id="fc_1",
+                                arguments='{"query":"hi"}',
+                            )
+                        ],
+                    ),
+                ],
+                [
+                    response_created_event("resp_2"),
+                    response_completed_event(
+                        "resp_2",
+                        text="fallback complete",
+                        usage={"output_tokens": 1},
+                    ),
+                ],
+            ],
+        ),
+    )
+
+    async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
+        seen_tool_calls.append((name, arguments))
+        return "tool:hi"
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.4",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort=None,
+            tools=[
+                TextToolDefinition(
+                    name="mcp_test_echo",
+                    description="Echo input",
+                    input_schema={"type": "object"},
+                )
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert seen_tool_calls == [("mcp_test_echo", {"query": "hi"})]
+    assert result.text == "fallback complete"
+    assert result.usage == {"input_tokens": 2, "output_tokens": 1}
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_loop_uses_done_event_item_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    seen_tool_calls: list[tuple[str, dict[str, Any]]] = []
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        openai_test_config(),
+    )
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    response_created_event("resp_1"),
+                    function_call_done_event(
+                        "resp_1",
+                        output_index=0,
+                        call_id="call_1",
+                        name=None,
+                        item_id="fc_1",
+                        arguments='{"query":"hi"}',
+                        item=function_call_item(
+                            call_id="call_1",
+                            name="mcp_test_echo",
+                            item_id="fc_1",
+                            arguments='{"query":"hi"}',
+                        ),
+                    ),
+                    response_completed_event(
+                        "resp_1",
+                        usage={"input_tokens": 2},
+                    ),
+                ],
+                [
+                    response_created_event("resp_2"),
+                    response_completed_event(
+                        "resp_2",
+                        text="tool-backed answer",
+                        usage={"output_tokens": 1},
+                    ),
+                ],
+            ],
+        ),
+    )
+
+    async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
+        seen_tool_calls.append((name, arguments))
+        return "tool:hi"
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.4",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort=None,
+            tools=[
+                TextToolDefinition(
+                    name="mcp_test_echo",
+                    description="Echo input",
+                    input_schema={"type": "object"},
+                )
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert seen_tool_calls == [("mcp_test_echo", {"query": "hi"})]
+    assert result.text == "tool-backed answer"
+    assert result.usage == {"input_tokens": 2, "output_tokens": 1}
+
+
+@pytest.mark.asyncio
 async def test_custom_responses_tool_loop_executes_tool_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -620,22 +1161,7 @@ async def test_custom_responses_tool_loop_executes_tool_calls(
 
     monkeypatch.setattr(
         "src.chat_provider.config",
-        SimpleNamespace(
-            custom_providers=[
-                {
-                    "name": "Compat",
-                    "base_url": "http://localhost:1234",
-                    "api_key": "test-key",
-                    "capabilities": ["chat"],
-                    "models": ["compat-model"],
-                    "chat_models": ["compat-model"],
-                    "tts_models": [],
-                    "image_models": [],
-                    "chat_api_mode": "responses",
-                    "streaming_mode": "disabled",
-                }
-            ]
-        ),
+        custom_provider_test_config(),
     )
 
     async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
@@ -696,6 +1222,87 @@ async def test_custom_responses_tool_loop_executes_tool_calls(
     assert payloads[1]["input"] == [
         {"type": "function_call_output", "call_id": "call_1", "output": "tool:hi"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_custom_responses_tool_loop_streaming_falls_back_to_non_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    payloads: list[dict[str, Any]] = []
+    stream_calls = 0
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        custom_provider_test_config(streaming_mode="enabled"),
+    )
+
+    async def fake_stream_sse_json(**kwargs: Any):
+        del kwargs
+        nonlocal stream_calls
+        stream_calls += 1
+        raise StreamingNotSupportedError("streaming not supported")
+        yield {}
+
+    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        payloads.append(kwargs["json_payload"])
+        if len(payloads) == 1:
+            return {
+                "id": "resp_custom_1",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "mcp_test_echo",
+                        "arguments": '{"query":"hi"}',
+                    }
+                ],
+                "usage": {"input_tokens": 2},
+            }
+
+        return {
+            "id": "resp_custom_2",
+            "output_text": "tool-backed answer",
+            "usage": {"output_tokens": 3},
+        }
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        fake_stream_sse_json,
+    )
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        fake_request_json,
+    )
+
+    async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
+        assert name == "mcp_test_echo"
+        return f"tool:{arguments['query']}"
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="compat-model",
+            provider="Compat",
+            temperature=0.5,
+            reasoning_effort=None,
+            tools=[
+                TextToolDefinition(
+                    name="mcp_test_echo",
+                    description="Echo input",
+                    input_schema={"type": "object"},
+                )
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert result.text == "tool-backed answer"
+    assert stream_calls == 1
+    assert len(payloads) == 2
+    assert "stream" not in payloads[0]
+    assert payloads[1]["previous_response_id"] == "resp_custom_1"
 
 
 @pytest.mark.asyncio
@@ -817,7 +1424,7 @@ async def test_custom_provider_responses_with_tools_not_implemented_raises_clear
         )
 
     assert "does not support the Responses API" in str(exc_info.value)
-    assert "MCP/tool calling cannot be used" in str(exc_info.value)
+    assert "tool calling cannot be used" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -891,44 +1498,58 @@ async def test_openai_responses_tool_loop_forces_final_answer_after_max_tool_tur
 ) -> None:
     cp = ChatProvider()
     payloads: list[dict[str, Any]] = []
+    request_calls = 0
 
     monkeypatch.setattr(
         "src.chat_provider.config",
-        SimpleNamespace(
-            openai_api_key="sk-test",
-            openai_endpoint=None,
-            custom_providers=[],
-        ),
+        openai_test_config(),
     )
 
     async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
-        payload = kwargs["json_payload"]
-        payloads.append(payload)
-        if len(payloads) <= MAX_TOOL_TURNS:
-            turn = len(payloads)
-            return {
-                "id": f"resp_{turn}",
-                "output": [
-                    {
-                        "type": "function_call",
-                        "id": f"fc_{turn}",
-                        "call_id": f"call_{turn}",
-                        "name": "mcp_test_echo",
-                        "arguments": json.dumps({"query": f"hi {turn}"}),
-                    }
-                ],
-                "usage": {"input_tokens": turn},
-            }
-
-        return {
-            "id": "resp_final",
-            "output_text": "final answer",
-            "usage": {"output_tokens": 3},
-        }
+        del kwargs
+        nonlocal request_calls
+        request_calls += 1
+        raise AssertionError(
+            "Official OpenAI tool calls should use streamed responses."
+        )
 
     monkeypatch.setattr(
         "src.chat_provider.provider_runtime.request_json",
         fake_request_json,
+    )
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    response_created_event(f"resp_{turn}"),
+                    function_call_done_event(
+                        f"resp_{turn}",
+                        output_index=0,
+                        call_id=f"call_{turn}",
+                        name="mcp_test_echo",
+                        item_id=f"fc_{turn}",
+                        arguments=json.dumps({"query": f"hi {turn}"}),
+                    ),
+                    response_completed_event(
+                        f"resp_{turn}",
+                        usage={"input_tokens": turn},
+                    ),
+                ]
+                for turn in range(1, MAX_TOOL_TURNS + 1)
+            ]
+            + [
+                [
+                    response_created_event("resp_final"),
+                    response_completed_event(
+                        "resp_final",
+                        text="final answer",
+                        usage={"output_tokens": 3},
+                    ),
+                ]
+            ],
+            payloads=payloads,
+        ),
     )
 
     async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
@@ -954,8 +1575,10 @@ async def test_openai_responses_tool_loop_forces_final_answer_after_max_tool_tur
     )
 
     assert result.text == "final answer"
+    assert request_calls == 0
     assert len(payloads) == MAX_TOOL_TURNS + 1
     assert all(payload["store"] is True for payload in payloads)
+    assert all(payload["stream"] is True for payload in payloads)
     assert payloads[-1]["tool_choice"] == "none"
     assert "tools" not in payloads[-1]
     assert payloads[-1]["previous_response_id"] == f"resp_{MAX_TOOL_TURNS}"

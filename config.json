@@ -9,7 +9,7 @@
   "chat_model": "gpt-4o-mini",
   "chat_temperature": 1,
   "chat_reasoning_effort": null,
-  "chat_use_mcp": false,
+  "chat_use_tools": false,
   "tts_provider": "google",
   "tts_voice": "en-US-Casual-K",
   "tts_model": "standard",
@@ -22,6 +22,10 @@
   "did_show_rate_dialog": false,
   "generate_at_review": true,
   "mcp_servers": [],
+  "built_in_tools": {
+    "anki_search_notes": true,
+    "anki_get_deck_overview": true
+  },
   "prompts_map": {
     "note_types": {}
   },

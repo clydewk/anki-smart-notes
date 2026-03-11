@@ -142,7 +142,7 @@ def test_interpolate_prompt(
     assert interpolate_prompt(prompt, note) == expected
 
 
-def test_add_or_update_prompts_persists_chat_use_mcp() -> None:
+def test_add_or_update_prompts_persists_chat_use_tools() -> None:
     from src.prompts import add_or_update_prompts
 
     prompts_map = cast("PromptMap", {"note_types": {}})
@@ -168,9 +168,9 @@ def test_add_or_update_prompts_persists_chat_use_mcp() -> None:
         ),
         chat_options=cast("OverridableChatOptionsDict", {}),
         image_options=cast("OverridableImageOptionsDict", {}),
-        chat_use_mcp=True,
+        chat_use_tools=True,
         regenerate_when_batching=False,
     )
 
     extras = updated["note_types"]["Basic"]["1"]["extras"]["Back"]
-    assert extras["chat_use_mcp"] is True
+    assert extras["chat_use_tools"] is True

@@ -17,7 +17,7 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Literal, Optional, TypedDict, Union
+from typing import Any, Literal, Optional, TypedDict, Union, cast
 
 # Providers
 
@@ -186,7 +186,7 @@ class FieldExtras(TypedDict):
     chat_temperature: Optional[int]
     chat_reasoning_effort: Optional[OpenAIReasoningEffort]
     chat_markdown_to_html: Optional[bool]
-    chat_use_mcp: Optional[bool]
+    chat_use_tools: Optional[bool]
 
     # TTS
     tts_provider: Optional[TTSProviders]
@@ -216,7 +216,7 @@ DEFAULT_EXTRAS: FieldExtras = {
     "chat_provider": None,
     "chat_temperature": None,
     "chat_reasoning_effort": None,
-    "chat_use_mcp": None,
+    "chat_use_tools": None,
     # Overridable TTS Options
     "tts_model": None,
     "tts_provider": None,
@@ -291,6 +291,54 @@ class McpServerConfig(TypedDict):
     url: str
     headers: list[McpKeyValuePair]
     header_env_vars: list[McpKeyValuePair]
+
+
+BuiltInToolId = Literal["anki_search_notes", "anki_get_deck_overview"]
+
+
+class BuiltInToolsConfig(TypedDict):
+    anki_search_notes: bool
+    anki_get_deck_overview: bool
+
+
+DEFAULT_BUILT_IN_TOOLS: BuiltInToolsConfig = {
+    "anki_search_notes": True,
+    "anki_get_deck_overview": True,
+}
+
+
+def normalize_built_in_tools_config(
+    built_in_tools: Optional[Union[dict[str, Any], BuiltInToolsConfig]],
+) -> BuiltInToolsConfig:
+    normalized = dict(DEFAULT_BUILT_IN_TOOLS)
+    if not built_in_tools:
+        return cast("BuiltInToolsConfig", normalized)
+
+    for key in DEFAULT_BUILT_IN_TOOLS:
+        value = built_in_tools.get(key)
+        if isinstance(value, bool):
+            normalized[key] = value
+
+    return cast("BuiltInToolsConfig", normalized)
+
+
+def normalize_field_extras(
+    extras: Optional[Union[dict[str, Any], FieldExtras]],
+) -> FieldExtras:
+    normalized = cast("FieldExtras", dict(DEFAULT_EXTRAS))
+    if not extras:
+        return normalized
+
+    raw_extras = dict(extras)
+    legacy_use_tools = raw_extras.get("chat_use_mcp")
+    if "chat_use_tools" not in raw_extras and isinstance(legacy_use_tools, bool):
+        raw_extras["chat_use_tools"] = legacy_use_tools
+
+    for key in DEFAULT_EXTRAS:
+        if key in raw_extras:
+            normalized[key] = raw_extras[key]
+
+    return normalized
 
 
 OverridableTTSOptions = Union[

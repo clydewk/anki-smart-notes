@@ -31,7 +31,7 @@ class MockConfig:
     chat_temperature: int = 0
     chat_reasoning_effort: Any = None
     chat_markdown_to_html: bool = False
-    chat_use_mcp: bool = False
+    chat_use_tools: bool = False
     tts_provider: str = "openai"
     tts_voice: str = "alloy"
     tts_model: str = "tts-1"
@@ -50,6 +50,7 @@ class MockConfig:
     replicate_api_key: str = ""
     custom_providers: Any = None
     mcp_servers: Any = None
+    built_in_tools: Any = None
     provider_settings: Any = None
     auth_token: str = ""
     uuid: str = "test-uuid-12345"

@@ -19,12 +19,13 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import html
 import re
-from typing import Any, Optional, TypedDict
+from typing import Any, Optional, TypedDict, cast
 from urllib.parse import urlparse
 
 from aqt import (
     QAction,
     QApplication,
+    QCheckBox,
     QDesktopServices,
     QDialog,
     QDialogButtonBox,
@@ -48,16 +49,19 @@ from aqt import (
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 
+from ..built_in_tools import list_built_in_tools
 from ..config import config
 from ..constants import GLOBAL_DECK_ID
 from ..decks import deck_id_to_name_map, deck_name_to_id_map
 from ..logger import logger
 from ..mcp_runtime import McpServerProbeResult, mcp_runtime
 from ..models import (
+    BuiltInToolsConfig,
     CustomProvider,
     McpServerConfig,
     PromptMap,
     SmartFieldType,
+    normalize_built_in_tools_config,
 )
 from ..note_proccessor import NoteProcessor
 from ..prompts import get_all_prompts, get_extras, get_prompts_for_note, remove_prompt
@@ -162,6 +166,7 @@ class State(TypedDict):
 
     custom_providers: list[CustomProvider]
     mcp_servers: list[McpServerConfig]
+    built_in_tools: BuiltInToolsConfig
     search_text: str
 
 
@@ -206,7 +211,7 @@ class AddonOptionsDialog(QDialog):
 
         tabs.addTab(self.render_general_tab(), "General")
         tabs.addTab(self.render_providers_tab(), "Providers")
-        tabs.addTab(self.render_mcp_tab(), "MCP")
+        tabs.addTab(self.render_tools_tab(), "Tools")
         tabs.addTab(self.render_chat_tab(), "Text")
         self.tts_tab = self.render_tts_tab()
         tabs.addTab(self.tts_tab, "TTS")
@@ -528,34 +533,89 @@ class AddonOptionsDialog(QDialog):
         if hasattr(self, "image_options"):
             self.image_options.refresh_custom_providers()
 
-    def render_mcp_tab(self) -> QWidget:
+    def render_tools_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout()
         container.setLayout(layout)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
 
-        title = QLabel("<h3>MCP Servers</h3>")
+        title = QLabel("<h3>Tools</h3>")
         subtitle = QLabel(
-            f"Connect external tools and data sources for chat Smart Fields. <a href='{MCP_DOCS_URL}'>Documentation</a>"
+            "Enable built-in Anki tools or connect external MCP servers for chat Smart Fields."
         )
         subtitle.setWordWrap(True)
-        subtitle.setOpenExternalLinks(False)
-        subtitle.linkActivated.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
         layout.addWidget(title)
         layout.addWidget(subtitle)
+        layout.addSpacing(8)
+
+        built_in_box = QGroupBox("Built-in Tools")
+        built_in_layout = QVBoxLayout()
+        built_in_box.setLayout(built_in_layout)
+
+        built_in_intro = QLabel(
+            "Built-in tools are local, read-only helpers that let the model inspect relevant parts of your Anki collection."
+        )
+        built_in_intro.setWordWrap(True)
+        built_in_intro.setFont(font_small)
+        built_in_layout.addWidget(built_in_intro)
+
+        self.built_in_tool_checkboxes: dict[str, QCheckBox] = {}
+        for tool in list_built_in_tools():
+            row = QWidget()
+            row_layout = QHBoxLayout()
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(12)
+            row.setLayout(row_layout)
+
+            copy = QVBoxLayout()
+            copy.setContentsMargins(0, 0, 0, 0)
+            copy.setSpacing(2)
+
+            name_label = QLabel(f"<b>{tool.title}</b>")
+            copy.addWidget(name_label)
+
+            description_label = QLabel(tool.description)
+            description_label.setWordWrap(True)
+            description_label.setFont(font_small)
+            copy.addWidget(description_label)
+
+            row_layout.addLayout(copy, 1)
+
+            checkbox = QCheckBox("Enabled")
+            checkbox.setChecked(self.state.s["built_in_tools"].get(tool.id, True))
+            checkbox.toggled.connect(
+                lambda checked, tool_id=tool.id: self._on_built_in_tool_toggled(
+                    tool_id, checked
+                )
+            )
+            row_layout.addWidget(checkbox)
+            self.built_in_tool_checkboxes[tool.id] = checkbox
+
+            built_in_layout.addWidget(row)
+
+        layout.addWidget(built_in_box)
+
+        servers_heading = QLabel(
+            f"External MCP servers. <a href='{MCP_DOCS_URL}'>Documentation</a>"
+        )
+        servers_heading.setWordWrap(True)
+        servers_heading.setOpenExternalLinks(False)
+        servers_heading.linkActivated.connect(
+            lambda url: QDesktopServices.openUrl(QUrl(url))
+        )
+        layout.addWidget(servers_heading)
+
+        servers_box = QGroupBox("External MCP Servers")
+        servers_layout = QVBoxLayout()
+        servers_box.setLayout(servers_layout)
 
         warning = QLabel(
             "Only configure MCP servers you trust. Local stdio commands and HTTP endpoints can run tool calls when requested by the model."
         )
         warning.setWordWrap(True)
         warning.setFont(font_small)
-        layout.addWidget(warning)
-        layout.addSpacing(8)
-
-        servers_box = QGroupBox("Configured Servers")
-        servers_layout = QVBoxLayout()
-        servers_box.setLayout(servers_layout)
+        servers_layout.addWidget(warning)
 
         self.mcp_table = QTableWidget(0, 4)
         self.mcp_table.setHorizontalHeaderLabels(
@@ -578,7 +638,7 @@ class AddonOptionsDialog(QDialog):
             header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         servers_layout.addWidget(self.mcp_table)
 
-        self.mcp_empty_label = QLabel("No MCP servers configured yet.")
+        self.mcp_empty_label = QLabel("No external MCP servers configured yet.")
         self.mcp_empty_label.setFont(font_small)
         servers_layout.addWidget(self.mcp_empty_label)
 
@@ -686,6 +746,14 @@ class AddonOptionsDialog(QDialog):
             servers = [*self.state.s["mcp_servers"], server]
             self.state.update({"mcp_servers": servers})
             self._save_mcp_servers()
+
+    def _on_built_in_tool_toggled(self, tool_id: str, enabled: bool) -> None:
+        built_in_tools = dict(self.state.s["built_in_tools"])
+        built_in_tools[tool_id] = enabled
+        self.state.update(
+            {"built_in_tools": cast("BuiltInToolsConfig", built_in_tools)}
+        )
+        self._save_built_in_tools()
 
     def _on_edit_selected_mcp_server(self) -> None:
         server_id = self._selected_mcp_server_id()
@@ -805,8 +873,16 @@ class AddonOptionsDialog(QDialog):
         self._update_mcp_buttons()
         config.mcp_servers = self.state.s["mcp_servers"]
 
+    def _save_built_in_tools(self) -> None:
+        config.built_in_tools = self.state.s["built_in_tools"]
+
     def render_ui(self) -> None:
         self.render_table()
+        if hasattr(self, "built_in_tool_checkboxes"):
+            for tool_id, checkbox in self.built_in_tool_checkboxes.items():
+                checkbox.blockSignals(True)
+                checkbox.setChecked(self.state.s["built_in_tools"].get(tool_id, True))
+                checkbox.blockSignals(False)
         if hasattr(self, "mcp_table"):
             self._render_mcp_servers_table()
             self._update_mcp_buttons()
@@ -1211,12 +1287,14 @@ class AddonOptionsDialog(QDialog):
             "debug": config.debug,
             "custom_providers": config.custom_providers or [],
             "mcp_servers": config.mcp_servers or [],
+            "built_in_tools": normalize_built_in_tools_config(config.built_in_tools),
             "search_text": "",
         }
 
     def on_restore_defaults(self) -> None:
         config.restore_defaults()
         self.state.update(self.make_initial_state())  # type: ignore
+        self.render_ui()
 
 
 def is_valid_url(url: str) -> bool:

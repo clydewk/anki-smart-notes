@@ -31,7 +31,6 @@ from .constants import GLOBAL_DECK_ID
 from .decks import deck_id_to_name_map
 from .logger import logger
 from .models import (
-    DEFAULT_EXTRAS,
     FieldExtras,
     OverridableChatOptions,
     OverridableChatOptionsDict,
@@ -40,6 +39,7 @@ from .models import (
     OverrideableTTSOptionsDict,
     PromptMap,
     SmartFieldType,
+    normalize_field_extras,
     overridable_chat_options,
     overridable_image_options,
     overridable_tts_options,
@@ -93,9 +93,12 @@ def get_extras(
         .get("extras", {})
     )
 
-    return deck_extras.get(field.lower()) or (
+    extras = deck_extras.get(field.lower()) or (
         global_extras.get(field.lower()) if fallback_to_global_deck else None
     )
+    if extras is None:
+        return None
+    return normalize_field_extras(cast("dict[str, Any]", extras))
 
 
 def get_all_prompts(
@@ -169,7 +172,7 @@ def add_or_update_prompts(
     tts_options: OverrideableTTSOptionsDict,
     chat_options: dict[OverridableChatOptions, Any],
     image_options: dict[OverridableImageOptions, Any],
-    chat_use_mcp: Optional[bool],
+    chat_use_tools: Optional[bool],
     regenerate_when_batching: bool,
 ) -> PromptMap:
     new_prompts_map = deepcopy(prompts_map)
@@ -190,22 +193,24 @@ def add_or_update_prompts(
     new_prompts_map["note_types"][note_type][str(deck_id)]["fields"][field] = prompt
 
     # Write out extras
-    extras = (
-        get_extras(
-            prompts=new_prompts_map,
-            note_type=note_type,
-            field=field,
-            deck_id=deck_id,
-            fallback_to_global_deck=False,
+    extras = normalize_field_extras(
+        cast(
+            "dict[str, Any] | None",
+            get_extras(
+                prompts=new_prompts_map,
+                note_type=note_type,
+                field=field,
+                deck_id=deck_id,
+                fallback_to_global_deck=False,
+            ),
         )
-        or DEFAULT_EXTRAS
     )
 
     # Set common fields
     extras["type"] = type
     extras["automatic"] = is_automatic
     extras["use_custom_model"] = is_custom_model
-    extras["chat_use_mcp"] = chat_use_mcp if type == "chat" else None
+    extras["chat_use_tools"] = chat_use_tools if type == "chat" else None
 
     # If we're doing custom settings, write out extra config
     if is_custom_model:

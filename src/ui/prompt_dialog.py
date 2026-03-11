@@ -124,7 +124,7 @@ class State(TypedDict):
     decks: list[DeckId]
     regenerate_when_batching: bool
     tts_style: str
-    chat_use_mcp: bool
+    chat_use_tools: bool
 
 
 class PartialState(TypedDict):
@@ -231,7 +231,7 @@ class PromptDialog(QDialog):
             "generate_automatically": extras["automatic"],
             "use_custom_model": extras["use_custom_model"],
             "regenerate_when_batching": extras.get("regenerate_when_batching", False),
-            "chat_use_mcp": key_or_config_val(extras, "chat_use_mcp")
+            "chat_use_tools": key_or_config_val(extras, "chat_use_tools")
             if field_type == "chat"
             else False,
         }
@@ -487,20 +487,22 @@ class PromptDialog(QDialog):
         models_layout.addRow(batch_desc)
 
         if self.state.s["type"] == "chat":
-            self.chat_use_mcp_checkbox = ReactiveCheckBox(self.state, "chat_use_mcp")
-            mcp_box = QWidget()
-            mcp_layout = QHBoxLayout()
-            mcp_layout.setContentsMargins(0, 0, 0, 0)
-            mcp_box.setLayout(mcp_layout)
-            mcp_layout.addWidget(QLabel("Use MCP tools for this field:"))
-            mcp_layout.addWidget(self.chat_use_mcp_checkbox)
-            models_layout.addWidget(mcp_box)
+            self.chat_use_tools_checkbox = ReactiveCheckBox(
+                self.state, "chat_use_tools"
+            )
+            tools_box = QWidget()
+            tools_layout = QHBoxLayout()
+            tools_layout.setContentsMargins(0, 0, 0, 0)
+            tools_box.setLayout(tools_layout)
+            tools_layout.addWidget(QLabel("Use tools for this field:"))
+            tools_layout.addWidget(self.chat_use_tools_checkbox)
+            models_layout.addWidget(tools_box)
 
-            mcp_desc = QLabel(
+            tools_desc = QLabel(
                 "This setting is stored per field and does not depend on model overrides."
             )
-            mcp_desc.setFont(font_small)
-            models_layout.addRow(mcp_desc)
+            tools_desc.setFont(font_small)
+            models_layout.addRow(tools_desc)
 
         models_layout.addWidget(self.model_options)
         model_box = QGroupBox("⚙️ Model Settings")
@@ -530,7 +532,7 @@ class PromptDialog(QDialog):
         # TODO: could use a refactor
         # Setup the dummy options; only one will be used
         self.tts_options = TTSOptions()
-        self.chat_options = ChatOptions(show_mcp_toggle=False)
+        self.chat_options = ChatOptions(show_tools_toggle=False)
         self.image_options = ImageOptions()
 
         extras = get_extras(
@@ -570,7 +572,7 @@ class PromptDialog(QDialog):
                             ),
                         },
                     ),
-                    show_mcp_toggle=False,
+                    show_tools_toggle=False,
                 )
             return self.chat_options
 
@@ -607,7 +609,7 @@ class PromptDialog(QDialog):
                 )
                 if extras
                 else False,
-                "chat_use_mcp": key_or_config_val(extras, "chat_use_mcp")
+                "chat_use_tools": key_or_config_val(extras, "chat_use_tools")
                 if self.state.s["type"] == "chat"
                 else False,
             }
@@ -830,7 +832,7 @@ class PromptDialog(QDialog):
                         self.chat_options.state.s, "chat_temperature"
                     ),
                     should_convert_to_html=False,  # Don't show HTML here bc it's confusing
-                    use_mcp=self.state.s["chat_use_mcp"],
+                    use_tools=self.state.s["chat_use_tools"],
                 )
 
             run_async_in_background_with_sentry(chat_fn, on_success, on_failure)
@@ -1016,7 +1018,7 @@ class PromptDialog(QDialog):
             image_options={
                 k: self.image_options.state.s[k] for k in overridable_image_options
             },
-            chat_use_mcp=s["chat_use_mcp"] if s["type"] == "chat" else None,
+            chat_use_tools=s["chat_use_tools"] if s["type"] == "chat" else None,
             regenerate_when_batching=self.state.s["regenerate_when_batching"],
         )
 

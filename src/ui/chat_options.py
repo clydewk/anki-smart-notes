@@ -50,7 +50,7 @@ class ChatOptionsState(TypedDict):
     chat_reasoning_effort: Optional[OpenAIReasoningEffort]
     chat_reasoning_efforts: list[OpenAIReasoningEffort]
     chat_markdown_to_html: bool
-    chat_use_mcp: bool
+    chat_use_tools: bool
     provider_settings: dict[str, ProviderSettings]
 
 
@@ -94,14 +94,14 @@ class ChatOptions(QWidget):
         self,
         chat_options: Optional[OverridableChatOptionsDict] = None,
         show_text_processing: bool = True,
-        show_mcp_toggle: bool = True,
+        show_tools_toggle: bool = True,
     ):
         super().__init__()
         self.state = StateManager[ChatOptionsState](
             self.get_initial_state(chat_options or {})  # type: ignore
         )
         self._show_text_processing = show_text_processing
-        self._show_mcp_toggle = show_mcp_toggle
+        self._show_tools_toggle = show_tools_toggle
         self._openai_refresh_inflight = False
         self.setup_ui()
 
@@ -168,11 +168,11 @@ class ChatOptions(QWidget):
         tools = QGroupBox("🧰 Tools")
         tools_layout = default_form_layout()
         tools.setLayout(tools_layout)
-        tools.setHidden(not self._show_mcp_toggle)
-        self.use_mcp_box = ReactiveCheckBox(self.state, "chat_use_mcp")
-        tools_layout.addRow(QLabel("Use MCP tools by default:"), self.use_mcp_box)
+        tools.setHidden(not self._show_tools_toggle)
+        self.use_tools_box = ReactiveCheckBox(self.state, "chat_use_tools")
+        tools_layout.addRow(QLabel("Use tools by default:"), self.use_tools_box)
         tools_desc = QLabel(
-            "Allow chat Smart Fields to call configured local MCP tools unless a field overrides this setting."
+            "Allow chat Smart Fields to call enabled built-in tools and configured external MCP tools unless a field overrides this setting."
         )
         tools_desc.setFont(font_small)
         tools_layout.addRow(tools_desc)
@@ -184,7 +184,7 @@ class ChatOptions(QWidget):
         if self._show_text_processing:
             chat_layout.addItem(QSpacerItem(0, 12))
         chat_layout.addRow(advanced)
-        if self._show_mcp_toggle:
+        if self._show_tools_toggle:
             chat_layout.addItem(QSpacerItem(0, 12))
             chat_layout.addRow(tools)
         chat_layout.setContentsMargins(0, 0, 0, 0)
@@ -295,7 +295,7 @@ class ChatOptions(QWidget):
             k: key_or_config_val(chat_options, k)
             for k in overridable_chat_options  # type: ignore
         }
-        ret["chat_use_mcp"] = config.chat_use_mcp
+        ret["chat_use_tools"] = config.chat_use_tools
 
         custom_provider_names = [p["name"] for p in (config.custom_providers or [])]
         ret["chat_providers"] = all_chat_providers + custom_provider_names

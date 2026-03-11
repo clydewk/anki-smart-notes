@@ -28,7 +28,7 @@ from aqt import addons, mw
 from .constants import DEFAULT_TEMPERATURE, GLOBAL_DECK_ID
 from .logger import logger
 from .models import (
-    DEFAULT_EXTRAS,
+    BuiltInToolsConfig,
     ChatModels,
     ChatProviders,
     CustomProvider,
@@ -45,6 +45,8 @@ from .models import (
     ProviderSettings,
     TTSModels,
     TTSProviders,
+    normalize_built_in_tools_config,
+    normalize_field_extras,
 )
 from .ui.rate_dialog import RateDialog
 from .utils import USES_BEFORE_RATE_DIALOG, get_file_path
@@ -62,6 +64,7 @@ class Config:
 
     custom_providers: list[CustomProvider]
     mcp_servers: list[McpServerConfig]
+    built_in_tools: BuiltInToolsConfig
     provider_settings: dict[str, ProviderSettings]
 
     prompts_map: PromptMap
@@ -80,7 +83,7 @@ class Config:
     chat_temperature: int
     chat_reasoning_effort: Optional[OpenAIReasoningEffort]
     chat_markdown_to_html: bool
-    chat_use_mcp: bool
+    chat_use_tools: bool
 
     # TTS
     tts_provider: TTSProviders
@@ -184,6 +187,19 @@ class Config:
             self.chat_temperature = DEFAULT_TEMPERATURE
             self.did_cleanup_config_defaults = True
 
+        legacy_chat_use_mcp = self.__getattr__("chat_use_mcp")
+        chat_use_tools = self.__getattr__("chat_use_tools")
+        if not isinstance(chat_use_tools, bool):
+            self.chat_use_tools = (
+                bool(legacy_chat_use_mcp)
+                if isinstance(legacy_chat_use_mcp, bool)
+                else False
+            )
+
+        self.built_in_tools = normalize_built_in_tools_config(
+            cast("Optional[dict[str, Any]]", self.built_in_tools)
+        )
+
         logger.debug("Migration: writing sane defaults for prompt extras")
         prompts_map = deepcopy(self.prompts_map)
 
@@ -199,11 +215,13 @@ class Config:
                         extras_and_fields["extras"][field] = {}  # type: ignore
 
                 # Add all default fields
-                for extras in extras_and_fields["extras"].values():
-                    for k, v in DEFAULT_EXTRAS.items():
-                        if k not in extras:
-                            logger.debug(f"Adding extra {k}: {v}")
-                            extras[k] = v  # type: ignore
+                for field, extras in extras_and_fields["extras"].items():
+                    normalized_extras = normalize_field_extras(
+                        cast("dict[str, Any]", extras)
+                    )
+                    if normalized_extras != extras:
+                        logger.debug("Normalizing extras for field %s", field)
+                    extras_and_fields["extras"][field] = normalized_extras
 
         self.prompts_map = prompts_map
 

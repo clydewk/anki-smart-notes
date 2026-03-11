@@ -125,6 +125,73 @@ class ProviderTurnResult:
     response_id: str | None = None
 
 
+@dataclass
+class ResponsesFunctionCallBuffer:
+    output_index: int
+    item_id: str | None = None
+    call_id: str | None = None
+    name: str | None = None
+    arguments_text: str = ""
+
+    def update_from_item(self, item: Any) -> None:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            return
+
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id:
+            self.item_id = item_id
+
+        call_id = item.get("call_id") or item.get("id")
+        if isinstance(call_id, str) and call_id:
+            self.call_id = call_id
+
+        name = item.get("name")
+        if isinstance(name, str) and name:
+            self.name = name
+
+        arguments = item.get("arguments")
+        if isinstance(arguments, str) and arguments and not self.arguments_text:
+            self.arguments_text = arguments
+
+    def append_arguments(self, delta: Any) -> None:
+        if isinstance(delta, str) and delta:
+            self.arguments_text += delta
+
+    def update_from_done_event(self, event: dict[str, Any]) -> None:
+        self.update_from_item(event.get("item"))
+
+        call_id = event.get("call_id")
+        if isinstance(call_id, str) and call_id:
+            self.call_id = call_id
+
+        name = event.get("name")
+        if isinstance(name, str) and name:
+            self.name = name
+
+        item_id = event.get("item_id")
+        if isinstance(item_id, str) and item_id:
+            self.item_id = item_id
+
+        arguments = event.get("arguments")
+        if isinstance(arguments, str):
+            self.arguments_text = arguments
+
+    def is_ready(self) -> bool:
+        return bool(self.name and self.call_id)
+
+    def to_tool_call(self) -> TextToolCall:
+        if not self.name:
+            raise ResponseFormatError("Responses stream omitted the tool name.")
+        if not self.call_id:
+            raise ResponseFormatError("Responses stream omitted the tool call ID.")
+
+        return TextToolCall(
+            id=self.call_id,
+            name=self.name,
+            arguments=parse_tool_arguments(self.arguments_text),
+        )
+
+
 @dataclass(frozen=True)
 class CustomProviderVerification:
     models: list[str]
@@ -269,7 +336,7 @@ def custom_provider_api_unsupported_message(
         if uses_tools:
             return (
                 f"Custom provider {provider_name} does not support the Responses API "
-                f"for model {model}, so MCP/tool calling cannot be used. Re-open the "
+                f"for model {model}, so tool calling cannot be used. Re-open the "
                 "provider settings and switch Chat API to Chat Completions, or choose "
                 "a provider/model that supports Responses."
             )
@@ -282,7 +349,7 @@ def custom_provider_api_unsupported_message(
     if uses_tools:
         return (
             f"Custom provider {provider_name} does not support Chat Completions tool "
-            f"calling for model {model}. Disable MCP/tool calling for this field or "
+            f"calling for model {model}. Disable tools for this field or "
             "choose a provider/model that supports tool calls."
         )
 
@@ -586,32 +653,26 @@ class ChatProvider:
                     "OpenAI API key not found. Please set it in the settings."
                 )
 
+        stream_enabled = (
+            custom_provider is None
+            or self._custom_provider_streaming_enabled(custom_provider)
+        )
         response_id: str | None = None
         usage: dict[str, Any] | None = None
         next_input: str | list[dict[str, Any]] = request.prompt
 
         for turn in range(MAX_TOOL_TURNS):
-            try:
-                turn_result = await self._responses_turn(
-                    request=request,
-                    provider_name=provider_name,
-                    base_url=base_url,
-                    api_key=api_key,
-                    input_payload=next_input,
-                    previous_response_id=response_id,
-                    include_prompt_cache_key=turn == 0 and provider_name == "openai",
-                )
-            except ProviderHTTPError as exc:
-                if custom_provider is not None and looks_like_unsupported_api(exc):
-                    raise Exception(
-                        custom_provider_api_unsupported_message(
-                            provider_name,
-                            api_mode="responses",
-                            model=request.model,
-                            uses_tools=True,
-                        )
-                    ) from exc
-                raise
+            turn_result, stream_enabled = await self._responses_tool_turn(
+                request=request,
+                provider_name=provider_name,
+                base_url=base_url,
+                api_key=api_key,
+                custom_provider=custom_provider,
+                stream_enabled=stream_enabled,
+                input_payload=next_input,
+                previous_response_id=response_id,
+                include_prompt_cache_key=turn == 0 and provider_name == "openai",
+            )
 
             response_id = turn_result.response_id or response_id
             usage = merge_usage_dicts(usage, turn_result.usage)
@@ -628,11 +689,13 @@ class ChatProvider:
             )
 
             if turn == MAX_TOOL_TURNS - 1:
-                final_result = await self._responses_turn(
+                final_result, stream_enabled = await self._responses_tool_turn(
                     request=request,
                     provider_name=provider_name,
                     base_url=base_url,
                     api_key=api_key,
+                    custom_provider=custom_provider,
+                    stream_enabled=stream_enabled,
                     input_payload=next_input,
                     previous_response_id=response_id,
                     include_prompt_cache_key=False,
@@ -641,16 +704,112 @@ class ChatProvider:
                 response_id = final_result.response_id or response_id
                 usage = merge_usage_dicts(usage, final_result.usage)
                 if final_result.tool_calls:
-                    raise Exception(
-                        "Model exceeded the maximum number of MCP tool rounds."
-                    )
+                    raise Exception("Model exceeded the maximum number of tool rounds.")
                 return TextGenerationResult(
                     text=final_result.text,
                     response_id=response_id,
                     usage=usage,
                 )
 
-        raise Exception("Model exceeded the maximum number of MCP tool rounds.")
+        raise Exception("Model exceeded the maximum number of tool rounds.")
+
+    async def _responses_tool_turn(
+        self,
+        *,
+        request: TextGenerationRequest,
+        provider_name: str,
+        base_url: str,
+        api_key: str,
+        custom_provider: CustomProvider | None,
+        stream_enabled: bool,
+        input_payload: str | list[dict[str, Any]],
+        previous_response_id: str | None,
+        include_prompt_cache_key: bool,
+        allow_tools: bool = True,
+    ) -> tuple[ProviderTurnResult, bool]:
+        if stream_enabled:
+            try:
+                return (
+                    await self._responses_stream_turn(
+                        request=request,
+                        provider_name=provider_name,
+                        base_url=base_url,
+                        api_key=api_key,
+                        input_payload=input_payload,
+                        previous_response_id=previous_response_id,
+                        include_prompt_cache_key=include_prompt_cache_key,
+                        allow_tools=allow_tools,
+                    ),
+                    True,
+                )
+            except StreamingNotSupportedError as exc:
+                if custom_provider is None:
+                    raise
+                detail = " ".join(str(exc).split())[:200]
+                logger.info(
+                    "Custom provider %s does not support streamed Responses tool calls; retrying without streaming. detail=%s",
+                    provider_name,
+                    detail,
+                )
+                stream_enabled = False
+            except ResponseFormatError as exc:
+                if custom_provider is None:
+                    raise
+                detail = " ".join(str(exc).split())[:200]
+                logger.info(
+                    "Custom provider %s emitted an incompatible Responses tool stream; retrying without streaming. detail=%s",
+                    provider_name,
+                    detail,
+                )
+                stream_enabled = False
+            except ProviderHTTPError as exc:
+                if (
+                    custom_provider is not None
+                    and looks_like_streaming_unsupported_http_error(exc)
+                ):
+                    logger.info(
+                        "Custom provider %s rejected streamed Responses tool calls; retrying without streaming. %s",
+                        provider_name,
+                        format_provider_http_error_for_log(exc),
+                    )
+                    stream_enabled = False
+                elif custom_provider is not None and looks_like_unsupported_api(exc):
+                    raise Exception(
+                        custom_provider_api_unsupported_message(
+                            provider_name,
+                            api_mode="responses",
+                            model=request.model,
+                            uses_tools=True,
+                        )
+                    ) from exc
+                else:
+                    raise
+
+        try:
+            return (
+                await self._responses_turn(
+                    request=request,
+                    provider_name=provider_name,
+                    base_url=base_url,
+                    api_key=api_key,
+                    input_payload=input_payload,
+                    previous_response_id=previous_response_id,
+                    include_prompt_cache_key=include_prompt_cache_key,
+                    allow_tools=allow_tools,
+                ),
+                False,
+            )
+        except ProviderHTTPError as exc:
+            if custom_provider is not None and looks_like_unsupported_api(exc):
+                raise Exception(
+                    custom_provider_api_unsupported_message(
+                        provider_name,
+                        api_mode="responses",
+                        model=request.model,
+                        uses_tools=True,
+                    )
+                ) from exc
+            raise
 
     async def _generate_text_with_tools_messages(
         self, request: TextGenerationRequest, tool_executor: ToolExecutor
@@ -688,13 +847,11 @@ class ChatProvider:
                     tool_message.content,
                 )
                 if call_signature in seen_calls:
-                    raise Exception(
-                        "Model repeated the same MCP tool result indefinitely."
-                    )
+                    raise Exception("Model repeated the same tool result indefinitely.")
                 seen_calls.add(call_signature)
                 messages.append(tool_message)
 
-        raise Exception("Model exceeded the maximum number of MCP tool rounds.")
+        raise Exception("Model exceeded the maximum number of tool rounds.")
 
     async def _run_tool_call(
         self,
@@ -787,6 +944,176 @@ class ChatProvider:
             timeouts=responses_json_timeouts(request.reasoning_effort),
         )
         return self._parse_openai_responses_turn(response)
+
+    async def _responses_stream_turn(
+        self,
+        *,
+        request: TextGenerationRequest,
+        provider_name: str,
+        base_url: str,
+        api_key: str,
+        input_payload: str | list[dict[str, Any]],
+        previous_response_id: str | None,
+        include_prompt_cache_key: bool,
+        allow_tools: bool = True,
+    ) -> ProviderTurnResult:
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        url = build_v1_endpoint(base_url, "/responses")
+        payload = self._responses_payload(
+            request=request,
+            input_payload=input_payload,
+            previous_response_id=previous_response_id,
+            include_prompt_cache_key=include_prompt_cache_key,
+            allow_tools=allow_tools,
+        )
+        payload["stream"] = True
+
+        response_id: str | None = None
+        usage: dict[str, Any] | None = None
+        text_parts: list[str] = []
+        response: dict[str, Any] | None = None
+        pending_calls: dict[int, ResponsesFunctionCallBuffer] = {}
+        completed_calls: dict[int, TextToolCall] = {}
+        completed = False
+
+        def function_call_buffer(output_index: int) -> ResponsesFunctionCallBuffer:
+            existing = pending_calls.get(output_index)
+            if existing is not None:
+                return existing
+
+            created = ResponsesFunctionCallBuffer(output_index=output_index)
+            pending_calls[output_index] = created
+            return created
+
+        async for event in provider_runtime.stream_sse_json(
+            key=f"text:{provider_name}:{request.model}",
+            initial_window=text_initial_window(provider_name),
+            method="POST",
+            url=url,
+            headers=headers,
+            json_payload=payload,
+            provider=provider_name,
+            model=request.model,
+            timeouts=responses_timeouts(request.reasoning_effort),
+        ):
+            event_type = str(event.get("type", ""))
+            if event_type == "done":
+                continue
+
+            response_data = event.get("response")
+            if isinstance(response_data, dict) and isinstance(
+                response_data.get("id"), str
+            ):
+                response_id = response_data["id"]
+            else:
+                stream_response_id = event.get("response_id")
+                if isinstance(stream_response_id, str) and stream_response_id:
+                    response_id = stream_response_id
+
+            if event_type == "response.output_text.delta":
+                delta = event.get("delta")
+                if isinstance(delta, str) and delta:
+                    text_parts.append(delta)
+                continue
+
+            if event_type == "response.output_item.added":
+                output_index = event.get("output_index")
+                if isinstance(output_index, int):
+                    item = event.get("item")
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        function_call_buffer(output_index).update_from_item(item)
+                continue
+
+            if event_type == "response.function_call_arguments.delta":
+                output_index = event.get("output_index")
+                if isinstance(output_index, int):
+                    call_buffer = function_call_buffer(output_index)
+                    item_id = event.get("item_id")
+                    if isinstance(item_id, str) and item_id:
+                        call_buffer.item_id = item_id
+                    call_buffer.append_arguments(event.get("delta"))
+                continue
+
+            if event_type == "response.function_call_arguments.done":
+                output_index = event.get("output_index")
+                if not isinstance(output_index, int):
+                    raise ResponseFormatError(
+                        "Responses stream omitted the tool call output index."
+                    )
+                call_buffer = function_call_buffer(output_index)
+                call_buffer.update_from_done_event(event)
+                if call_buffer.is_ready():
+                    completed_calls[output_index] = call_buffer.to_tool_call()
+                continue
+
+            if event_type == "response.completed":
+                response_payload = event.get("response")
+                if not isinstance(response_payload, dict):
+                    raise ResponseFormatError(
+                        "Responses stream completed without a response payload."
+                    )
+                completed = True
+                response = cast("dict[str, Any]", response_payload)
+                response_id = cast("str | None", response.get("id", response_id))
+                usage = self._extract_usage(response)
+                if not text_parts:
+                    final_text = self._extract_openai_responses_text(response)
+                    if final_text:
+                        text_parts.append(final_text)
+                continue
+
+            if event_type in {"response.failed", "error", "response.incomplete"}:
+                raise Exception(self._describe_event_error(event))
+
+        if not completed:
+            raise ResponseFormatError(
+                "Responses stream ended before the response completed."
+            )
+
+        tool_calls = tuple(
+            tool_call for _, tool_call in sorted(completed_calls.items())
+        )
+
+        if response is not None:
+            parsed_tool_calls = self._extract_openai_responses_tool_calls(response)
+            if parsed_tool_calls:
+                tool_calls = parsed_tool_calls
+
+        if not tool_calls and pending_calls:
+            ready_pending_calls = [
+                pending_calls[index]
+                for index in sorted(pending_calls)
+                if pending_calls[index].is_ready()
+            ]
+            if ready_pending_calls:
+                tool_calls = tuple(
+                    pending_call.to_tool_call() for pending_call in ready_pending_calls
+                )
+
+        if not tool_calls and pending_calls:
+            incomplete_pending_calls = [
+                pending_calls[index]
+                for index in sorted(pending_calls)
+                if pending_calls[index].arguments_text
+            ]
+            if incomplete_pending_calls:
+                first_incomplete = incomplete_pending_calls[0]
+                if not first_incomplete.name:
+                    raise ResponseFormatError("Responses stream omitted the tool name.")
+                if not first_incomplete.call_id:
+                    raise ResponseFormatError(
+                        "Responses stream omitted the tool call ID."
+                    )
+
+        return ProviderTurnResult(
+            text="".join(text_parts),
+            tool_calls=tool_calls,
+            usage=usage,
+            response_id=response_id,
+        )
 
     async def _message_turn(
         self, request: TextGenerationRequest, messages: list[TextConversationMessage]
@@ -1884,7 +2211,9 @@ class ChatProvider:
             for tool in tools
         ]
 
-    def _parse_openai_responses_turn(self, response: Any) -> ProviderTurnResult:
+    def _extract_openai_responses_tool_calls(
+        self, response: Any
+    ) -> tuple[TextToolCall, ...]:
         if not isinstance(response, dict):
             raise ResponseFormatError("Responses API returned an invalid payload.")
 
@@ -1910,9 +2239,15 @@ class ChatProvider:
                 )
             )
 
+        return tuple(tool_calls)
+
+    def _parse_openai_responses_turn(self, response: Any) -> ProviderTurnResult:
+        if not isinstance(response, dict):
+            raise ResponseFormatError("Responses API returned an invalid payload.")
+
         return ProviderTurnResult(
             text=self._extract_openai_responses_text(response),
-            tool_calls=tuple(tool_calls),
+            tool_calls=self._extract_openai_responses_tool_calls(response),
             usage=self._extract_usage(response),
             response_id=self._response_id(response),
         )
