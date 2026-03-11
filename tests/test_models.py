@@ -558,6 +558,60 @@ async def test_openai_responses_tool_loop_executes_tool_calls(
 
 
 @pytest.mark.asyncio
+async def test_openai_responses_tool_loop_uses_reasoning_timeout_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            openai_api_key="sk-test",
+            openai_endpoint=None,
+            custom_providers=[],
+        ),
+    )
+
+    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        captured["timeouts"] = kwargs["timeouts"]
+        return {
+            "id": "resp_1",
+            "output_text": "tool-backed answer",
+            "usage": {"output_tokens": 3},
+        }
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        fake_request_json,
+    )
+
+    async def tool_executor(_: str, __: dict[str, Any]) -> str:
+        raise AssertionError("Tool executor should not be called without tool calls.")
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.4",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort="xhigh",
+            tools=[
+                TextToolDefinition(
+                    name="mcp_test_echo",
+                    description="Echo input",
+                    input_schema={"type": "object"},
+                )
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert result.text == "tool-backed answer"
+    assert captured["timeouts"].sock_read_timeout_sec == 90.0
+
+
+@pytest.mark.asyncio
 async def test_custom_responses_tool_loop_executes_tool_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

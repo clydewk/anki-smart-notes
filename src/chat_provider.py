@@ -178,12 +178,27 @@ def is_reasoning_model(model: str) -> bool:
 def responses_timeouts(
     reasoning_effort: OpenAIReasoningEffort | None,
 ) -> RequestTimeouts:
-    first_event_timeout = 90.0 if reasoning_effort in {"high", "xhigh"} else 45.0
+    first_event_timeout = responses_liveness_timeout_sec(reasoning_effort)
     return RequestTimeouts(
         connect_timeout_sec=10.0,
         sock_read_timeout_sec=None,
         first_event_timeout_sec=first_event_timeout,
         stream_idle_timeout_sec=first_event_timeout,
+    )
+
+
+def responses_liveness_timeout_sec(
+    reasoning_effort: OpenAIReasoningEffort | None,
+) -> float:
+    return 90.0 if reasoning_effort in {"high", "xhigh"} else 45.0
+
+
+def responses_json_timeouts(
+    reasoning_effort: OpenAIReasoningEffort | None,
+) -> RequestTimeouts:
+    return RequestTimeouts(
+        connect_timeout_sec=10.0,
+        sock_read_timeout_sec=responses_liveness_timeout_sec(reasoning_effort),
     )
 
 
@@ -769,7 +784,7 @@ class ChatProvider:
             ),
             provider=provider_name,
             model=request.model,
-            timeouts=json_timeouts(),
+            timeouts=responses_json_timeouts(request.reasoning_effort),
         )
         return self._parse_openai_responses_turn(response)
 
@@ -877,7 +892,7 @@ class ChatProvider:
                 json_payload=payload,
                 provider=provider_name,
                 model=request.model,
-                timeouts=json_timeouts(),
+                timeouts=responses_json_timeouts(request.reasoning_effort),
             )
             if not isinstance(response, dict):
                 raise ResponseFormatError("Responses API returned an invalid payload.")
