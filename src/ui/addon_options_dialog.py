@@ -52,23 +52,32 @@ from ..config import config
 from ..constants import GLOBAL_DECK_ID
 from ..decks import deck_id_to_name_map, deck_name_to_id_map
 from ..logger import logger
+from ..mcp_runtime import McpServerProbeResult, mcp_runtime
 from ..models import (
     CustomProvider,
+    McpServerConfig,
     PromptMap,
     SmartFieldType,
 )
 from ..note_proccessor import NoteProcessor
 from ..prompts import get_all_prompts, get_extras, get_prompts_for_note, remove_prompt
+from ..sentry import run_async_in_background_with_sentry
 from ..utils import get_fields, get_version
 from .chat_options import ChatOptions
 from .custom_provider_dialog import CustomProviderDialog
 from .image_options import ImageOptions
+from .mcp_server_dialog import MCP_DOCS_URL, McpServerDialog
 from .prompt_dialog import PromptDialog
 from .reactive_check_box import ReactiveCheckBox
 from .reactive_line_edit import ReactiveLineEdit
 from .state_manager import StateManager
 from .tts_options import TTSOptions
-from .ui_utils import default_form_layout, font_large, font_small, show_message_box
+from .ui_utils import (
+    default_form_layout,
+    font_large,
+    font_small,
+    show_message_box,
+)
 
 OPTIONS_MIN_WIDTH = 875
 TTS_PROMPT_STUB_VALUE = "🔈"
@@ -118,6 +127,19 @@ def redact_config_value(key: str, value: Any) -> Any:
             redacted.append(provider_copy)
         return redacted
 
+    if key == "mcp_servers" and isinstance(value, list):
+        redacted_servers: list[dict[str, Any]] = []
+        for server in value:
+            if not isinstance(server, dict):
+                redacted_servers.append({"value": "***"})
+                continue
+            server_copy = dict(server)
+            for sensitive_key in ("env", "headers", "header_env_vars"):
+                if sensitive_key in server_copy:
+                    server_copy[sensitive_key] = "***"
+            redacted_servers.append(server_copy)
+        return redacted_servers
+
     return value
 
 
@@ -139,6 +161,7 @@ class State(TypedDict):
     replicate_api_key: Optional[str]
 
     custom_providers: list[CustomProvider]
+    mcp_servers: list[McpServerConfig]
     search_text: str
 
 
@@ -183,6 +206,7 @@ class AddonOptionsDialog(QDialog):
 
         tabs.addTab(self.render_general_tab(), "General")
         tabs.addTab(self.render_providers_tab(), "Providers")
+        tabs.addTab(self.render_mcp_tab(), "MCP")
         tabs.addTab(self.render_chat_tab(), "Text")
         self.tts_tab = self.render_tts_tab()
         tabs.addTab(self.tts_tab, "TTS")
@@ -504,8 +528,288 @@ class AddonOptionsDialog(QDialog):
         if hasattr(self, "image_options"):
             self.image_options.refresh_custom_providers()
 
+    def render_mcp_tab(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout()
+        container.setLayout(layout)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        title = QLabel("<h3>MCP Servers</h3>")
+        subtitle = QLabel(
+            f"Connect external tools and data sources for chat Smart Fields. <a href='{MCP_DOCS_URL}'>Documentation</a>"
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setOpenExternalLinks(False)
+        subtitle.linkActivated.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        warning = QLabel(
+            "Only configure MCP servers you trust. Local stdio commands and HTTP endpoints can run tool calls when requested by the model."
+        )
+        warning.setWordWrap(True)
+        warning.setFont(font_small)
+        layout.addWidget(warning)
+        layout.addSpacing(8)
+
+        servers_box = QGroupBox("Configured Servers")
+        servers_layout = QVBoxLayout()
+        servers_box.setLayout(servers_layout)
+
+        self.mcp_table = QTableWidget(0, 4)
+        self.mcp_table.setHorizontalHeaderLabels(
+            ["Name", "Transport", "Target", "Enabled"]
+        )
+        self.mcp_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.mcp_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.mcp_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.mcp_table.itemDoubleClicked.connect(
+            lambda _item: self._on_edit_selected_mcp_server()
+        )
+        self.mcp_table.currentItemChanged.connect(
+            lambda _current, _previous: self._update_mcp_buttons()
+        )
+        header = self.mcp_table.horizontalHeader()
+        if header:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        servers_layout.addWidget(self.mcp_table)
+
+        self.mcp_empty_label = QLabel("No MCP servers configured yet.")
+        self.mcp_empty_label.setFont(font_small)
+        servers_layout.addWidget(self.mcp_empty_label)
+
+        buttons = QHBoxLayout()
+        add_button = QPushButton("Add")
+        add_button.clicked.connect(self._on_add_mcp_server)
+        buttons.addWidget(add_button)
+
+        self.mcp_edit_button = QPushButton("Edit")
+        self.mcp_edit_button.clicked.connect(self._on_edit_selected_mcp_server)
+        buttons.addWidget(self.mcp_edit_button)
+
+        self.mcp_remove_button = QPushButton("Remove")
+        self.mcp_remove_button.clicked.connect(self._on_remove_selected_mcp_server)
+        buttons.addWidget(self.mcp_remove_button)
+
+        self.mcp_toggle_button = QPushButton("Disable")
+        self.mcp_toggle_button.clicked.connect(self._on_toggle_selected_mcp_server)
+        buttons.addWidget(self.mcp_toggle_button)
+
+        self.mcp_test_button = QPushButton("Test Connection")
+        self.mcp_test_button.clicked.connect(self._on_test_selected_mcp_server)
+        buttons.addWidget(self.mcp_test_button)
+        buttons.addStretch()
+        servers_layout.addLayout(buttons)
+
+        layout.addWidget(servers_box)
+        self._render_mcp_servers_table()
+        self._update_mcp_buttons()
+        layout.addStretch()
+        return container
+
+    def _render_mcp_servers_table(self) -> None:
+        selected_server_id = self._selected_mcp_server_id()
+        self.mcp_table.setRowCount(0)
+
+        for server in self.state.s["mcp_servers"]:
+            row = self.mcp_table.rowCount()
+            self.mcp_table.insertRow(row)
+
+            name_item = QTableWidgetItem(server["name"])
+            name_item.setData(Qt.ItemDataRole.UserRole, server["id"])
+
+            transport_item = QTableWidgetItem(
+                "STDIO" if server["transport"] == "stdio" else "Streamable HTTP"
+            )
+            target = (
+                server["command"] if server["transport"] == "stdio" else server["url"]
+            )
+            target_item = QTableWidgetItem(target or "Not configured")
+            enabled_item = QTableWidgetItem(
+                "Yes" if server.get("enabled", True) else "No"
+            )
+            enabled_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            self.mcp_table.setItem(row, 0, name_item)
+            self.mcp_table.setItem(row, 1, transport_item)
+            self.mcp_table.setItem(row, 2, target_item)
+            self.mcp_table.setItem(row, 3, enabled_item)
+
+        has_servers = bool(self.state.s["mcp_servers"])
+        self.mcp_empty_label.setVisible(not has_servers)
+        if not has_servers:
+            return
+
+        target_server_id = selected_server_id or self.state.s["mcp_servers"][0]["id"]
+        for row in range(self.mcp_table.rowCount()):
+            name_item = self.mcp_table.item(row, 0)
+            if (
+                name_item
+                and name_item.data(Qt.ItemDataRole.UserRole) == target_server_id
+            ):
+                self.mcp_table.selectRow(row)
+                break
+
+    def _selected_mcp_server_id(self) -> Optional[str]:
+        row = self.mcp_table.currentRow()
+        if row < 0:
+            return None
+
+        item = self.mcp_table.item(row, 0)
+        if item is None:
+            return None
+        server_id = item.data(Qt.ItemDataRole.UserRole)
+        return str(server_id) if server_id else None
+
+    def _selected_mcp_server(self) -> Optional[McpServerConfig]:
+        server_id = self._selected_mcp_server_id()
+        if server_id is None:
+            return None
+
+        return next(
+            (
+                server
+                for server in self.state.s["mcp_servers"]
+                if server["id"] == server_id
+            ),
+            None,
+        )
+
+    def _on_add_mcp_server(self) -> None:
+        dialog = McpServerDialog(parent=self)
+        if dialog.exec():
+            server = dialog.get_server()
+            servers = [*self.state.s["mcp_servers"], server]
+            self.state.update({"mcp_servers": servers})
+            self._save_mcp_servers()
+
+    def _on_edit_selected_mcp_server(self) -> None:
+        server_id = self._selected_mcp_server_id()
+        if server_id is None:
+            return
+        self._on_edit_mcp_server(server_id)
+
+    def _on_edit_mcp_server(self, server_id: str) -> None:
+        server = next(
+            (
+                existing
+                for existing in self.state.s["mcp_servers"]
+                if existing["id"] == server_id
+            ),
+            None,
+        )
+        if server is None:
+            return
+
+        dialog = McpServerDialog(server=server, parent=self)
+        if dialog.exec():
+            if dialog.was_removed():
+                self._remove_mcp_server(server["id"])
+                return
+
+            updated_server = dialog.get_server()
+            servers = list(self.state.s["mcp_servers"])
+            for index, existing_server in enumerate(servers):
+                if existing_server["id"] == updated_server["id"]:
+                    servers[index] = updated_server
+                    break
+            self.state.update({"mcp_servers": servers})
+            self._save_mcp_servers()
+
+    def _on_remove_selected_mcp_server(self) -> None:
+        server_id = self._selected_mcp_server_id()
+        if server_id is None:
+            return
+        self._remove_mcp_server(server_id)
+
+    def _remove_mcp_server(self, server_id: str) -> None:
+        servers = [
+            existing_server
+            for existing_server in self.state.s["mcp_servers"]
+            if existing_server["id"] != server_id
+        ]
+        self.state.update({"mcp_servers": servers})
+        self._save_mcp_servers()
+
+    def _on_toggle_selected_mcp_server(self) -> None:
+        server = self._selected_mcp_server()
+        if server is None:
+            return
+        self._set_mcp_server_enabled(server["id"], not server.get("enabled", True))
+
+    def _set_mcp_server_enabled(self, server_id: str, enabled: bool) -> None:
+        servers = list(self.state.s["mcp_servers"])
+        for server in servers:
+            if server["id"] == server_id:
+                server["enabled"] = enabled
+                break
+        self.state.update({"mcp_servers": servers})
+        self._save_mcp_servers()
+
+    def _on_test_selected_mcp_server(self) -> None:
+        server = self._selected_mcp_server()
+        if server is None:
+            return
+
+        self.mcp_test_button.setEnabled(False)
+        self.mcp_test_button.setText("Testing...")
+
+        def on_success(result: McpServerProbeResult) -> None:
+            self.mcp_test_button.setEnabled(True)
+            self.mcp_test_button.setText("Test Connection")
+            details = [f"Connected to {result.server_info.name}"]
+            if result.server_info.version:
+                details.append(f"Version: {result.server_info.version}")
+            details.append(f"Tools: {len(result.tools)}")
+            if result.tools:
+                details.append(
+                    "Available: " + ", ".join(tool.name for tool in result.tools[:10])
+                )
+            show_message_box("\n".join(details), custom_ok="Close")
+
+        def on_failure(error: Exception) -> None:
+            logger.error("Failed to test MCP server: %s", error)
+            self.mcp_test_button.setEnabled(True)
+            self.mcp_test_button.setText("Test Connection")
+            show_message_box(f"Failed to connect to MCP server: {error}")
+
+        run_async_in_background_with_sentry(
+            lambda: mcp_runtime.probe_server(server),
+            on_success,
+            on_failure,
+            use_collection=False,
+        )
+
+    def _update_mcp_buttons(self) -> None:
+        server = self._selected_mcp_server()
+        has_selection = server is not None
+
+        self.mcp_edit_button.setEnabled(has_selection)
+        self.mcp_remove_button.setEnabled(has_selection)
+        self.mcp_test_button.setEnabled(has_selection)
+        self.mcp_toggle_button.setEnabled(has_selection)
+        if server is None:
+            self.mcp_toggle_button.setText("Disable")
+            return
+
+        self.mcp_toggle_button.setText(
+            "Disable" if server.get("enabled", True) else "Enable"
+        )
+
+    def _save_mcp_servers(self) -> None:
+        self._render_mcp_servers_table()
+        self._update_mcp_buttons()
+        config.mcp_servers = self.state.s["mcp_servers"]
+
     def render_ui(self) -> None:
         self.render_table()
+        if hasattr(self, "mcp_table"):
+            self._render_mcp_servers_table()
+            self._update_mcp_buttons()
         self.render_buttons()
 
     def render_table(self) -> None:
@@ -906,6 +1210,7 @@ class AddonOptionsDialog(QDialog):
             "allow_empty_fields": config.allow_empty_fields,
             "debug": config.debug,
             "custom_providers": config.custom_providers or [],
+            "mcp_servers": config.mcp_servers or [],
             "search_text": "",
         }
 

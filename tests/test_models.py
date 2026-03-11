@@ -26,18 +26,26 @@ import pytest
 
 from src import models
 from src.chat_provider import (
+    MAX_TOOL_TURNS,
     ChatProvider,
     TextGenerationRequest,
+    TextToolDefinition,
     filter_openai_text_models,
     prompt_cache_key_for_request,
 )
 from src.image_provider import ImageProvider
+from src.provider_runtime import ProviderHTTPError, StreamingNotSupportedError
 from src.tts_provider import TTSProvider
 
 
 def test_gpt_5_4_present_in_openai_models() -> None:
     assert "gpt-5.4" in models.openai_chat_models
     assert "gpt-5.4" in models.provider_model_map["openai"]
+
+
+def test_default_extras_include_chat_use_mcp() -> None:
+    assert "chat_use_mcp" in models.DEFAULT_EXTRAS
+    assert models.DEFAULT_EXTRAS["chat_use_mcp"] is None
 
 
 def test_gpt_5_3_chat_latest_present() -> None:
@@ -469,3 +477,535 @@ async def test_openai_image_uses_http_endpoint(
     assert captured["url"].endswith("/v1/images/generations")
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
     assert captured["payload"]["model"] == "gpt-image-1"
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_loop_executes_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    payloads: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            openai_api_key="sk-test",
+            openai_endpoint=None,
+            custom_providers=[],
+        ),
+    )
+
+    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        payloads.append(kwargs["json_payload"])
+        if len(payloads) == 1:
+            return {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "mcp_test_echo",
+                        "arguments": '{"query":"hi"}',
+                    }
+                ],
+                "usage": {"input_tokens": 2},
+            }
+
+        return {
+            "id": "resp_2",
+            "output_text": "tool-backed answer",
+            "usage": {"output_tokens": 3},
+        }
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        fake_request_json,
+    )
+
+    async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
+        assert name == "mcp_test_echo"
+        return f"tool:{arguments['query']}"
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.4",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort=None,
+            tools=[
+                TextToolDefinition(
+                    name="mcp_test_echo",
+                    description="Echo input",
+                    input_schema={"type": "object"},
+                )
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert result.text == "tool-backed answer"
+    assert result.usage == {"input_tokens": 2, "output_tokens": 3}
+    assert payloads[0]["tools"][0]["name"] == "mcp_test_echo"
+    assert payloads[0]["store"] is True
+    assert "prompt_cache_key" not in payloads[0]
+    assert payloads[1]["store"] is True
+    assert payloads[1]["previous_response_id"] == "resp_1"
+    assert payloads[1]["input"] == [
+        {"type": "function_call_output", "call_id": "call_1", "output": "tool:hi"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_custom_responses_tool_loop_executes_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    payloads: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            custom_providers=[
+                {
+                    "name": "Compat",
+                    "base_url": "http://localhost:1234",
+                    "api_key": "test-key",
+                    "capabilities": ["chat"],
+                    "models": ["compat-model"],
+                    "chat_models": ["compat-model"],
+                    "tts_models": [],
+                    "image_models": [],
+                    "chat_api_mode": "responses",
+                    "streaming_mode": "disabled",
+                }
+            ]
+        ),
+    )
+
+    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        payloads.append(kwargs["json_payload"])
+        if len(payloads) == 1:
+            return {
+                "id": "resp_custom_1",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "mcp_test_echo",
+                        "arguments": '{"query":"hi"}',
+                    }
+                ],
+                "usage": {"input_tokens": 2},
+            }
+
+        return {
+            "id": "resp_custom_2",
+            "output_text": "tool-backed answer",
+            "usage": {"output_tokens": 3},
+        }
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        fake_request_json,
+    )
+
+    async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
+        assert name == "mcp_test_echo"
+        return f"tool:{arguments['query']}"
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="compat-model",
+            provider="Compat",
+            temperature=0.5,
+            reasoning_effort=None,
+            tools=[
+                TextToolDefinition(
+                    name="mcp_test_echo",
+                    description="Echo input",
+                    input_schema={"type": "object"},
+                )
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert result.text == "tool-backed answer"
+    assert result.usage == {"input_tokens": 2, "output_tokens": 3}
+    assert payloads[0]["store"] is True
+    assert payloads[1]["store"] is True
+    assert payloads[1]["previous_response_id"] == "resp_custom_1"
+    assert payloads[1]["input"] == [
+        {"type": "function_call_output", "call_id": "call_1", "output": "tool:hi"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_responses_not_implemented_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            custom_providers=[
+                {
+                    "name": "Compat",
+                    "base_url": "http://localhost:1234",
+                    "api_key": "test-key",
+                    "capabilities": ["chat"],
+                    "models": ["compat-model"],
+                    "chat_models": ["compat-model"],
+                    "tts_models": [],
+                    "image_models": [],
+                    "chat_api_mode": "responses",
+                    "streaming_mode": "disabled",
+                }
+            ]
+        ),
+    )
+
+    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        raise ProviderHTTPError(
+            500,
+            "Internal Server Error",
+            '{"error":{"message":"not implemented","type":"rix_api_error","code":"convert_request_failed"}}',
+            "http://localhost:1234/v1/responses",
+        )
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        fake_request_json,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        await cp.generate_text(
+            TextGenerationRequest(
+                prompt="hello",
+                model="compat-model",
+                provider="Compat",
+                temperature=0.25,
+                reasoning_effort=None,
+            )
+        )
+
+    assert "does not support the Responses API" in str(exc_info.value)
+    assert "Chat Completions" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_responses_with_tools_not_implemented_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            custom_providers=[
+                {
+                    "name": "Compat",
+                    "base_url": "http://localhost:1234",
+                    "api_key": "test-key",
+                    "capabilities": ["chat"],
+                    "models": ["compat-model"],
+                    "chat_models": ["compat-model"],
+                    "tts_models": [],
+                    "image_models": [],
+                    "chat_api_mode": "responses",
+                    "streaming_mode": "disabled",
+                }
+            ]
+        ),
+    )
+
+    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        raise ProviderHTTPError(
+            500,
+            "Internal Server Error",
+            '{"error":{"message":"not implemented","type":"rix_api_error","code":"convert_request_failed"}}',
+            "http://localhost:1234/v1/responses",
+        )
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        fake_request_json,
+    )
+
+    async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
+        del name, arguments
+        return "unused"
+
+    with pytest.raises(Exception) as exc_info:
+        await cp.generate_text(
+            TextGenerationRequest(
+                prompt="hello",
+                model="compat-model",
+                provider="Compat",
+                temperature=0.25,
+                reasoning_effort=None,
+                tools=[
+                    TextToolDefinition(
+                        name="mcp_test_echo",
+                        description="Echo input",
+                        input_schema={"type": "object"},
+                    )
+                ],
+            ),
+            tool_executor=tool_executor,
+        )
+
+    assert "does not support the Responses API" in str(exc_info.value)
+    assert "MCP/tool calling cannot be used" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_streaming_falls_back_to_non_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    stream_calls = 0
+    request_calls = 0
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            custom_providers=[
+                {
+                    "name": "Compat",
+                    "base_url": "http://localhost:1234",
+                    "api_key": "test-key",
+                    "capabilities": ["chat"],
+                    "models": ["compat-model"],
+                    "chat_models": ["compat-model"],
+                    "tts_models": [],
+                    "image_models": [],
+                    "chat_api_mode": "responses",
+                    "streaming_mode": "enabled",
+                }
+            ]
+        ),
+    )
+
+    async def fake_stream_sse_json(**kwargs: Any):
+        del kwargs
+        nonlocal stream_calls
+        stream_calls += 1
+        raise StreamingNotSupportedError("streaming not supported")
+        yield {}
+
+    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        nonlocal request_calls
+        request_calls += 1
+        return {"id": "resp_1", "output_text": "fallback text"}
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        fake_stream_sse_json,
+    )
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        fake_request_json,
+    )
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hello",
+            model="compat-model",
+            provider="Compat",
+            temperature=0.25,
+            reasoning_effort=None,
+        )
+    )
+
+    assert result.text == "fallback text"
+    assert stream_calls == 1
+    assert request_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_loop_forces_final_answer_after_max_tool_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    payloads: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            openai_api_key="sk-test",
+            openai_endpoint=None,
+            custom_providers=[],
+        ),
+    )
+
+    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        payload = kwargs["json_payload"]
+        payloads.append(payload)
+        if len(payloads) <= MAX_TOOL_TURNS:
+            turn = len(payloads)
+            return {
+                "id": f"resp_{turn}",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": f"fc_{turn}",
+                        "call_id": f"call_{turn}",
+                        "name": "mcp_test_echo",
+                        "arguments": json.dumps({"query": f"hi {turn}"}),
+                    }
+                ],
+                "usage": {"input_tokens": turn},
+            }
+
+        return {
+            "id": "resp_final",
+            "output_text": "final answer",
+            "usage": {"output_tokens": 3},
+        }
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        fake_request_json,
+    )
+
+    async def tool_executor(name: str, arguments: dict[str, Any]) -> str:
+        assert name == "mcp_test_echo"
+        return f"tool:{arguments['query']}"
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.4",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort=None,
+            tools=[
+                TextToolDefinition(
+                    name="mcp_test_echo",
+                    description="Echo input",
+                    input_schema={"type": "object"},
+                )
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert result.text == "final answer"
+    assert len(payloads) == MAX_TOOL_TURNS + 1
+    assert all(payload["store"] is True for payload in payloads)
+    assert payloads[-1]["tool_choice"] == "none"
+    assert "tools" not in payloads[-1]
+    assert payloads[-1]["previous_response_id"] == f"resp_{MAX_TOOL_TURNS}"
+    assert payloads[-1]["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": f"call_{MAX_TOOL_TURNS}",
+            "output": f"tool:hi {MAX_TOOL_TURNS}",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_custom_chat_completions_tool_loop_executes_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    payloads: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            custom_providers=[
+                {
+                    "name": "Compat",
+                    "base_url": "http://localhost:1234",
+                    "api_key": "test-key",
+                    "capabilities": ["chat"],
+                    "models": ["compat-model"],
+                    "chat_models": ["compat-model"],
+                    "tts_models": [],
+                    "image_models": [],
+                    "chat_api_mode": "chat_completions",
+                    "streaming_mode": "disabled",
+                }
+            ]
+        ),
+    )
+
+    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        payloads.append(kwargs["json_payload"])
+        if len(payloads) == 1:
+            return {
+                "id": "chat_1",
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mcp_test_echo",
+                                        "arguments": '{"query":"hi"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 2},
+            }
+
+        return {
+            "id": "chat_2",
+            "choices": [{"message": {"content": "done"}}],
+            "usage": {"completion_tokens": 1},
+        }
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        fake_request_json,
+    )
+
+    async def tool_executor(_: str, arguments: dict[str, Any]) -> str:
+        return f"tool:{arguments['query']}"
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hello",
+            model="compat-model",
+            provider="Compat",
+            temperature=0.25,
+            reasoning_effort=None,
+            tools=[
+                TextToolDefinition(
+                    name="mcp_test_echo",
+                    description="Echo input",
+                    input_schema={"type": "object"},
+                )
+            ],
+        ),
+        tool_executor=tool_executor,
+    )
+
+    assert result.text == "done"
+    assert payloads[0]["tools"][0]["function"]["name"] == "mcp_test_echo"
+    assert (
+        payloads[1]["messages"][1]["tool_calls"][0]["function"]["name"]
+        == "mcp_test_echo"
+    )
+    assert payloads[1]["messages"][2] == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "tool:hi",
+    }

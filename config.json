@@ -9,6 +9,7 @@
   "chat_model": "gpt-4o-mini",
   "chat_temperature": 1,
   "chat_reasoning_effort": null,
+  "chat_use_mcp": false,
   "tts_provider": "google",
   "tts_voice": "en-US-Casual-K",
   "tts_model": "standard",
@@ -20,6 +21,7 @@
   "times_used": 0,
   "did_show_rate_dialog": false,
   "generate_at_review": true,
+  "mcp_servers": [],
   "prompts_map": {
     "note_types": {}
   },

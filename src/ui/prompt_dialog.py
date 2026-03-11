@@ -51,6 +51,8 @@ from ..decks import deck_id_to_name_map, get_all_deck_ids
 from ..logger import logger
 from ..models import (
     DEFAULT_EXTRAS,
+    OverridableChatOptionsDict,
+    OverridableImageOptionsDict,
     OverrideableTTSOptionsDict,
     PromptMap,
     SmartFieldType,
@@ -122,6 +124,7 @@ class State(TypedDict):
     decks: list[DeckId]
     regenerate_when_batching: bool
     tts_style: str
+    chat_use_mcp: bool
 
 
 class PartialState(TypedDict):
@@ -228,6 +231,9 @@ class PromptDialog(QDialog):
             "generate_automatically": extras["automatic"],
             "use_custom_model": extras["use_custom_model"],
             "regenerate_when_batching": extras.get("regenerate_when_batching", False),
+            "chat_use_mcp": key_or_config_val(extras, "chat_use_mcp")
+            if field_type == "chat"
+            else False,
         }
         self.state = StateManager[State](initial_state)
 
@@ -479,6 +485,23 @@ class PromptDialog(QDialog):
         )
         batch_desc.setFont(font_small)
         models_layout.addRow(batch_desc)
+
+        if self.state.s["type"] == "chat":
+            self.chat_use_mcp_checkbox = ReactiveCheckBox(self.state, "chat_use_mcp")
+            mcp_box = QWidget()
+            mcp_layout = QHBoxLayout()
+            mcp_layout.setContentsMargins(0, 0, 0, 0)
+            mcp_box.setLayout(mcp_layout)
+            mcp_layout.addWidget(QLabel("Use MCP tools for this field:"))
+            mcp_layout.addWidget(self.chat_use_mcp_checkbox)
+            models_layout.addWidget(mcp_box)
+
+            mcp_desc = QLabel(
+                "This setting is stored per field and does not depend on model overrides."
+            )
+            mcp_desc.setFont(font_small)
+            models_layout.addRow(mcp_desc)
+
         models_layout.addWidget(self.model_options)
         model_box = QGroupBox("⚙️ Model Settings")
         model_box.setEnabled(True)
@@ -507,7 +530,7 @@ class PromptDialog(QDialog):
         # TODO: could use a refactor
         # Setup the dummy options; only one will be used
         self.tts_options = TTSOptions()
-        self.chat_options = ChatOptions()
+        self.chat_options = ChatOptions(show_mcp_toggle=False)
         self.image_options = ImageOptions()
 
         extras = get_extras(
@@ -536,24 +559,33 @@ class PromptDialog(QDialog):
         elif self.state.s["type"] == "chat":
             if extras and use_custom_model:
                 self.chat_options = ChatOptions(
-                    {
-                        "chat_provider": extras.get("chat_provider"),
-                        "chat_model": extras.get("chat_model"),
-                        "chat_temperature": extras.get("chat_temperature"),
-                        "chat_markdown_to_html": extras.get("chat_markdown_to_html"),
-                    }
+                    cast(
+                        "OverridableChatOptionsDict",
+                        {
+                            "chat_provider": extras.get("chat_provider"),
+                            "chat_model": extras.get("chat_model"),
+                            "chat_temperature": extras.get("chat_temperature"),
+                            "chat_markdown_to_html": extras.get(
+                                "chat_markdown_to_html"
+                            ),
+                        },
+                    ),
+                    show_mcp_toggle=False,
                 )
             return self.chat_options
 
         elif self.state.s["type"] == "image":
             if extras and use_custom_model:
                 self.image_options = ImageOptions(
-                    {
-                        "image_model": extras.get("image_model"),
-                        "image_provider": extras.get("image_provider"),
-                        "image_aspect_ratio": extras.get("image_aspect_ratio"),
-                        "image_resolution": extras.get("image_resolution"),
-                    }
+                    cast(
+                        "OverridableImageOptionsDict",
+                        {
+                            "image_model": extras.get("image_model"),
+                            "image_provider": extras.get("image_provider"),
+                            "image_aspect_ratio": extras.get("image_aspect_ratio"),
+                            "image_resolution": extras.get("image_resolution"),
+                        },
+                    )
                 )
             return self.image_options
 
@@ -574,7 +606,10 @@ class PromptDialog(QDialog):
                     "regenerate_when_batching", False
                 )
                 if extras
-                else False
+                else False,
+                "chat_use_mcp": key_or_config_val(extras, "chat_use_mcp")
+                if self.state.s["type"] == "chat"
+                else False,
             }
         )
 
@@ -795,6 +830,7 @@ class PromptDialog(QDialog):
                         self.chat_options.state.s, "chat_temperature"
                     ),
                     should_convert_to_html=False,  # Don't show HTML here bc it's confusing
+                    use_mcp=self.state.s["chat_use_mcp"],
                 )
 
             run_async_in_background_with_sentry(chat_fn, on_success, on_failure)
@@ -980,6 +1016,7 @@ class PromptDialog(QDialog):
             image_options={
                 k: self.image_options.state.s[k] for k in overridable_image_options
             },
+            chat_use_mcp=s["chat_use_mcp"] if s["type"] == "chat" else None,
             regenerate_when_batching=self.state.s["regenerate_when_batching"],
         )
 

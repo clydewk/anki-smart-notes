@@ -300,6 +300,151 @@ def build_httpx_timeout(
 
 QUEUE_LOG_THRESHOLD_SEC = 0.5
 SLOW_REQUEST_LOG_THRESHOLD_SEC = 5.0
+PROVIDER_ERROR_DETAIL_LOG_LIMIT = 300
+OFFICIAL_PROVIDER_NAMES = {"openai", "anthropic", "deepseek", "google"}
+PROVIDER_TRACE_HEADER_NAMES = (
+    "x-request-id",
+    "request-id",
+    "openai-request-id",
+    "anthropic-request-id",
+    "x-amzn-requestid",
+    "trace-id",
+    "cf-ray",
+)
+
+
+def normalize_log_text(
+    value: str, *, limit: int = PROVIDER_ERROR_DETAIL_LOG_LIMIT
+) -> str:
+    compact = " ".join(value.split())
+    if not compact:
+        return ""
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 3].rstrip()}..."
+
+
+def extract_provider_trace_id(headers: Mapping[str, str] | None) -> str | None:
+    if not headers:
+        return None
+
+    lower_headers = {key.lower(): value for key, value in headers.items()}
+    for header_name in PROVIDER_TRACE_HEADER_NAMES:
+        value = lower_headers.get(header_name)
+        if value:
+            return normalize_log_text(value, limit=120)
+    return None
+
+
+def summarize_provider_error_detail(value: Any) -> str | None:
+    if isinstance(value, str):
+        compact = normalize_log_text(value)
+        return compact or None
+
+    if isinstance(value, list):
+        messages: list[str] = []
+        for item in value[:3]:
+            if isinstance(item, str):
+                compact = normalize_log_text(item, limit=100)
+                if compact:
+                    messages.append(compact)
+                continue
+            if isinstance(item, dict):
+                message = item.get("msg") or item.get("message")
+                if isinstance(message, str):
+                    compact = normalize_log_text(message, limit=100)
+                    if compact:
+                        messages.append(compact)
+        if messages:
+            return "; ".join(messages)
+
+    return None
+
+
+def extract_provider_error_detail(body_text: str) -> str:
+    stripped = body_text.strip()
+    if not stripped:
+        return "empty response body"
+
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return normalize_log_text(stripped)
+
+    if isinstance(payload, dict):
+        nested_error = payload.get("error")
+        if nested_error is not None:
+            detail = extract_provider_error_detail(json.dumps(nested_error))
+            if detail:
+                return detail
+
+        parts: list[str] = []
+        field_map = (
+            ("message", "message"),
+            ("detail", "detail"),
+            ("error_description", "error_description"),
+        )
+        for field_name, label in field_map:
+            detail = summarize_provider_error_detail(payload.get(field_name))
+            if detail:
+                parts.append(f"{label}={detail}")
+
+        for field_name in ("type", "code", "param"):
+            value = payload.get(field_name)
+            if value not in (None, ""):
+                parts.append(f"{field_name}={normalize_log_text(str(value), limit=80)}")
+
+        if parts:
+            return "; ".join(parts)
+
+        keys = ", ".join(sorted(str(key) for key in payload)[:8]) or "none"
+        return f"json error body with keys: {keys}"
+
+    if isinstance(payload, list):
+        detail = summarize_provider_error_detail(payload)
+        if detail:
+            return f"detail={detail}"
+        return f"json error body list(len={len(payload)})"
+
+    return normalize_log_text(str(payload))
+
+
+def format_provider_http_error_for_log(error: ProviderHTTPError) -> str:
+    trace_id = extract_provider_trace_id(error.headers) or "n/a"
+    detail = extract_provider_error_detail(error.body)
+    return f"status={error.status} url={error.url} trace_id={trace_id} detail={detail}"
+
+
+def format_provider_timeout_for_log(error: ProviderTimeoutError) -> str:
+    timeout_display = (
+        f"{error.timeout_sec:.0f}s" if error.timeout_sec is not None else "n/a"
+    )
+    last_event = error.last_event_type or "n/a"
+    return (
+        f"phase={error.phase} timeout={timeout_display} "
+        f"url={error.url} last_event={last_event}"
+    )
+
+
+def is_non_retryable_custom_provider_http_error(
+    provider: str, error: ProviderHTTPError
+) -> bool:
+    if provider in OFFICIAL_PROVIDER_NAMES or error.status < 500:
+        return False
+
+    text = error.body.lower()
+    return (
+        "not implemented" in text
+        or "convert_request_failed" in text
+        or "unsupported" in text
+        or "unknown field" in text
+        or "unexpected field" in text
+        or "schema" in text
+    )
+
+
+def is_non_retryable_custom_provider_timeout(error: ProviderTimeoutError) -> bool:
+    return error.provider not in OFFICIAL_PROVIDER_NAMES and error.phase == "read_idle"
 
 
 class ProviderRuntime:
@@ -696,11 +841,35 @@ class ProviderRuntime:
         max_retries: int,
         error: ProviderHTTPError,
     ) -> bool:
-        if error.status not in {408, 429, 500, 502, 503, 504}:
-            raise error
-
+        retryable = error.status in {408, 429, 500, 502, 503, 504}
         retry_after = parse_retry_after(error.headers)
         reset_after = parse_rate_limit_reset(error.headers)
+
+        if not retryable:
+            self._log_http_error(
+                provider=provider,
+                model=model,
+                attempt=attempt,
+                max_retries=max_retries,
+                error=error,
+                retry_after=retry_after,
+                reset_after=reset_after,
+                will_retry=False,
+            )
+            raise error
+
+        if is_non_retryable_custom_provider_http_error(provider, error):
+            self._log_http_error(
+                provider=provider,
+                model=model,
+                attempt=attempt,
+                max_retries=max_retries,
+                error=error,
+                retry_after=retry_after,
+                reset_after=reset_after,
+                will_retry=False,
+            )
+            raise error
 
         if error.status == 429 and is_daily_quota_error(error.body):
             controller.note_throttle(
@@ -708,8 +877,18 @@ class ProviderRuntime:
                 reset_after_sec=reset_after,
                 shared_capacity=False,
             )
+            self._log_http_error(
+                provider=provider,
+                model=model,
+                attempt=attempt,
+                max_retries=max_retries,
+                error=error,
+                retry_after=retry_after,
+                reset_after=reset_after,
+                will_retry=False,
+            )
             raise ProviderUnavailableError(
-                f"{provider}:{model} quota exhausted: {error.body[:200]}"
+                f"{provider}:{model} quota exhausted: {extract_provider_error_detail(error.body)}"
             ) from error
 
         controller.note_throttle(
@@ -719,10 +898,30 @@ class ProviderRuntime:
         )
 
         if attempt < max_retries:
+            self._log_http_error(
+                provider=provider,
+                model=model,
+                attempt=attempt,
+                max_retries=max_retries,
+                error=error,
+                retry_after=retry_after,
+                reset_after=reset_after,
+                will_retry=True,
+            )
             controller.note_retry()
             await asyncio.sleep(self._retry_delay(attempt, retry_after, reset_after))
             return True
 
+        self._log_http_error(
+            provider=provider,
+            model=model,
+            attempt=attempt,
+            max_retries=max_retries,
+            error=error,
+            retry_after=retry_after,
+            reset_after=reset_after,
+            will_retry=False,
+        )
         raise error
 
     async def _handle_timeout_error(
@@ -735,12 +934,81 @@ class ProviderRuntime:
         allow_retry: bool,
     ) -> bool:
         controller.note_timeout()
-        logger.warning(str(error))
-        if allow_retry and attempt < max_retries:
+        should_retry = (
+            allow_retry
+            and attempt < max_retries
+            and not is_non_retryable_custom_provider_timeout(error)
+        )
+        self._log_timeout_error(
+            attempt=attempt,
+            max_retries=max_retries,
+            error=error,
+            will_retry=should_retry,
+        )
+        if should_retry:
             controller.note_retry()
             await asyncio.sleep(self._retry_delay(attempt, None, None))
             return True
         return False
+
+    def _log_http_error(
+        self,
+        *,
+        provider: str,
+        model: str,
+        attempt: int,
+        max_retries: int,
+        error: ProviderHTTPError,
+        retry_after: float | None,
+        reset_after: float | None,
+        will_retry: bool,
+    ) -> None:
+        retry_after_display = (
+            f"{retry_after:.1f}s" if retry_after is not None else "n/a"
+        )
+        reset_after_display = (
+            f"{reset_after:.1f}s" if reset_after is not None else "n/a"
+        )
+        log_message = (
+            "Provider HTTP error %s:%s attempt=%s/%s retry=%s "
+            "%s retry_after=%s reset_after=%s"
+        )
+        log_args = (
+            provider,
+            model,
+            attempt + 1,
+            max_retries + 1,
+            "yes" if will_retry else "no",
+            format_provider_http_error_for_log(error),
+            retry_after_display,
+            reset_after_display,
+        )
+        if will_retry:
+            logger.warning(log_message, *log_args)
+        else:
+            logger.error(log_message, *log_args)
+
+    def _log_timeout_error(
+        self,
+        *,
+        attempt: int,
+        max_retries: int,
+        error: ProviderTimeoutError,
+        will_retry: bool,
+    ) -> None:
+        log_message = "Provider timeout %s:%s attempt=%s/%s retry=%s %s"
+        log_args = (
+            error.provider,
+            error.model,
+            attempt + 1,
+            max_retries + 1,
+            "yes" if will_retry else "no",
+            format_provider_timeout_for_log(error),
+        )
+        if will_retry:
+            logger.warning(log_message, *log_args)
+        else:
+            logger.error(log_message, *log_args)
 
     @staticmethod
     def _http_error_from_response(response: httpx.Response) -> ProviderHTTPError:

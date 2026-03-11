@@ -24,6 +24,7 @@ from typing import Any, Optional
 from aqt import mw
 from aqt.operations import QueryOp
 
+from .mcp_runtime import mcp_runtime
 from .provider_runtime import provider_runtime
 
 
@@ -43,6 +44,7 @@ def run_async_in_background(
         try:
             return await op()
         finally:
+            await mcp_runtime.close_current_session()
             await provider_runtime.close_current_session()
 
     def run_op(_):

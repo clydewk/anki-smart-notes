@@ -23,12 +23,18 @@ from anki.decks import DeckId
 from anki.notes import Note
 from aqt import mw
 
-from .chat_provider import ChatProvider, chat_provider, prompt_cache_key_for_request
+from .chat_provider import (
+    ChatProvider,
+    TextToolDefinition,
+    chat_provider,
+    prompt_cache_key_for_request,
+)
 from .config import config, key_or_config_val
 from .constants import API_KEY_MISSING_MESSAGE
 from .image_provider import ImageProvider, image_provider
 from .logger import logger
 from .markdown import convert_markdown_to_html
+from .mcp_manager import McpManager
 from .media_utils import convert_image_data, get_media_path
 from .models import (
     DEFAULT_EXTRAS,
@@ -143,6 +149,7 @@ class FieldProcessor:
                 extras, "chat_reasoning_effort"
             )
             should_convert: bool = key_or_config_val(extras, "chat_markdown_to_html")
+            use_mcp: bool = key_or_config_val(extras, "chat_use_mcp")
 
             return await self.get_chat_response(
                 note=note,
@@ -154,6 +161,7 @@ class FieldProcessor:
                 reasoning_effort=chat_reasoning_effort,
                 field_lower=node.field,
                 should_convert_to_html=should_convert,
+                use_mcp=use_mcp,
                 show_error_box=show_error_box,
             )
 
@@ -211,6 +219,7 @@ class FieldProcessor:
         temperature: float,
         should_convert_to_html: bool,
         reasoning_effort: Optional[OpenAIReasoningEffort] = None,
+        use_mcp: bool = False,
         show_error_box: bool = True,
     ) -> Optional[str]:
         interpolated_prompt = interpolate_prompt(prompt, note)
@@ -222,6 +231,34 @@ class FieldProcessor:
         if not self._check_api_key(provider, show_error_box):
             return None
 
+        tools: Optional[list[TextToolDefinition]] = None
+        tool_executor = None
+        if use_mcp:
+            manager = McpManager(config.mcp_servers or [])
+            if not manager.enabled_servers():
+                raise Exception(
+                    "MCP is enabled for this field, but no MCP servers are enabled."
+                )
+
+            exposed_tools, warnings = await manager.build_tool_registry()
+            for warning in warnings:
+                logger.warning("MCP warning: %s", warning)
+
+            if not exposed_tools:
+                raise Exception(
+                    "MCP is enabled for this field, but no MCP tools were available."
+                )
+
+            tools = [
+                TextToolDefinition(
+                    name=tool.exposed_name,
+                    description=tool.description,
+                    input_schema=tool.input_schema,
+                )
+                for tool in exposed_tools
+            ]
+            tool_executor = manager.execute_tool_call
+
         note_type = get_note_type(note)
         cache_seed = f"{provider}:{model}:{note_type}:{deck_id}:{field_lower}:{prompt}"
         resp = await self.chat_provider.async_get_chat_response(
@@ -232,6 +269,8 @@ class FieldProcessor:
             reasoning_effort=reasoning_effort,
             prompt_cache_key=prompt_cache_key_for_request(str(model), cache_seed),
             note_id=note.id,
+            tools=tools,
+            tool_executor=tool_executor,
         )
 
         if resp and should_convert_to_html:

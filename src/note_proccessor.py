@@ -38,7 +38,11 @@ from .logger import logger
 from .nodes import FieldNode
 from .notes import get_note_type
 from .prompts import get_prompts_for_note
-from .provider_runtime import ProviderHTTPError, provider_runtime
+from .provider_runtime import (
+    ProviderHTTPError,
+    format_provider_http_error_for_log,
+    provider_runtime,
+)
 from .sentry import run_async_in_background_with_sentry
 from .ui.ui_utils import show_message_box
 from .utils import run_on_main
@@ -691,7 +695,10 @@ class NoteProcessor:
         # Simplified error handling for BYOK
         if isinstance(e, ProviderHTTPError):
             status = e.status
-            logger.debug(f"Got status: {status}")
+            logger.error(
+                "Processing failed with provider HTTP error: %s",
+                format_provider_http_error_for_log(e),
+            )
 
             error_map = {
                 401: "Smart Notes Error: 401 Unauthorized. Please check your API Key in settings.",

@@ -37,6 +37,7 @@ from .models import (
     ImageOutputFormat,
     ImageProviders,
     ImageResolution,
+    McpServerConfig,
     NoteTypeMap,
     OpenAIModels,
     OpenAIReasoningEffort,
@@ -60,6 +61,7 @@ class Config:
     replicate_api_key: Optional[str]
 
     custom_providers: list[CustomProvider]
+    mcp_servers: list[McpServerConfig]
     provider_settings: dict[str, ProviderSettings]
 
     prompts_map: PromptMap
@@ -78,6 +80,7 @@ class Config:
     chat_temperature: int
     chat_reasoning_effort: Optional[OpenAIReasoningEffort]
     chat_markdown_to_html: bool
+    chat_use_mcp: bool
 
     # TTS
     tts_provider: TTSProviders

@@ -186,6 +186,7 @@ class FieldExtras(TypedDict):
     chat_temperature: Optional[int]
     chat_reasoning_effort: Optional[OpenAIReasoningEffort]
     chat_markdown_to_html: Optional[bool]
+    chat_use_mcp: Optional[bool]
 
     # TTS
     tts_provider: Optional[TTSProviders]
@@ -215,6 +216,7 @@ DEFAULT_EXTRAS: FieldExtras = {
     "chat_provider": None,
     "chat_temperature": None,
     "chat_reasoning_effort": None,
+    "chat_use_mcp": None,
     # Overridable TTS Options
     "tts_model": None,
     "tts_provider": None,
@@ -266,6 +268,29 @@ class OverridableChatOptionsDict(TypedDict):
     chat_temperature: Optional[int]
     chat_reasoning_effort: Optional[OpenAIReasoningEffort]
     chat_markdown_to_html: Optional[bool]
+
+
+McpServerTransport = Literal["stdio", "streamable_http"]
+
+
+class McpKeyValuePair(TypedDict):
+    key: str
+    value: str
+
+
+class McpServerConfig(TypedDict):
+    id: str
+    name: str
+    enabled: bool
+    transport: McpServerTransport
+    command: str
+    args: list[str]
+    env: list[McpKeyValuePair]
+    env_passthrough: list[str]
+    cwd: str
+    url: str
+    headers: list[McpKeyValuePair]
+    header_env_vars: list[McpKeyValuePair]
 
 
 OverridableTTSOptions = Union[

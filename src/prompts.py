@@ -169,6 +169,7 @@ def add_or_update_prompts(
     tts_options: OverrideableTTSOptionsDict,
     chat_options: dict[OverridableChatOptions, Any],
     image_options: dict[OverridableImageOptions, Any],
+    chat_use_mcp: Optional[bool],
     regenerate_when_batching: bool,
 ) -> PromptMap:
     new_prompts_map = deepcopy(prompts_map)
@@ -204,6 +205,7 @@ def add_or_update_prompts(
     extras["type"] = type
     extras["automatic"] = is_automatic
     extras["use_custom_model"] = is_custom_model
+    extras["chat_use_mcp"] = chat_use_mcp if type == "chat" else None
 
     # If we're doing custom settings, write out extra config
     if is_custom_model:

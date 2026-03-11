@@ -17,11 +17,19 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 import pytest
 
 from tests.mocks import MockConfig, MockNote
+
+if TYPE_CHECKING:
+    from src.models import (
+        OverridableChatOptionsDict,
+        OverridableImageOptionsDict,
+        OverrideableTTSOptionsDict,
+        PromptMap,
+    )
 
 
 def setup_prompts_config(
@@ -132,3 +140,37 @@ def test_interpolate_prompt(
 
     note = MockNote(note_type="Basic", data=note_data)
     assert interpolate_prompt(prompt, note) == expected
+
+
+def test_add_or_update_prompts_persists_chat_use_mcp() -> None:
+    from src.prompts import add_or_update_prompts
+
+    prompts_map = cast("PromptMap", {"note_types": {}})
+
+    updated = add_or_update_prompts(
+        prompts_map=prompts_map,
+        note_type="Basic",
+        deck_id=1,
+        field="Back",
+        prompt="Use {{Front}}",
+        is_automatic=True,
+        is_custom_model=False,
+        type="chat",
+        tts_options=cast(
+            "OverrideableTTSOptionsDict",
+            {
+                "tts_model": None,
+                "tts_provider": None,
+                "tts_voice": None,
+                "tts_strip_html": None,
+                "tts_style": None,
+            },
+        ),
+        chat_options=cast("OverridableChatOptionsDict", {}),
+        image_options=cast("OverridableImageOptionsDict", {}),
+        chat_use_mcp=True,
+        regenerate_when_batching=False,
+    )
+
+    extras = updated["note_types"]["Basic"]["1"]["extras"]["Back"]
+    assert extras["chat_use_mcp"] is True
