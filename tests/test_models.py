@@ -759,17 +759,18 @@ async def test_openai_responses_tool_loop_uses_reasoning_timeout_budget(
         ),
     )
 
-    async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+    async def fake_stream_sse_json(**kwargs: Any):
         captured["timeouts"] = kwargs["timeouts"]
-        return {
-            "id": "resp_1",
-            "output_text": "tool-backed answer",
-            "usage": {"output_tokens": 3},
-        }
+        yield response_created_event("resp_1")
+        yield response_completed_event(
+            "resp_1",
+            text="tool-backed answer",
+            usage={"output_tokens": 3},
+        )
 
     monkeypatch.setattr(
-        "src.chat_provider.provider_runtime.request_json",
-        fake_request_json,
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        fake_stream_sse_json,
     )
 
     async def tool_executor(_: str, __: dict[str, Any]) -> str:
@@ -794,7 +795,8 @@ async def test_openai_responses_tool_loop_uses_reasoning_timeout_budget(
     )
 
     assert result.text == "tool-backed answer"
-    assert captured["timeouts"].sock_read_timeout_sec == 90.0
+    assert captured["timeouts"].first_event_timeout_sec == 90.0
+    assert captured["timeouts"].stream_idle_timeout_sec == 90.0
 
 
 @pytest.mark.asyncio
