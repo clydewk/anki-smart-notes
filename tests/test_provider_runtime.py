@@ -143,6 +143,31 @@ async def test_provider_runtime_closes_current_loop_session() -> None:
     assert not runtime.has_loop_client(loop)
 
 
+def test_provider_runtime_scopes_controllers_per_event_loop() -> None:
+    runtime = ProviderRuntime()
+
+    async def exercise_controller() -> TrafficController:
+        controller = runtime.controller("text:openai:gpt-5.4", initial_window=1)
+        assert controller is runtime.controller("text:openai:gpt-5.4", initial_window=1)
+
+        await controller.acquire()
+        waiter = asyncio.create_task(controller.acquire())
+        await asyncio.sleep(0)
+        await controller.release()
+        await waiter
+        await controller.release()
+
+        assert "text:openai:gpt-5.4" in runtime.get_metrics_summary()
+
+        await runtime.close_current_session()
+        return controller
+
+    first_controller = asyncio.run(exercise_controller())
+    second_controller = asyncio.run(exercise_controller())
+
+    assert first_controller is not second_controller
+
+
 @pytest.mark.asyncio
 async def test_stream_idle_timeout_reports_last_event_type(
     monkeypatch: pytest.MonkeyPatch,

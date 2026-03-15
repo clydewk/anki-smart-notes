@@ -449,7 +449,9 @@ def is_non_retryable_custom_provider_timeout(error: ProviderTimeoutError) -> boo
 
 class ProviderRuntime:
     def __init__(self) -> None:
-        self._controllers: dict[str, TrafficController] = {}
+        self._controllers: dict[
+            asyncio.AbstractEventLoop, dict[str, TrafficController]
+        ] = {}
         self._clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
 
     async def get_http_client(self) -> httpx.AsyncClient:
@@ -462,14 +464,17 @@ class ProviderRuntime:
 
     async def close_current_session(self) -> None:
         loop = asyncio.get_running_loop()
+        self._controllers.pop(loop, None)
         client = self._clients.pop(loop, None)
         if client is not None and not client.is_closed:
             await client.aclose()
 
     def controller(self, key: str, initial_window: int) -> TrafficController:
-        if key not in self._controllers:
-            self._controllers[key] = TrafficController(initial_window)
-        return self._controllers[key]
+        loop = asyncio.get_running_loop()
+        loop_controllers = self._controllers.setdefault(loop, {})
+        if key not in loop_controllers:
+            loop_controllers[key] = TrafficController(initial_window)
+        return loop_controllers[key]
 
     async def request_json(
         self,
@@ -772,8 +777,10 @@ class ProviderRuntime:
         raise RuntimeError("unreachable")
 
     def get_metrics_summary(self) -> dict[str, dict[str, float]]:
+        loop = asyncio.get_running_loop()
+        loop_controllers = self._controllers.get(loop, {})
         return {
-            key: controller.snapshot() for key, controller in self._controllers.items()
+            key: controller.snapshot() for key, controller in loop_controllers.items()
         }
 
     def _log_request_timing(
