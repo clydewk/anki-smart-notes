@@ -127,6 +127,51 @@ def test_prompt_usage_lookup_resets_when_signature_changes(tmp_path) -> None:
     assert changed_snapshot is None
 
 
+def test_global_prompt_usage_lookup_aggregates_matching_decks(tmp_path) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
+    signature = build_prompt_usage_signature(
+        prompt="Question: {{Front}}",
+        provider="openai",
+        model="gpt-5.4",
+        reasoning_effort=None,
+        use_tools=False,
+    )
+
+    for deck_id, input_tokens, output_tokens in ((1, 10, 5), (2, 14, 9)):
+        tracker.finalize_request(
+            provider="openai",
+            model="gpt-5.4",
+            reasoning_effort=None,
+            use_tools=False,
+            prompt_chars=20,
+            raw_usage={
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
+            prompt_key=build_prompt_usage_key("Basic", deck_id, "Front"),
+            prompt_signature=signature,
+        )
+
+    exact_snapshot = tracker.get_prompt_usage(
+        note_type="Basic",
+        deck_id=0,
+        field_lower="Front",
+        signature=signature,
+    )
+    assert exact_snapshot is None
+
+    aggregate_snapshot = tracker.get_prompt_usage_across_decks(
+        note_type="Basic",
+        field_lower="Front",
+        signature=signature,
+    )
+    assert aggregate_snapshot is not None
+    assert aggregate_snapshot.run_count == 2
+    assert aggregate_snapshot.avg_input_tokens == 12
+    assert aggregate_snapshot.avg_output_tokens == 7
+    assert aggregate_snapshot.avg_total_tokens == 19
+
+
 def test_openai_daily_usage_resets_on_utc_rollover(tmp_path) -> None:
     clock = Clock(datetime(2026, 3, 22, 23, 59, tzinfo=timezone.utc))
     tracker = ChatUsageTracker(

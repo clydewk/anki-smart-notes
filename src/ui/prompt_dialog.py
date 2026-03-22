@@ -821,12 +821,19 @@ class PromptDialog(QDialog):
             return
 
         current_signature = self.get_current_prompt_signature()
+        selected_deck_id = int(self.state.s["selected_deck"])
         snapshot = chat_usage_tracker.get_prompt_usage(
             note_type=self.state.s["selected_note_type"],
-            deck_id=int(self.state.s["selected_deck"]),
+            deck_id=selected_deck_id,
             field_lower=self.state.s["selected_note_field"].lower(),
             signature=current_signature,
         )
+        if snapshot is None and selected_deck_id == GLOBAL_DECK_ID:
+            snapshot = chat_usage_tracker.get_prompt_usage_across_decks(
+                note_type=self.state.s["selected_note_type"],
+                field_lower=self.state.s["selected_note_field"].lower(),
+                signature=current_signature,
+            )
         saved_signature = self.get_saved_prompt_signature()
 
         lines: list[str] = []

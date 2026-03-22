@@ -343,6 +343,34 @@ class ChatUsageTracker:
 
             return self.snapshot_for_stats(prompt_stats)
 
+    def get_prompt_usage_across_decks(
+        self,
+        *,
+        note_type: str,
+        field_lower: str,
+        signature: str,
+    ) -> PromptUsageStatsSnapshot | None:
+        with self._lock:
+            self.ensure_loaded_locked()
+            prefix = f"{note_type}\t"
+            suffix = f"\t{field_lower.lower()}"
+            aggregate: StoredUsageStats | None = None
+
+            for prompt_key, prompt_stats in self._state["prompt_stats"].items():
+                if not prompt_key.startswith(prefix) or not prompt_key.endswith(suffix):
+                    continue
+                if prompt_stats["signature"] != signature:
+                    continue
+                if aggregate is None:
+                    aggregate = self.new_usage_stats()
+                aggregate["run_count"] += prompt_stats["run_count"]
+                aggregate["total_input_tokens"] += prompt_stats["total_input_tokens"]
+                aggregate["total_output_tokens"] += prompt_stats["total_output_tokens"]
+                aggregate["total_tokens"] += prompt_stats["total_tokens"]
+                aggregate["total_prompt_chars"] += prompt_stats["total_prompt_chars"]
+
+            return self.snapshot_for_stats(aggregate) if aggregate else None
+
     def get_openai_daily_usage(self) -> OpenAIDailyUsageSnapshot:
         with self._lock:
             self.ensure_loaded_locked()
