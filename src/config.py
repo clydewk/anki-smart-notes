@@ -76,6 +76,8 @@ class Config:
     allow_empty_fields: bool
     last_message_id: int
     debug: bool
+    openai_daily_token_budget_enabled: bool
+    openai_daily_token_budget: int
 
     # Chat
     chat_provider: ChatProviders
@@ -195,6 +197,12 @@ class Config:
                 if isinstance(legacy_chat_use_mcp, bool)
                 else False
             )
+
+        if not isinstance(self.__getattr__("openai_daily_token_budget_enabled"), bool):
+            self.openai_daily_token_budget_enabled = False
+
+        if not isinstance(self.__getattr__("openai_daily_token_budget"), int):
+            self.openai_daily_token_budget = 1_000_000
 
         self.built_in_tools = normalize_built_in_tools_config(
             cast("Optional[dict[str, Any]]", self.built_in_tools)

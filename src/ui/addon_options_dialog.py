@@ -74,6 +74,7 @@ from .mcp_server_dialog import MCP_DOCS_URL, McpServerDialog
 from .prompt_dialog import PromptDialog
 from .reactive_check_box import ReactiveCheckBox
 from .reactive_line_edit import ReactiveLineEdit
+from .reactive_spin_box import ReactiveSpinBox
 from .state_manager import StateManager
 from .tts_options import TTSOptions
 from .ui_utils import (
@@ -155,6 +156,8 @@ class State(TypedDict):
     openai_endpoint: Optional[str]
     allow_empty_fields: bool
     debug: bool
+    openai_daily_token_budget_enabled: bool
+    openai_daily_token_budget: int
 
     # API Keys
     openai_api_key: Optional[str]
@@ -403,6 +406,33 @@ class AddonOptionsDialog(QDialog):
         group_box = QGroupBox("API Configuration")
         group_box.setLayout(form)
         layout.addWidget(group_box)
+
+        budget_box = QGroupBox("OpenAI Daily Token Budget")
+        budget_form = default_form_layout()
+
+        self.openai_budget_enabled_checkbox = ReactiveCheckBox(
+            self.state, "openai_daily_token_budget_enabled"
+        )
+        budget_form.addRow(
+            "Enable local budget guard:", self.openai_budget_enabled_checkbox
+        )
+
+        self.openai_budget_spinbox = ReactiveSpinBox(
+            self.state, "openai_daily_token_budget"
+        )
+        self.openai_budget_spinbox.setRange(1, 1_000_000_000)
+        self.openai_budget_spinbox.setSingleStep(10_000)
+        budget_form.addRow("Daily token budget:", self.openai_budget_spinbox)
+
+        budget_description = QLabel(
+            "Tracks observed OpenAI chat usage locally, reserves estimates before each request, and resets at 00:00 UTC. Use this to stay inside your complimentary token budget."
+        )
+        budget_description.setWordWrap(True)
+        budget_description.setFont(font_small)
+        budget_form.addRow(budget_description)
+
+        budget_box.setLayout(budget_form)
+        layout.addWidget(budget_box)
 
         # Custom Providers
         custom_box = QGroupBox("Custom Providers")
@@ -878,6 +908,10 @@ class AddonOptionsDialog(QDialog):
 
     def render_ui(self) -> None:
         self.render_table()
+        if hasattr(self, "openai_budget_spinbox"):
+            self.openai_budget_spinbox.setEnabled(
+                self.state.s["openai_daily_token_budget_enabled"]
+            )
         if hasattr(self, "built_in_tool_checkboxes"):
             for tool_id, checkbox in self.built_in_tool_checkboxes.items():
                 checkbox.blockSignals(True)
@@ -1283,6 +1317,12 @@ class AddonOptionsDialog(QDialog):
             "generate_at_review": config.generate_at_review,
             "regenerate_notes_when_batching": config.regenerate_notes_when_batching,
             "openai_endpoint": config.openai_endpoint,
+            "openai_daily_token_budget_enabled": bool(
+                config.openai_daily_token_budget_enabled
+            ),
+            "openai_daily_token_budget": int(
+                config.openai_daily_token_budget or 1_000_000
+            ),
             "allow_empty_fields": config.allow_empty_fields,
             "debug": config.debug,
             "custom_providers": config.custom_providers or [],

@@ -48,6 +48,8 @@ class MockConfig:
     google_api_key: str = ""
     elevenlabs_api_key: str = ""
     replicate_api_key: str = ""
+    openai_daily_token_budget_enabled: bool = False
+    openai_daily_token_budget: int = 1_000_000
     custom_providers: Any = None
     mcp_servers: Any = None
     built_in_tools: Any = None

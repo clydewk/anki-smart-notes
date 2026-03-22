@@ -29,6 +29,7 @@ from aqt import QAction, QMenu, browser, editor, gui_hooks, mw
 from aqt.addcards import AddCards
 from aqt.browser.sidebar.item import SidebarItemType
 
+from .chat_usage import chat_usage_tracker, format_token_count
 from .config import bump_usage_counter, config
 from .decks import deck_id_to_name_map
 from .logger import logger, setup_logger
@@ -185,6 +186,7 @@ def make_on_batch_success(
         updated_fields = stats.updated_fields
         error_details = stats.error_details
         field_error_details = stats.field_error_details
+        chat_usage_summary = stats.chat_usage_summary
 
         browser.on_all_or_selected_rows_changed()
 
@@ -215,6 +217,12 @@ def make_on_batch_success(
             debug_parts.append(f"Failed: {len(errors)}")
             debug_parts.append(f"Blocked By Field Failures: {len(blocked)}")
             debug_parts.append(f"No Updates: {len(no_updates)}")
+            if chat_usage_summary.request_count:
+                debug_parts.append(
+                    "Chat tokens: "
+                    f"{format_token_count(chat_usage_summary.total_tokens)} across "
+                    f"{chat_usage_summary.request_count} requests"
+                )
 
             if updated_fields:
                 field_list = ", ".join(sorted(updated_fields))
@@ -282,6 +290,28 @@ def make_on_batch_success(
 
             if was_cancelled:
                 parts.append("Batch processing cancelled")
+
+            if chat_usage_summary.request_count:
+                token_line = (
+                    f"Chat tokens: {format_token_count(chat_usage_summary.total_tokens)} "
+                    f"across {chat_usage_summary.request_count} request"
+                    f"{'s' if chat_usage_summary.request_count != 1 else ''}"
+                )
+                if len(chat_usage_summary.providers) > 1:
+                    provider_bits = ", ".join(
+                        f"{summary.provider}: {format_token_count(summary.total_tokens)}"
+                        for summary in chat_usage_summary.providers
+                    )
+                    token_line += f" ({provider_bits})"
+
+                if config.openai_daily_token_budget_enabled:
+                    daily_usage = chat_usage_tracker.get_openai_daily_usage()
+                    token_line += (
+                        f". OpenAI today: {format_token_count(daily_usage.used_total_tokens)}"
+                        f" / {format_token_count(config.openai_daily_token_budget)}"
+                    )
+
+                parts.append(token_line)
 
             show_message_box(
                 (". ".join(parts) + ".") if parts else "No notes were processed.",

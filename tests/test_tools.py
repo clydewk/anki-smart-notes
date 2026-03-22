@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.built_in_tools import BuiltInToolContext, BuiltInToolProvider
+from src.chat_provider import TextGenerationResult
 from src.config import Config
 from src.constants import GLOBAL_DECK_ID
 from src.field_processor import FieldProcessor
@@ -592,10 +593,12 @@ async def test_field_processor_does_not_register_tools_when_disabled(
     captured: dict[str, Any] = {}
 
     class FakeChatProvider:
-        async def async_get_chat_response(self, prompt: str, **kwargs: Any) -> str:
+        async def async_get_chat_response_result(
+            self, prompt: str, **kwargs: Any
+        ) -> TextGenerationResult:
             captured["prompt"] = prompt
             captured.update(kwargs)
-            return "ok"
+            return TextGenerationResult(text="ok", response_id=None, usage=None)
 
     monkeypatch.setattr(
         "src.field_processor.interpolate_prompt", lambda prompt, note: prompt

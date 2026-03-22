@@ -480,6 +480,33 @@ class ChatProvider:
         tools: list[TextToolDefinition] | None = None,
         tool_executor: ToolExecutor | None = None,
     ) -> str:
+        result = await self.async_get_chat_response_result(
+            prompt=prompt,
+            model=model,
+            provider=provider,
+            note_id=note_id,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            prompt_cache_key=prompt_cache_key,
+            retry_count=retry_count,
+            tools=tools,
+            tool_executor=tool_executor,
+        )
+        return result.text
+
+    async def async_get_chat_response_result(
+        self,
+        prompt: str,
+        model: ChatModels,
+        provider: ChatProviders,
+        note_id: int,
+        temperature: float = DEFAULT_TEMPERATURE,
+        reasoning_effort: OpenAIReasoningEffort | None = None,
+        prompt_cache_key: str | None = None,
+        retry_count: int = 0,
+        tools: list[TextToolDefinition] | None = None,
+        tool_executor: ToolExecutor | None = None,
+    ) -> TextGenerationResult:
         del note_id, retry_count
         request = TextGenerationRequest(
             prompt=prompt,
@@ -492,8 +519,7 @@ class ChatProvider:
             ),
             tools=tools,
         )
-        result = await self.generate_text(request, tool_executor=tool_executor)
-        return result.text
+        return await self.generate_text(request, tool_executor=tool_executor)
 
     async def generate_text(
         self,

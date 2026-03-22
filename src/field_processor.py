@@ -17,6 +17,7 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+from dataclasses import dataclass
 from typing import Optional, Union
 
 from anki.decks import DeckId
@@ -29,6 +30,13 @@ from .chat_provider import (
     TextToolDefinition,
     chat_provider,
     prompt_cache_key_for_request,
+)
+from .chat_usage import (
+    OpenAITokenBudgetExceededError,
+    OpenAIUsageReservation,
+    build_prompt_usage_key,
+    build_prompt_usage_signature,
+    chat_usage_tracker,
 )
 from .config import config, key_or_config_val
 from .constants import API_KEY_MISSING_MESSAGE
@@ -62,6 +70,12 @@ from .ui.ui_utils import show_message_box
 from .utils import run_on_main
 
 
+@dataclass(frozen=True)
+class PromptUsageContext:
+    prompt_key: str
+    signature: str
+
+
 class FieldProcessor:
     def __init__(
         self,
@@ -74,15 +88,20 @@ class FieldProcessor:
         self.image_provider = image_provider
 
     async def resolve(
-        self, node: FieldNode, note: Note, show_error_box: bool = False
+        self,
+        node: FieldNode,
+        note: Note,
+        show_error_box: bool = False,
+        usage_scope_id: str | None = None,
     ) -> Optional[str]:
         # Only show error box if we're running on the target node
         input = node.input
         field_type: SmartFieldType = node.field_type
+        note_type = get_note_type(note)
 
         extras = (
             get_extras(
-                note_type=get_note_type(note),
+                note_type=note_type,
                 field=node.field,
                 deck_id=node.deck_id,
                 fallback_to_global_deck=True,
@@ -152,6 +171,20 @@ class FieldProcessor:
             )
             should_convert: bool = key_or_config_val(extras, "chat_markdown_to_html")
             use_tools: bool = key_or_config_val(extras, "chat_use_tools")
+            prompt_usage_context = PromptUsageContext(
+                prompt_key=build_prompt_usage_key(
+                    note_type=note_type,
+                    deck_id=int(node.deck_id),
+                    field_lower=node.field,
+                ),
+                signature=build_prompt_usage_signature(
+                    prompt=input,
+                    provider=str(chat_provider),
+                    model=str(chat_model),
+                    reasoning_effort=chat_reasoning_effort,
+                    use_tools=use_tools,
+                ),
+            )
 
             return await self.get_chat_response(
                 note=note,
@@ -165,6 +198,8 @@ class FieldProcessor:
                 should_convert_to_html=should_convert,
                 use_tools=use_tools,
                 show_error_box=show_error_box,
+                prompt_usage_context=prompt_usage_context,
+                usage_scope_id=usage_scope_id,
             )
 
         elif field_type == "image":
@@ -223,6 +258,8 @@ class FieldProcessor:
         reasoning_effort: Optional[OpenAIReasoningEffort] = None,
         use_tools: bool = False,
         show_error_box: bool = True,
+        prompt_usage_context: PromptUsageContext | None = None,
+        usage_scope_id: str | None = None,
     ) -> Optional[str]:
         interpolated_prompt = interpolate_prompt(prompt, note)
 
@@ -260,22 +297,69 @@ class FieldProcessor:
             tool_executor = registry.execute_tool_call
 
         cache_seed = f"{provider}:{model}:{note_type}:{deck_id}:{field_lower}:{prompt}"
-        resp = await self.chat_provider.async_get_chat_response(
-            interpolated_prompt,
-            model=model,
-            provider=provider,
-            temperature=temperature,
+        prompt_chars = len(interpolated_prompt)
+        reservation: OpenAIUsageReservation | None = None
+
+        try:
+            reservation = chat_usage_tracker.reserve_openai_budget(
+                provider=str(provider),
+                model=str(model),
+                reasoning_effort=reasoning_effort,
+                use_tools=use_tools,
+                prompt_chars=prompt_chars,
+                budget_enabled=bool(config.openai_daily_token_budget_enabled),
+                budget_limit=int(config.openai_daily_token_budget or 1_000_000),
+                prompt_key=(
+                    prompt_usage_context.prompt_key if prompt_usage_context else None
+                ),
+                prompt_signature=(
+                    prompt_usage_context.signature if prompt_usage_context else None
+                ),
+            )
+        except OpenAITokenBudgetExceededError as error:
+            if show_error_box:
+                run_on_main(lambda msg=str(error): show_message_box(msg))
+                return None
+            raise
+
+        try:
+            provider_result = await self.chat_provider.async_get_chat_response_result(
+                interpolated_prompt,
+                model=model,
+                provider=provider,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                prompt_cache_key=prompt_cache_key_for_request(str(model), cache_seed),
+                note_id=note.id,
+                tools=tools,
+                tool_executor=tool_executor,
+            )
+        except Exception:
+            chat_usage_tracker.release_reservation(reservation)
+            raise
+
+        chat_usage_tracker.finalize_request(
+            provider=str(provider),
+            model=str(model),
             reasoning_effort=reasoning_effort,
-            prompt_cache_key=prompt_cache_key_for_request(str(model), cache_seed),
-            note_id=note.id,
-            tools=tools,
-            tool_executor=tool_executor,
+            use_tools=use_tools,
+            prompt_chars=prompt_chars,
+            raw_usage=provider_result.usage,
+            reservation=reservation,
+            scope_id=usage_scope_id,
+            prompt_key=prompt_usage_context.prompt_key
+            if prompt_usage_context
+            else None,
+            prompt_signature=(
+                prompt_usage_context.signature if prompt_usage_context else None
+            ),
         )
 
-        if resp and should_convert_to_html:
-            resp = convert_markdown_to_html(resp)
+        response_text = provider_result.text
+        if response_text and should_convert_to_html:
+            response_text = convert_markdown_to_html(response_text)
 
-        return resp
+        return response_text
 
     async def get_tts_response(
         self,

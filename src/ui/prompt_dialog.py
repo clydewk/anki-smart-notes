@@ -44,10 +44,17 @@ from aqt import (
 )
 from aqt.qt import QCursor
 
+from ..chat_usage import (
+    build_prompt_usage_key,
+    build_prompt_usage_signature,
+    chat_usage_tracker,
+    format_token_count,
+)
 from ..config import config, key_or_config_val
 from ..constants import API_KEY_MISSING_MESSAGE, GLOBAL_DECK_ID
 from ..dag import prompt_has_error
 from ..decks import deck_id_to_name_map, get_all_deck_ids
+from ..field_processor import PromptUsageContext
 from ..logger import logger
 from ..models import (
     DEFAULT_EXTRAS,
@@ -151,6 +158,7 @@ class PromptDialog(QDialog):
     tts_options: TTSOptions
     mode: Literal["new", "edit"]
     field_type: SmartFieldType
+    token_usage_label: QLabel
 
     def __init__(
         self,
@@ -261,6 +269,8 @@ class PromptDialog(QDialog):
     def render_ui(self) -> None:
         self.render_buttons()
         self.render_automatic_button()
+        if hasattr(self, "token_usage_label"):
+            self.render_token_usage()
 
     def render_main_tab(self) -> QWidget:
         layout = QVBoxLayout()
@@ -504,6 +514,15 @@ class PromptDialog(QDialog):
             tools_desc.setFont(font_small)
             models_layout.addRow(tools_desc)
 
+            token_group = QGroupBox("Token Usage")
+            token_layout = QVBoxLayout()
+            self.token_usage_label = QLabel()
+            self.token_usage_label.setWordWrap(True)
+            self.token_usage_label.setFont(font_small)
+            token_layout.addWidget(self.token_usage_label)
+            token_group.setLayout(token_layout)
+            models_layout.addRow(token_group)
+
         models_layout.addWidget(self.model_options)
         model_box = QGroupBox("⚙️ Model Settings")
         model_box.setEnabled(True)
@@ -556,6 +575,7 @@ class PromptDialog(QDialog):
                         "tts_style": extras.get("tts_style"),
                     }
                 )
+            self.tts_options.state.state_changed.connect(self.on_state_update)
             return self.tts_options
 
         elif self.state.s["type"] == "chat":
@@ -567,6 +587,9 @@ class PromptDialog(QDialog):
                             "chat_provider": extras.get("chat_provider"),
                             "chat_model": extras.get("chat_model"),
                             "chat_temperature": extras.get("chat_temperature"),
+                            "chat_reasoning_effort": extras.get(
+                                "chat_reasoning_effort"
+                            ),
                             "chat_markdown_to_html": extras.get(
                                 "chat_markdown_to_html"
                             ),
@@ -574,6 +597,7 @@ class PromptDialog(QDialog):
                     ),
                     show_tools_toggle=False,
                 )
+            self.chat_options.state.state_changed.connect(self.on_state_update)
             return self.chat_options
 
         elif self.state.s["type"] == "image":
@@ -589,6 +613,7 @@ class PromptDialog(QDialog):
                         },
                     )
                 )
+            self.image_options.state.state_changed.connect(self.on_state_update)
             return self.image_options
 
         # Should never get here
@@ -617,6 +642,8 @@ class PromptDialog(QDialog):
 
     def on_state_update(self):
         self.model_options.setEnabled(self.state.s["use_custom_model"])
+        if hasattr(self, "token_usage_label"):
+            self.render_token_usage()
 
     def _get_note_types(self, deck_id: DeckId) -> list[str]:
         """Returns note types for which there are valid target fields remaining"""
@@ -703,6 +730,133 @@ class PromptDialog(QDialog):
         else:
             self.test_button.setText("Test With Random Note✨")
 
+    def get_current_chat_settings(self) -> tuple[str, str, Optional[str], bool]:
+        use_custom_model = self.state.s["use_custom_model"]
+        provider = key_or_config_val(
+            self.chat_options.state.s if use_custom_model else None,
+            "chat_provider",
+        )
+        model = key_or_config_val(
+            self.chat_options.state.s if use_custom_model else None,
+            "chat_model",
+        )
+        reasoning_effort = key_or_config_val(
+            self.chat_options.state.s if use_custom_model else None,
+            "chat_reasoning_effort",
+        )
+        use_tools = self.state.s["chat_use_tools"]
+        return str(provider), str(model), reasoning_effort, use_tools
+
+    def get_current_prompt_signature(self) -> str:
+        provider, model, reasoning_effort, use_tools = self.get_current_chat_settings()
+        return build_prompt_usage_signature(
+            prompt=self.state.s["prompt"],
+            provider=provider,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            use_tools=use_tools,
+        )
+
+    def get_saved_prompt_signature(self) -> Optional[str]:
+        if self.mode != "edit" or self.state.s["type"] != "chat":
+            return None
+
+        note_type = self.state.s["selected_note_type"]
+        deck_id = self.state.s["selected_deck"]
+        field = self.state.s["selected_note_field"]
+        prompts_for_note = get_prompts_for_note(
+            note_type=note_type,
+            deck_id=deck_id,
+            override_prompts_map=self.prompts_map,
+            fallback_to_global_deck=False,
+        )
+        saved_prompt = prompts_for_note.get(field) if prompts_for_note else None
+        if not saved_prompt:
+            return None
+
+        saved_extras = (
+            get_extras(
+                note_type=note_type,
+                field=field,
+                deck_id=deck_id,
+                prompts=self.prompts_map,
+                fallback_to_global_deck=False,
+            )
+            or DEFAULT_EXTRAS
+        )
+        saved_provider = key_or_config_val(saved_extras, "chat_provider")
+        saved_model = key_or_config_val(saved_extras, "chat_model")
+        saved_reasoning_effort = key_or_config_val(
+            saved_extras, "chat_reasoning_effort"
+        )
+        saved_use_tools = key_or_config_val(saved_extras, "chat_use_tools")
+
+        return build_prompt_usage_signature(
+            prompt=saved_prompt,
+            provider=str(saved_provider),
+            model=str(saved_model),
+            reasoning_effort=saved_reasoning_effort,
+            use_tools=bool(saved_use_tools),
+        )
+
+    def build_saved_prompt_usage_context(self) -> Optional[PromptUsageContext]:
+        saved_signature = self.get_saved_prompt_signature()
+        if (
+            not saved_signature
+            or self.get_current_prompt_signature() != saved_signature
+        ):
+            return None
+
+        return PromptUsageContext(
+            prompt_key=build_prompt_usage_key(
+                note_type=self.state.s["selected_note_type"],
+                deck_id=int(self.state.s["selected_deck"]),
+                field_lower=self.state.s["selected_note_field"].lower(),
+            ),
+            signature=saved_signature,
+        )
+
+    def render_token_usage(self) -> None:
+        if self.state.s["type"] != "chat":
+            return
+
+        current_signature = self.get_current_prompt_signature()
+        snapshot = chat_usage_tracker.get_prompt_usage(
+            note_type=self.state.s["selected_note_type"],
+            deck_id=int(self.state.s["selected_deck"]),
+            field_lower=self.state.s["selected_note_field"].lower(),
+            signature=current_signature,
+        )
+        saved_signature = self.get_saved_prompt_signature()
+
+        lines: list[str] = []
+        if snapshot is not None:
+            lines.extend(
+                [
+                    f"Average: {format_token_count(round(snapshot.avg_total_tokens))} total tokens/run",
+                    f"Input: {format_token_count(round(snapshot.avg_input_tokens))} avg",
+                    f"Output: {format_token_count(round(snapshot.avg_output_tokens))} avg",
+                    f"Runs: {snapshot.run_count}",
+                ]
+            )
+        elif saved_signature and saved_signature != current_signature:
+            lines.append("Stats will reset when this prompt is saved.")
+        else:
+            lines.append(
+                "No token usage yet. Stats appear after a successful chat response that reports usage."
+            )
+
+        provider, _, _, _ = self.get_current_chat_settings()
+        if provider == "openai" and config.openai_daily_token_budget_enabled:
+            daily_usage = chat_usage_tracker.get_openai_daily_usage()
+            lines.append(
+                f"Today: {format_token_count(daily_usage.used_total_tokens)} / "
+                f"{format_token_count(config.openai_daily_token_budget)}"
+            )
+            lines.append("Resets: 00:00 UTC")
+
+        self.token_usage_label.setText("\n".join(lines))
+
     def on_test(self) -> None:
         prompt = self.state.s["prompt"]
 
@@ -776,7 +930,7 @@ class PromptDialog(QDialog):
 
         self.state["is_loading_prompt"] = True
 
-        def on_success(arg: Union[str, bytes, None]):
+        def on_success(arg: Union[bytes, None]):
             prompt = self.state.s["prompt"]
             if not prompt:
                 return
@@ -792,13 +946,7 @@ class PromptDialog(QDialog):
             stringified_vals = "\n".join([f"{k}: {v}" for k, v in field_map.items()])
             self.state["is_loading_prompt"] = False
             field_type = self.state.s["type"]
-            if field_type == "chat":
-                if arg is None:
-                    msg = f"Ran with fields: \n{stringified_vals}.\n Model: {chat_model}\n\n Response: No response received"
-                else:
-                    msg = f"Ran with fields: \n{stringified_vals}.\n Model: {chat_model}\n\n Response: {arg}"
-                show_message_box(msg, custom_ok="Close")
-            elif field_type == "tts":
+            if field_type == "tts":
                 msg = f"Ran with fields: \n{stringified_vals}.\n Voice: {tts_provider} - {tts_voice}\n\n"
                 if arg is not None and isinstance(arg, bytes):
                     play_audio(arg)
@@ -819,6 +967,58 @@ class PromptDialog(QDialog):
             self.state["is_loading_prompt"] = False
 
         if self.state.s["type"] == "chat":
+            usage_scope_id = chat_usage_tracker.open_scope()
+
+            def on_chat_success(result: Optional[str]) -> None:
+                prompt = self.state.s["prompt"]
+                if not prompt:
+                    chat_usage_tracker.close_scope(usage_scope_id)
+                    return
+
+                prompt_fields = get_prompt_fields(prompt)
+                fields = to_lowercase_dict(sample_note)  # type: ignore
+                field_map = {
+                    prompt_field: fields[prompt_field] for prompt_field in prompt_fields
+                }
+                stringified_vals = "\n".join(
+                    [f"{k}: {v}" for k, v in field_map.items()]
+                )
+                self.state["is_loading_prompt"] = False
+
+                response_text = result if result is not None else "No response received"
+                message_parts = [
+                    f"Ran with fields: \n{stringified_vals}.",
+                    f"Model: {chat_model}",
+                    "",
+                    f"Response: {response_text}",
+                ]
+
+                usage_summary = chat_usage_tracker.close_scope(usage_scope_id)
+                if usage_summary.request_count:
+                    message_parts.extend(
+                        [
+                            "",
+                            f"Tokens: {format_token_count(usage_summary.total_tokens)} total "
+                            f"({format_token_count(usage_summary.input_tokens)} input, "
+                            f"{format_token_count(usage_summary.output_tokens)} output)",
+                        ]
+                    )
+
+                if (
+                    chat_provider == "openai"
+                    and config.openai_daily_token_budget_enabled
+                ):
+                    daily_usage = chat_usage_tracker.get_openai_daily_usage()
+                    message_parts.append(
+                        f"OpenAI today: {format_token_count(daily_usage.used_total_tokens)} / "
+                        f"{format_token_count(config.openai_daily_token_budget)}"
+                    )
+
+                show_message_box("\n".join(message_parts), custom_ok="Close")
+
+            def on_chat_failure(error: Exception) -> None:
+                chat_usage_tracker.close_scope(usage_scope_id)
+                on_failure(error)
 
             def chat_fn():
                 return self.processor.field_processor.get_chat_response(
@@ -833,9 +1033,14 @@ class PromptDialog(QDialog):
                     ),
                     should_convert_to_html=False,  # Don't show HTML here bc it's confusing
                     use_tools=self.state.s["chat_use_tools"],
+                    show_error_box=False,
+                    prompt_usage_context=self.build_saved_prompt_usage_context(),
+                    usage_scope_id=usage_scope_id,
                 )
 
-            run_async_in_background_with_sentry(chat_fn, on_success, on_failure)
+            run_async_in_background_with_sentry(
+                chat_fn, on_chat_success, on_chat_failure
+            )
         elif self.state.s["type"] == "tts":
 
             def tts_fn():

@@ -32,10 +32,10 @@ NOTE_TYPE_NAME = "note_type_1"
 
 
 class FakeFieldProcessor:
-    async def resolve(self, node, note, show_error_box=False):
+    async def resolve(self, node, note, show_error_box=False, usage_scope_id=None):
         from src.prompts import interpolate_prompt
 
-        del show_error_box
+        del show_error_box, usage_scope_id
 
         interpolated = interpolate_prompt(node.input, note)
         if not interpolated:
@@ -576,8 +576,8 @@ async def test_process_note_reports_field_failures(monkeypatch):
         allow_empty_fields=False,
     )
 
-    async def fail_resolve(node, note, show_error_box=False):
-        del show_error_box
+    async def fail_resolve(node, note, show_error_box=False, usage_scope_id=None):
+        del show_error_box, usage_scope_id
         if node.field == "f2":
             raise TimeoutError()
 

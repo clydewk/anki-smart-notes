@@ -30,6 +30,11 @@ from anki.notes import Note, NoteId
 from aqt import mw
 from aqt.qt import QDialog, QLabel, QProgressBar, QPushButton, Qt, QVBoxLayout
 
+from .chat_usage import (
+    EMPTY_CHAT_RUN_USAGE_SUMMARY,
+    ChatRunUsageSummary,
+    chat_usage_tracker,
+)
 from .config import Config, bump_usage_counter
 from .constants import STANDARD_BATCH_LIMIT
 from .dag import generate_fields_dag
@@ -84,6 +89,7 @@ class BatchStatistics:
     db_writes: int
     transport_metrics: dict[str, dict[str, float]]
     logs: list[str]
+    chat_usage_summary: ChatRunUsageSummary = EMPTY_CHAT_RUN_USAGE_SUMMARY
     was_cancelled: bool = False
 
 
@@ -203,6 +209,7 @@ class NoteProcessor:
             f"✨Generating... (0/{len(note_ids)})", len(note_ids), on_cancel
         )
         progress.show()
+        usage_scope_id = chat_usage_tracker.open_scope()
 
         # Capture logs
         log_handler = ListHandler()
@@ -233,6 +240,7 @@ class NoteProcessor:
 
         def on_failure(e: Exception) -> None:
             logger.removeHandler(log_handler)
+            chat_usage_tracker.close_scope(usage_scope_id)
 
             if autosave_was_active and hasattr(mw, "autosaveTimer"):
                 mw.autosaveTimer.start()
@@ -348,6 +356,7 @@ class NoteProcessor:
                         note,
                         deck_id=did_map[nid],
                         overwrite_fields=overwrite_fields,
+                        usage_scope_id=usage_scope_id,
                     )
                     return (note, result)
 
@@ -495,6 +504,7 @@ class NoteProcessor:
                 db_writes=db_writes,
                 transport_metrics=transport_metrics,
                 logs=logs,
+                chat_usage_summary=chat_usage_tracker.close_scope(usage_scope_id),
                 was_cancelled=cancellation_state["cancelled"],
             )
 
@@ -504,6 +514,7 @@ class NoteProcessor:
             )
         except Exception as e:
             logger.removeHandler(log_handler)
+            chat_usage_tracker.close_scope(usage_scope_id)
             if autosave_was_active and hasattr(mw, "autosaveTimer"):
                 mw.autosaveTimer.start()
             if hasattr(mw.col, "set_autosave_enabled"):
@@ -553,6 +564,7 @@ class NoteProcessor:
                 target_field=target_field,
                 on_field_update=on_field_update,
                 show_progress=show_progress,
+                usage_scope_id=None,
             ),
             lambda result: wrapped_on_success(result.did_update),
             wrapped_failure,
@@ -570,6 +582,7 @@ class NoteProcessor:
         target_field: Optional[str] = None,
         on_field_update: Optional[Callable[[], None]] = None,
         show_progress: bool = False,
+        usage_scope_id: str | None = None,
     ) -> NoteProcessingResult:
         """Process a single note and return updated fields plus any field-level failures."""
 
@@ -619,6 +632,7 @@ class NoteProcessor:
                         node,
                         note,
                         show_error_message_box=node.is_target,
+                        usage_scope_id=usage_scope_id,
                     )
                     for node in next_batch
                 }
@@ -731,7 +745,11 @@ class NoteProcessor:
         self.req_in_progress = False
 
     async def _process_node(
-        self, node: FieldNode, note: Note, show_error_message_box: bool
+        self,
+        node: FieldNode,
+        note: Note,
+        show_error_message_box: bool,
+        usage_scope_id: str | None = None,
     ) -> Optional[str]:
         started_at = time.perf_counter()
         status = "completed"
@@ -753,7 +771,10 @@ class NoteProcessor:
                 return value
 
             new_value = await self.field_processor.resolve(
-                node, note, show_error_message_box
+                node,
+                note,
+                show_error_box=show_error_message_box,
+                usage_scope_id=usage_scope_id,
             )
             if new_value:
                 node.did_update = True

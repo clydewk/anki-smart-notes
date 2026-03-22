@@ -35,6 +35,8 @@
   "allow_empty_fields": true,
   "last_message_id": 0,
   "debug": false,
+  "openai_daily_token_budget_enabled": false,
+  "openai_daily_token_budget": 1000000,
   "auth_token": null,
   "legacy_support": null,
   "legacy_openai_model": null,
