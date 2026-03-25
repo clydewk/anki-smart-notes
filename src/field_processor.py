@@ -33,7 +33,6 @@ from .chat_provider import (
 )
 from .chat_usage import (
     OpenAITokenBudgetExceededError,
-    OpenAIUsageReservation,
     build_prompt_usage_key,
     build_prompt_usage_signature,
     chat_usage_tracker,
@@ -298,29 +297,6 @@ class FieldProcessor:
 
         cache_seed = f"{provider}:{model}:{note_type}:{deck_id}:{field_lower}:{prompt}"
         prompt_chars = len(interpolated_prompt)
-        reservation: OpenAIUsageReservation | None = None
-
-        try:
-            reservation = chat_usage_tracker.reserve_openai_budget(
-                provider=str(provider),
-                model=str(model),
-                reasoning_effort=reasoning_effort,
-                use_tools=use_tools,
-                prompt_chars=prompt_chars,
-                budget_enabled=bool(config.openai_daily_token_budget_enabled),
-                budget_limit=int(config.openai_daily_token_budget or 1_000_000),
-                prompt_key=(
-                    prompt_usage_context.prompt_key if prompt_usage_context else None
-                ),
-                prompt_signature=(
-                    prompt_usage_context.signature if prompt_usage_context else None
-                ),
-            )
-        except OpenAITokenBudgetExceededError as error:
-            if show_error_box:
-                run_on_main(lambda msg=str(error): show_message_box(msg))
-                return None
-            raise
 
         try:
             provider_result = await self.chat_provider.async_get_chat_response_result(
@@ -333,9 +309,17 @@ class FieldProcessor:
                 note_id=note.id,
                 tools=tools,
                 tool_executor=tool_executor,
+                prompt_usage_key=prompt_usage_context.prompt_key
+                if prompt_usage_context
+                else None,
+                prompt_usage_signature=prompt_usage_context.signature
+                if prompt_usage_context
+                else None,
             )
-        except Exception:
-            chat_usage_tracker.release_reservation(reservation)
+        except OpenAITokenBudgetExceededError as error:
+            if show_error_box:
+                run_on_main(lambda msg=str(error): show_message_box(msg))
+                return None
             raise
 
         chat_usage_tracker.finalize_request(
@@ -345,7 +329,6 @@ class FieldProcessor:
             use_tools=use_tools,
             prompt_chars=prompt_chars,
             raw_usage=provider_result.usage,
-            reservation=reservation,
             scope_id=usage_scope_id,
             prompt_key=prompt_usage_context.prompt_key
             if prompt_usage_context
@@ -353,6 +336,7 @@ class FieldProcessor:
             prompt_signature=(
                 prompt_usage_context.signature if prompt_usage_context else None
             ),
+            record_openai_daily_usage=False,
         )
 
         response_text = provider_result.text

@@ -476,6 +476,10 @@ class ProviderRuntime:
             loop_controllers[key] = TrafficController(initial_window)
         return loop_controllers[key]
 
+    def get_concurrency_window(self, key: str, initial_window: int) -> int:
+        controller = self.controller(key, initial_window)
+        return int(controller.snapshot()["window"])
+
     async def request_json(
         self,
         *,

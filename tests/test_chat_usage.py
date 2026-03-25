@@ -19,6 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -199,59 +200,183 @@ def test_openai_daily_usage_resets_on_utc_rollover(tmp_path) -> None:
     assert second_day.request_count == 0
 
 
-def test_openai_budget_uses_live_prompt_stats_for_later_requests(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_openai_budget_waits_for_active_turns_before_rejecting(
+    tmp_path,
+) -> None:
     clock = Clock(datetime(2026, 3, 22, tzinfo=timezone.utc))
     tracker = ChatUsageTracker(
         state_path=str(tmp_path / "chat_usage.json"),
         now_fn=clock.now,
     )
+
+    first_permit = await tracker.acquire_openai_turn_permit(
+        provider="openai",
+        model="gpt-4o-mini",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=40,
+        prompt_bytes=40,
+        transport_key="text:openai:gpt-4o-mini",
+        transport_window=4,
+        budget_enabled=True,
+        budget_limit=4_200,
+    )
+    assert first_permit is not None
+
+    second_attempt = asyncio.create_task(
+        tracker.acquire_openai_turn_permit(
+            provider="openai",
+            model="gpt-4o-mini",
+            reasoning_effort=None,
+            use_tools=False,
+            prompt_chars=40,
+            prompt_bytes=40,
+            transport_key="text:openai:gpt-4o-mini",
+            transport_window=4,
+            budget_enabled=True,
+            budget_limit=4_200,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not second_attempt.done()
+
+    await tracker.finalize_openai_turn(
+        provider="openai",
+        raw_usage={"input_tokens": 100, "output_tokens": 4_090},
+        permit=first_permit,
+    )
+
+    with pytest.raises(OpenAITokenBudgetExceededError):
+        await asyncio.wait_for(second_attempt, timeout=1.0)
+
+    daily_usage = tracker.get_openai_daily_usage()
+    assert daily_usage.used_total_tokens == 4_190
+    assert daily_usage.request_count == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_budget_respects_transport_window(tmp_path) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
+
+    first_permit = await tracker.acquire_openai_turn_permit(
+        provider="openai",
+        model="gpt-4o-mini",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=10,
+        prompt_bytes=10,
+        transport_key="text:openai:gpt-4o-mini",
+        transport_window=1,
+        budget_enabled=True,
+        budget_limit=20_000,
+    )
+    assert first_permit is not None
+
+    second_attempt = asyncio.create_task(
+        tracker.acquire_openai_turn_permit(
+            provider="openai",
+            model="gpt-4o-mini",
+            reasoning_effort=None,
+            use_tools=False,
+            prompt_chars=10,
+            prompt_bytes=10,
+            transport_key="text:openai:gpt-4o-mini",
+            transport_window=1,
+            budget_enabled=True,
+            budget_limit=20_000,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not second_attempt.done()
+
+    await tracker.release_openai_turn_permit(first_permit)
+    second_permit = await asyncio.wait_for(second_attempt, timeout=1.0)
+    assert second_permit is not None
+    await tracker.release_openai_turn_permit(second_permit)
+
+
+@pytest.mark.asyncio
+async def test_openai_budget_uses_max_observed_output_tokens(tmp_path) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
     prompt_key = build_prompt_usage_key("Basic", 1, "Front")
     prompt_signature = build_prompt_usage_signature(
         prompt="Question: {{Front}}",
         provider="openai",
-        model="gpt-5.4",
+        model="gpt-4o-mini",
         reasoning_effort=None,
         use_tools=False,
     )
-
-    first_reservation = tracker.reserve_openai_budget(
-        provider="openai",
-        model="gpt-5.4",
-        reasoning_effort=None,
-        use_tools=False,
-        prompt_chars=40,
-        budget_enabled=True,
-        budget_limit=150,
-        prompt_key=prompt_key,
-        prompt_signature=prompt_signature,
-    )
-    assert first_reservation is not None
-    assert first_reservation.estimated_usage.total_tokens == 138
 
     tracker.finalize_request(
         provider="openai",
-        model="gpt-5.4",
+        model="gpt-4o-mini",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=20,
+        raw_usage={"input_tokens": 30, "output_tokens": 7_000},
+        prompt_key=prompt_key,
+        prompt_signature=prompt_signature,
+        record_openai_daily_usage=False,
+    )
+
+    permit = await tracker.acquire_openai_turn_permit(
+        provider="openai",
+        model="gpt-4o-mini",
         reasoning_effort=None,
         use_tools=False,
         prompt_chars=40,
-        raw_usage={"input_tokens": 10, "output_tokens": 110},
-        reservation=first_reservation,
+        prompt_bytes=40,
+        transport_key="text:openai:gpt-4o-mini",
+        transport_window=4,
+        budget_enabled=True,
+        budget_limit=20_000,
         prompt_key=prompt_key,
         prompt_signature=prompt_signature,
     )
+    assert permit is not None
+    assert permit.estimated_usage.output_tokens == 7_000
+    await tracker.release_openai_turn_permit(permit)
 
-    with pytest.raises(OpenAITokenBudgetExceededError):
-        tracker.reserve_openai_budget(
-            provider="openai",
-            model="gpt-5.4",
-            reasoning_effort=None,
-            use_tools=False,
-            prompt_chars=40,
-            budget_enabled=True,
-            budget_limit=150,
-            prompt_key=prompt_key,
-            prompt_signature=prompt_signature,
-        )
+
+@pytest.mark.asyncio
+async def test_openai_budget_uses_utf8_bytes_for_cjk_prompts(tmp_path) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
+    prompt = "漢" * 12
+
+    permit = await tracker.acquire_openai_turn_permit(
+        provider="openai",
+        model="gpt-4o-mini",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=len(prompt),
+        prompt_bytes=len(prompt.encode("utf-8")),
+        transport_key="text:openai:gpt-4o-mini",
+        transport_window=4,
+        budget_enabled=True,
+        budget_limit=20_000,
+    )
+    assert permit is not None
+    assert permit.estimated_usage.input_tokens >= 12
+    await tracker.release_openai_turn_permit(permit)
+
+
+def test_finalize_request_can_skip_openai_daily_ledger(tmp_path) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
+
+    tracker.finalize_request(
+        provider="openai",
+        model="gpt-4o-mini",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=10,
+        raw_usage={"input_tokens": 3, "output_tokens": 2},
+        record_openai_daily_usage=False,
+    )
+
+    daily_usage = tracker.get_openai_daily_usage()
+    assert daily_usage.used_total_tokens == 0
+    assert daily_usage.request_count == 0
 
 
 def test_finalize_request_updates_scope_and_provider_breakdown(tmp_path) -> None:

@@ -20,6 +20,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """Helpful functions for working with prompts and cards"""
 
 import re
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any, Optional, Union, cast
 
@@ -137,27 +138,36 @@ def get_prompt_fields(prompt: str, lower: bool = True) -> list[str]:
     return [(field.lower() if lower else field) for field in fields]
 
 
-def interpolate_prompt(prompt: str, note: Note) -> Optional[str]:
-    """Interpolates a prompt. Returns none if all source field are empty, or if some are empty and we're not allowing empty fields."""
+def interpolate_prompt_with_values(
+    prompt: str,
+    values: Mapping[str, str],
+    allow_empty: bool,
+) -> Optional[str]:
+    """Interpolates a prompt from a lowercased field-value mapping."""
     fields = get_prompt_fields(prompt)
     if not fields:
         return prompt
 
-    all_note_fields = to_lowercase_dict(note)  # type: ignore[arg-type]
-
     prompt = re.sub(FIELD_PATTERN, lambda x: "{{" + x.group(1).lower() + "}}", prompt)
 
-    allow_empty = config.allow_empty_fields
+    resolved_values = [values.get(field, "") for field in fields]
 
-    values = [all_note_fields.get(field, "") for field in fields]
-
-    if any(values) and (allow_empty or all(values)):
-        for field, value in zip(fields, values):
+    if any(resolved_values) and (allow_empty or all(resolved_values)):
+        for field, value in zip(fields, resolved_values):
             prompt = prompt.replace("{{" + field + "}}", value)
         return prompt
 
     logger.debug("Prompt has empty fields")
     return None
+
+
+def interpolate_prompt(prompt: str, note: Note) -> Optional[str]:
+    """Interpolates a prompt. Returns none if all source field are empty, or if some are empty and we're not allowing empty fields."""
+    return interpolate_prompt_with_values(
+        prompt,
+        cast("Mapping[str, str]", to_lowercase_dict(note)),  # type: ignore[arg-type]
+        config.allow_empty_fields,
+    )
 
 
 def add_or_update_prompts(

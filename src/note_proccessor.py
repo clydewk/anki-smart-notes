@@ -30,19 +30,27 @@ from anki.notes import Note, NoteId
 from aqt import mw
 from aqt.qt import QDialog, QLabel, QProgressBar, QPushButton, Qt, QVBoxLayout
 
+from .chat_provider import text_initial_window, text_transport_key
 from .chat_usage import (
     EMPTY_CHAT_RUN_USAGE_SUMMARY,
     ChatRunUsageSummary,
+    build_prompt_usage_key,
+    build_prompt_usage_signature,
     chat_usage_tracker,
 )
-from .config import Config, bump_usage_counter
-from .constants import STANDARD_BATCH_LIMIT
+from .config import Config, bump_usage_counter, key_or_config_val
 from .dag import generate_fields_dag
 from .field_processor import FieldProcessor
 from .logger import logger
+from .models import (
+    DEFAULT_EXTRAS,
+    ChatModels,
+    ChatProviders,
+    OpenAIReasoningEffort,
+)
 from .nodes import FieldNode
 from .notes import get_note_type
-from .prompts import get_prompts_for_note
+from .prompts import get_extras, get_prompts_for_note, interpolate_prompt_with_values
 from .provider_runtime import (
     ProviderHTTPError,
     format_provider_http_error_for_log,
@@ -91,6 +99,22 @@ class BatchStatistics:
     logs: list[str]
     chat_usage_summary: ChatRunUsageSummary = EMPTY_CHAT_RUN_USAGE_SUMMARY
     was_cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class OpenAIBatchPreflight:
+    note_count: int
+    request_count: int
+    estimated_total_tokens: int
+    remaining_tokens: int
+    fast_budget_tokens: int
+    recommended_note_count: int
+
+
+@dataclass(frozen=True)
+class EstimatedOpenAIRequest:
+    transport_key: str
+    estimated_tokens: int
 
 
 class ListHandler(logging.Handler):
@@ -154,6 +178,265 @@ class NoteProcessor:
         self.config = config
         self.req_in_progress = False
 
+    def get_openai_batch_preflight(
+        self,
+        card_ids: Sequence[CardId],
+        overwrite_fields: bool = False,
+    ) -> OpenAIBatchPreflight | None:
+        if not mw or not mw.col or not self.config.openai_daily_token_budget_enabled:
+            return None
+
+        cards = [mw.col.get_card(card_id) for card_id in card_ids]
+        cards = list({card.nid: card for card in cards}.values())
+        notes_with_decks = [(mw.col.get_note(card.nid), card.did) for card in cards]
+        return self.estimate_openai_batch_preflight_for_notes(
+            notes_with_decks,
+            overwrite_fields=overwrite_fields,
+        )
+
+    def estimate_openai_batch_preflight_for_notes(
+        self,
+        notes_with_decks: Sequence[tuple[Note, DeckId]],
+        overwrite_fields: bool = False,
+    ) -> OpenAIBatchPreflight | None:
+        if not self.config.openai_daily_token_budget_enabled:
+            return None
+
+        budget_limit = int(self.config.openai_daily_token_budget or 1_000_000)
+        daily_usage = chat_usage_tracker.get_openai_daily_usage()
+        remaining_tokens = max(0, budget_limit - daily_usage.used_total_tokens)
+
+        note_token_totals: list[int] = []
+        request_count = 0
+        estimated_total_tokens = 0
+        max_request_tokens_by_transport: dict[str, int] = {}
+
+        for note, deck_id in notes_with_decks:
+            estimated_requests = self.estimate_openai_requests_for_note(
+                note,
+                deck_id=deck_id,
+                overwrite_fields=overwrite_fields,
+            )
+            note_total_tokens = sum(
+                request.estimated_tokens for request in estimated_requests
+            )
+            note_token_totals.append(note_total_tokens)
+            request_count += len(estimated_requests)
+            estimated_total_tokens += note_total_tokens
+
+            for request in estimated_requests:
+                max_request_tokens_by_transport[request.transport_key] = max(
+                    max_request_tokens_by_transport.get(request.transport_key, 0),
+                    request.estimated_tokens,
+                )
+
+        if request_count <= 0:
+            return None
+
+        slowdown_buffer_tokens = sum(
+            text_initial_window("openai") * max_tokens
+            for max_tokens in max_request_tokens_by_transport.values()
+        )
+        fast_budget_tokens = max(0, remaining_tokens - slowdown_buffer_tokens)
+
+        running_total = 0
+        recommended_note_count = 0
+        for note_total_tokens in note_token_totals:
+            if running_total + note_total_tokens > fast_budget_tokens:
+                break
+            running_total += note_total_tokens
+            recommended_note_count += 1
+
+        if estimated_total_tokens <= fast_budget_tokens:
+            return None
+
+        return OpenAIBatchPreflight(
+            note_count=len(note_token_totals),
+            request_count=request_count,
+            estimated_total_tokens=estimated_total_tokens,
+            remaining_tokens=remaining_tokens,
+            fast_budget_tokens=fast_budget_tokens,
+            recommended_note_count=recommended_note_count,
+        )
+
+    def estimate_openai_requests_for_note(
+        self,
+        note: Note,
+        *,
+        deck_id: DeckId,
+        overwrite_fields: bool = False,
+    ) -> list[EstimatedOpenAIRequest]:
+        note_type = get_note_type(note)
+        dag = generate_fields_dag(
+            note,
+            overwrite_fields=overwrite_fields,
+            deck_id=deck_id,
+        )
+        if not dag:
+            return []
+
+        pending_inputs = {
+            field: {in_node.field for in_node in node.in_nodes}
+            for field, node in dag.items()
+        }
+        ready_fields = [
+            field for field, in_fields in pending_inputs.items() if not in_fields
+        ]
+        simulated_values = {
+            field.lower(): str(value or "") for field, value in note.items()
+        }
+        estimated_requests: list[EstimatedOpenAIRequest] = []
+
+        while ready_fields:
+            field = ready_fields.pop(0)
+            node = dag[field]
+
+            if not self.should_skip_node_for_estimate(node, simulated_values):
+                simulated_prompt = interpolate_prompt_with_values(
+                    node.input,
+                    simulated_values,
+                    self.config.allow_empty_fields,
+                )
+                if simulated_prompt is not None:
+                    estimated_request = self.estimate_openai_request_for_node(
+                        note_type=note_type,
+                        node=node,
+                        prompt=node.input,
+                        interpolated_prompt=simulated_prompt,
+                    )
+                    if estimated_request is not None:
+                        estimated_requests.append(estimated_request)
+
+                    simulated_values[node.field] = self.estimated_generated_field_value(
+                        note_type=note_type,
+                        node=node,
+                        prompt=node.input,
+                    )
+
+            for out_node in node.out_nodes:
+                pending_inputs[out_node.field].discard(node.field)
+                if not pending_inputs[out_node.field]:
+                    ready_fields.append(out_node.field)
+
+        return estimated_requests
+
+    def should_skip_node_for_estimate(
+        self,
+        node: FieldNode,
+        simulated_values: dict[str, str],
+    ) -> bool:
+        if node.manual and not (node.is_target or node.generate_despite_manual):
+            return True
+
+        current_value = simulated_values.get(node.field, "")
+        return bool(current_value and not (node.is_target or node.overwrite))
+
+    def estimate_openai_request_for_node(
+        self,
+        *,
+        note_type: str,
+        node: FieldNode,
+        prompt: str,
+        interpolated_prompt: str,
+    ) -> EstimatedOpenAIRequest | None:
+        if node.field_type != "chat":
+            return None
+
+        extras = (
+            get_extras(
+                note_type=note_type,
+                field=node.field,
+                deck_id=node.deck_id,
+                fallback_to_global_deck=True,
+            )
+            or DEFAULT_EXTRAS
+        )
+        chat_provider: ChatProviders = key_or_config_val(extras, "chat_provider")
+        if chat_provider != "openai":
+            return None
+
+        chat_model: ChatModels = key_or_config_val(extras, "chat_model")
+        chat_reasoning_effort: Optional[OpenAIReasoningEffort] = key_or_config_val(
+            extras, "chat_reasoning_effort"
+        )
+        use_tools: bool = key_or_config_val(extras, "chat_use_tools")
+        prompt_key = build_prompt_usage_key(
+            note_type=note_type,
+            deck_id=int(node.deck_id),
+            field_lower=node.field,
+        )
+        prompt_signature = build_prompt_usage_signature(
+            prompt=prompt,
+            provider=str(chat_provider),
+            model=str(chat_model),
+            reasoning_effort=chat_reasoning_effort,
+            use_tools=use_tools,
+        )
+        usage = chat_usage_tracker.estimate_request_usage(
+            provider=str(chat_provider),
+            model=str(chat_model),
+            reasoning_effort=chat_reasoning_effort,
+            use_tools=use_tools,
+            prompt_chars=len(interpolated_prompt),
+            prompt_bytes=len(interpolated_prompt.encode("utf-8")),
+            prompt_key=prompt_key,
+            prompt_signature=prompt_signature,
+            mode="planning",
+        )
+        return EstimatedOpenAIRequest(
+            transport_key=text_transport_key("openai", str(chat_model)),
+            estimated_tokens=usage.total_tokens,
+        )
+
+    def estimated_generated_field_value(
+        self,
+        *,
+        note_type: str,
+        node: FieldNode,
+        prompt: str,
+    ) -> str:
+        if node.field_type == "image":
+            return '<img src="generated"/>'
+        if node.field_type == "tts":
+            return "[sound:generated]"
+        if node.field_type != "chat":
+            return "generated"
+
+        extras = (
+            get_extras(
+                note_type=note_type,
+                field=node.field,
+                deck_id=node.deck_id,
+                fallback_to_global_deck=True,
+            )
+            or DEFAULT_EXTRAS
+        )
+        chat_provider: ChatProviders = key_or_config_val(extras, "chat_provider")
+        chat_model: ChatModels = key_or_config_val(extras, "chat_model")
+        chat_reasoning_effort: Optional[OpenAIReasoningEffort] = key_or_config_val(
+            extras, "chat_reasoning_effort"
+        )
+        use_tools: bool = key_or_config_val(extras, "chat_use_tools")
+        prompt_signature = build_prompt_usage_signature(
+            prompt=prompt,
+            provider=str(chat_provider),
+            model=str(chat_model),
+            reasoning_effort=chat_reasoning_effort,
+            use_tools=use_tools,
+        )
+        snapshot = chat_usage_tracker.get_prompt_usage(
+            note_type=note_type,
+            deck_id=int(node.deck_id),
+            field_lower=node.field,
+            signature=prompt_signature,
+        )
+
+        estimated_chars = 256
+        if snapshot is not None and snapshot.avg_output_tokens > 0:
+            estimated_chars = round(snapshot.avg_output_tokens * 4)
+        estimated_chars = max(32, min(estimated_chars, 2048))
+        return "x" * estimated_chars
+
     def process_cards_with_progress(
         self,
         card_ids: Sequence[CardId],
@@ -178,9 +461,7 @@ class NoteProcessor:
             return
 
         logger.debug("Processing notes...")
-
-        initial_limit = STANDARD_BATCH_LIMIT
-        logger.debug(f"Global concurrency limit: {initial_limit}")
+        logger.debug("Scheduling %d note workers", len(note_ids))
 
         # Only show fancy progress meter for large batches
         cancellation_state = {"cancelled": False}
@@ -302,8 +583,6 @@ class NoteProcessor:
         async def op():
             start_time = time.time()
 
-            concurrency_limit = STANDARD_BATCH_LIMIT
-
             total_processed = []
             total_partial = []
             total_failed = []
@@ -316,9 +595,6 @@ class NoteProcessor:
             update_buffer: list[Note] = []
             processed_count = 0
             db_writes = 0
-
-            to_process_ids = note_ids[:]
-            active_tasks: set[asyncio.Task] = set()
 
             async def worker(
                 nid: NoteId,
@@ -368,13 +644,15 @@ class NoteProcessor:
                     except Exception:
                         return (None, e)
 
-            while to_process_ids or active_tasks:
+            active_tasks = [asyncio.create_task(worker(nid)) for nid in note_ids]
+
+            for completed_task in asyncio.as_completed(active_tasks):
                 # If cancelled, force-cancel all active tasks instead of waiting
                 if cancellation_state["cancelled"]:
                     if active_tasks:
                         logger.info(f"Cancelling {len(active_tasks)} active tasks...")
-                        for task in active_tasks:
-                            task.cancel()
+                        for active_task in active_tasks:
+                            active_task.cancel()
                         # Wait for cancelled tasks to finish (with timeout)
                         try:
                             await asyncio.wait_for(
@@ -385,95 +663,57 @@ class NoteProcessor:
                             logger.warning(
                                 "Some tasks did not cancel cleanly within timeout"
                             )
-                        active_tasks.clear()
                     break
-
-                # Fill the pool
-                while to_process_ids and len(active_tasks) < concurrency_limit:
-                    if cancellation_state["cancelled"]:
-                        break
-                    nid = to_process_ids.pop(0)
-                    task = asyncio.create_task(worker(nid))
-                    active_tasks.add(task)
-
-                if not active_tasks:
-                    break
-
-                # Wait for at least one task to finish (with timeout to check cancellation)
+                processed_count += 1
                 try:
-                    done, pending = await asyncio.wait(
-                        active_tasks,
-                        return_when=asyncio.FIRST_COMPLETED,
-                        timeout=1.0,  # Check cancellation state every second
-                    )
-                except asyncio.TimeoutError:
-                    # No task completed, but check cancellation state
+                    note_obj, status = await completed_task
+                except asyncio.CancelledError:
+                    logger.debug("Task was cancelled")
                     continue
-                active_tasks = pending
+                except Exception as e:
+                    note_obj, status = (None, e)
 
-                for task in done:
-                    processed_count += 1
-                    try:
-                        note_obj, status = await task
-                    except asyncio.CancelledError:
-                        # Task was cancelled - don't count as error
-                        logger.debug("Task was cancelled")
-                        continue
-                    except Exception as e:
-                        # Should be caught inside worker, but just in case
-                        note_obj, status = (None, e)
-
-                    if isinstance(status, Exception):
-                        if note_obj:
-                            total_failed.append(note_obj)
-                            error_details[note_obj.id] = describe_exception(status)
-                            logger.error(
-                                f"Error processing note {note_obj.id}: {describe_exception(status)}"
-                            )
-                        else:
-                            logger.error(
-                                f"Error processing note: {describe_exception(status)}"
-                            )
-
-                    else:
-                        if note_obj is None:
-                            continue
-
-                        if status.field_failures:
-                            field_error_details[note_obj.id] = status.field_failures
-
-                        if status.did_update:
-                            update_buffer.append(note_obj)
-                            all_updated_fields.update(status.updated_fields)
-                            if status.field_failures:
-                                total_partial.append(note_obj)
-                            else:
-                                total_processed.append(note_obj)
-                        elif status.field_failures:
-                            total_blocked.append(note_obj)
-                        else:
-                            total_no_updates.append(note_obj)
-
-                    # Flush buffer periodically (DB write)
-                    batch_to_update = []
-                    # Use larger buffer (100 notes) to reduce DB operations and avoid
-                    # triggering Anki's internal "Processing..." dialog which appears
-                    # when main thread is blocked for more than ~600ms
-                    if len(update_buffer) >= 100:
-                        batch_to_update = update_buffer[:]
-                        update_buffer.clear()
-
-                    # Update UI/DB
-                    # Progress bar updates are cheap (just Qt widget updates)
-                    # DB writes are expensive but batched (every 100 notes) and protected
-                    # by progress manager suppression, so it's safe to update on every note
-                    if batch_to_update:
-                        db_writes += 1
-                    run_on_main(
-                        lambda u=batch_to_update, p=processed_count: on_update(
-                            u, p, False
+                if isinstance(status, Exception):
+                    if note_obj:
+                        total_failed.append(note_obj)
+                        error_details[note_obj.id] = describe_exception(status)
+                        logger.error(
+                            f"Error processing note {note_obj.id}: {describe_exception(status)}"
                         )
-                    )
+                    else:
+                        logger.error(
+                            f"Error processing note: {describe_exception(status)}"
+                        )
+
+                else:
+                    if note_obj is None:
+                        continue
+
+                    if status.field_failures:
+                        field_error_details[note_obj.id] = status.field_failures
+
+                    if status.did_update:
+                        update_buffer.append(note_obj)
+                        all_updated_fields.update(status.updated_fields)
+                        if status.field_failures:
+                            total_partial.append(note_obj)
+                        else:
+                            total_processed.append(note_obj)
+                    elif status.field_failures:
+                        total_blocked.append(note_obj)
+                    else:
+                        total_no_updates.append(note_obj)
+
+                batch_to_update = []
+                if len(update_buffer) >= 100:
+                    batch_to_update = update_buffer[:]
+                    update_buffer.clear()
+
+                if batch_to_update:
+                    db_writes += 1
+                run_on_main(
+                    lambda u=batch_to_update, p=processed_count: on_update(u, p, False)
+                )
 
             # Final flush
             if update_buffer:

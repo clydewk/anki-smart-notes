@@ -22,7 +22,8 @@ Setup the hooks for the Anki plugin
 """
 
 
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from collections.abc import Sequence
+from typing import Any, Callable, Optional
 
 from anki.cards import Card
 from aqt import QAction, QMenu, browser, editor, gui_hooks, mw
@@ -43,9 +44,6 @@ from .ui.changelog import perform_update_check
 from .ui.field_menu import FieldMenu
 from .ui.sparkle import Sparkle
 from .ui.ui_utils import show_message_box
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
 
 
 def with_processor(fn: Any):
@@ -322,6 +320,45 @@ def make_on_batch_success(
     return wrapped_on_batch_success
 
 
+def confirm_openai_batch_preflight(
+    processor: NoteProcessor,
+    card_ids: Sequence[int],
+    overwrite_fields: bool,
+) -> bool:
+    preflight = processor.get_openai_batch_preflight(
+        card_ids,
+        overwrite_fields=overwrite_fields,
+    )
+    if preflight is None:
+        return True
+
+    if preflight.recommended_note_count <= 0:
+        recommendation = "0 notes. You're already close to today's OpenAI budget."
+    else:
+        recommendation = (
+            f"{preflight.recommended_note_count} note"
+            f"{'s' if preflight.recommended_note_count != 1 else ''}."
+        )
+
+    details = "\n".join(
+        [
+            f"Selected notes: {preflight.note_count}",
+            f"Estimated OpenAI requests: {preflight.request_count}",
+            f"Estimated batch tokens: {format_token_count(preflight.estimated_total_tokens)}",
+            f"Remaining today: {format_token_count(preflight.remaining_tokens)}",
+            f"Fast-run budget: {format_token_count(preflight.fast_budget_tokens)}",
+            f"Recommended fast batch size: {recommendation}",
+            "Near the limit, Smart Notes drains in-flight OpenAI requests before starting more, which slows the batch down.",
+        ]
+    )
+    return show_message_box(
+        "OpenAI batch may slow down near today's token limit.",
+        details=details,
+        custom_ok="Continue",
+        show_cancel=True,
+    )
+
+
 @with_processor  # type: ignore
 def on_browser_context(processor: NoteProcessor, browser: browser.Browser, menu: QMenu):  # type: ignore
     item = QAction("✨ Generate Smart Fields", menu)
@@ -331,6 +368,12 @@ def on_browser_context(processor: NoteProcessor, browser: browser.Browser, menu:
     cards = browser.selected_cards()
 
     def wrapped():
+        if not confirm_openai_batch_preflight(
+            processor,
+            cards,
+            overwrite_fields=config.regenerate_notes_when_batching,
+        ):
+            return
         processor.process_cards_with_progress(
             cards,
             on_success=make_on_batch_success(browser),
@@ -479,6 +522,12 @@ def add_deck_option(
     menu.addAction(item)
 
     def wrapped():
+        if not confirm_openai_batch_preflight(
+            processor,
+            cards,
+            overwrite_fields=config.regenerate_notes_when_batching,
+        ):
+            return
         processor.process_cards_with_progress(
             cards,
             on_success=make_on_batch_success(tree_view.browser),

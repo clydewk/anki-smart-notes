@@ -19,6 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -26,14 +27,20 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Any, Callable, TypedDict, cast
+from typing import Any, Callable, Literal, TypedDict, cast
 from uuid import uuid4
 
 from .logger import logger
 from .utils import get_file_path
 
-DEFAULT_OPENAI_OUTPUT_ESTIMATE = 128
-DEFAULT_OPENAI_TOOLS_OUTPUT_ESTIMATE = 192
+DEFAULT_STANDARD_OUTPUT_ESTIMATE = 512
+DEFAULT_STANDARD_TOOLS_OUTPUT_ESTIMATE = 768
+DEFAULT_REASONING_OUTPUT_ESTIMATE = 1024
+DEFAULT_REASONING_TOOLS_OUTPUT_ESTIMATE = 1536
+DEFAULT_STANDARD_OUTPUT_FLOOR = 4096
+DEFAULT_STANDARD_TOOLS_OUTPUT_FLOOR = 6144
+DEFAULT_REASONING_OUTPUT_FLOOR = 8192
+DEFAULT_REASONING_TOOLS_OUTPUT_FLOOR = 12288
 
 
 class StoredUsageStats(TypedDict):
@@ -42,6 +49,7 @@ class StoredUsageStats(TypedDict):
     total_output_tokens: int
     total_tokens: int
     total_prompt_chars: int
+    max_output_tokens: int
     last_used_at: str | None
 
 
@@ -104,8 +112,9 @@ class ChatRunUsageSummary:
 
 
 @dataclass(frozen=True)
-class OpenAIUsageReservation:
-    reservation_id: str
+class OpenAITurnPermit:
+    permit_id: str
+    transport_key: str
     estimated_usage: NormalizedChatUsage
 
 
@@ -172,6 +181,11 @@ class OpenAITokenBudgetExceededError(Exception):
 
 def format_token_count(count: int) -> str:
     return f"{count:,}"
+
+
+def is_reasoning_model_name(model: str) -> bool:
+    lowered = model.lower()
+    return lowered.startswith(("o", "gpt-5"))
 
 
 def build_prompt_usage_key(note_type: str, deck_id: int, field_lower: str) -> str:
@@ -305,7 +319,9 @@ class ChatUsageTracker:
         self._lock = threading.RLock()
         self._loaded = False
         self._state: StoredChatUsageState = self.default_state()
-        self._reservations: dict[str, OpenAIUsageReservation] = {}
+        self._turn_permits: dict[str, OpenAITurnPermit] = {}
+        self._turn_permit_condition: asyncio.Condition | None = None
+        self._turn_permit_loop: asyncio.AbstractEventLoop | None = None
         self._scopes: dict[str, MutableUsageScope] = {}
 
     def open_scope(self) -> str:
@@ -368,6 +384,10 @@ class ChatUsageTracker:
                 aggregate["total_output_tokens"] += prompt_stats["total_output_tokens"]
                 aggregate["total_tokens"] += prompt_stats["total_tokens"]
                 aggregate["total_prompt_chars"] += prompt_stats["total_prompt_chars"]
+                aggregate["max_output_tokens"] = max(
+                    aggregate["max_output_tokens"],
+                    prompt_stats["max_output_tokens"],
+                )
 
             return self.snapshot_for_stats(aggregate) if aggregate else None
 
@@ -387,7 +407,7 @@ class ChatUsageTracker:
                 request_count=usage["request_count"],
             )
 
-    def reserve_openai_budget(
+    def estimate_request_usage(
         self,
         *,
         provider: str,
@@ -395,67 +415,163 @@ class ChatUsageTracker:
         reasoning_effort: str | None,
         use_tools: bool,
         prompt_chars: int,
-        budget_enabled: bool,
-        budget_limit: int,
+        prompt_bytes: int,
         prompt_key: str | None = None,
         prompt_signature: str | None = None,
-    ) -> OpenAIUsageReservation | None:
-        if provider.lower() != "openai" or not budget_enabled:
-            return None
-
+        mode: Literal["planning", "strict"] = "strict",
+    ) -> NormalizedChatUsage:
         with self._lock:
             self.ensure_loaded_locked()
             changed = self.ensure_openai_daily_usage_current_locked()
-            estimate = self.estimate_usage_locked(
+            estimate = self.estimate_turn_usage_locked(
                 provider=provider,
                 model=model,
                 reasoning_effort=reasoning_effort,
                 use_tools=use_tools,
                 prompt_chars=prompt_chars,
+                prompt_bytes=prompt_bytes,
                 prompt_key=prompt_key,
                 prompt_signature=prompt_signature,
+                mode=mode,
             )
-
-            ledger = self._state["openai_daily_usage"]
-            reserved_total = sum(
-                reservation.estimated_usage.total_tokens
-                for reservation in self._reservations.values()
-            )
-            projected_total = (
-                ledger["used_total_tokens"] + reserved_total + estimate.total_tokens
-            )
-
-            if projected_total > budget_limit:
-                if changed:
-                    self.save_locked()
-                remaining = max(
-                    0, budget_limit - ledger["used_total_tokens"] - reserved_total
-                )
-                raise OpenAITokenBudgetExceededError(
-                    self.format_openai_budget_error(
-                        used_total=ledger["used_total_tokens"],
-                        reserved_total=reserved_total,
-                        budget_limit=budget_limit,
-                        estimate=estimate,
-                        remaining=remaining,
-                    )
-                )
-
-            reservation = OpenAIUsageReservation(
-                reservation_id=uuid4().hex,
-                estimated_usage=estimate,
-            )
-            self._reservations[reservation.reservation_id] = reservation
             if changed:
                 self.save_locked()
-            return reservation
+            return estimate
 
-    def release_reservation(self, reservation: OpenAIUsageReservation | None) -> None:
-        if reservation is None:
+    async def acquire_openai_turn_permit(
+        self,
+        *,
+        provider: str,
+        model: str,
+        reasoning_effort: str | None,
+        use_tools: bool,
+        prompt_chars: int,
+        prompt_bytes: int,
+        transport_key: str,
+        transport_window: int,
+        budget_enabled: bool,
+        budget_limit: int,
+        prompt_key: str | None = None,
+        prompt_signature: str | None = None,
+    ) -> OpenAITurnPermit | None:
+        if provider.lower() != "openai" or not budget_enabled:
+            return None
+
+        condition = self.turn_permit_condition()
+        async with condition:
+            while True:
+                with self._lock:
+                    self.ensure_loaded_locked()
+                    changed = self.ensure_openai_daily_usage_current_locked()
+                    estimate = self.estimate_turn_usage_locked(
+                        provider=provider,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                        use_tools=use_tools,
+                        prompt_chars=prompt_chars,
+                        prompt_bytes=prompt_bytes,
+                        prompt_key=prompt_key,
+                        prompt_signature=prompt_signature,
+                        mode="strict",
+                    )
+
+                    active_for_transport = self.count_active_turns_for_transport_locked(
+                        transport_key
+                    )
+                    if active_for_transport >= max(1, transport_window):
+                        if changed:
+                            self.save_locked()
+                    else:
+                        ledger = self._state["openai_daily_usage"]
+                        reserved_total = self.active_turn_reserved_total_locked()
+                        projected_total = (
+                            ledger["used_total_tokens"]
+                            + reserved_total
+                            + estimate.total_tokens
+                        )
+
+                        if projected_total <= budget_limit:
+                            permit = OpenAITurnPermit(
+                                permit_id=uuid4().hex,
+                                transport_key=transport_key,
+                                estimated_usage=estimate,
+                            )
+                            self._turn_permits[permit.permit_id] = permit
+                            if changed:
+                                self.save_locked()
+                            return permit
+
+                        if not self._turn_permits:
+                            if changed:
+                                self.save_locked()
+                            remaining = max(
+                                0,
+                                budget_limit
+                                - ledger["used_total_tokens"]
+                                - reserved_total,
+                            )
+                            raise OpenAITokenBudgetExceededError(
+                                self.format_openai_budget_error(
+                                    used_total=ledger["used_total_tokens"],
+                                    reserved_total=reserved_total,
+                                    budget_limit=budget_limit,
+                                    estimate=estimate,
+                                    remaining=remaining,
+                                )
+                            )
+
+                await condition.wait()
+
+    async def release_openai_turn_permit(self, permit: OpenAITurnPermit | None) -> None:
+        if permit is None:
             return
 
-        with self._lock:
-            self._reservations.pop(reservation.reservation_id, None)
+        condition = self.turn_permit_condition()
+        async with condition:
+            with self._lock:
+                self._turn_permits.pop(permit.permit_id, None)
+            condition.notify_all()
+
+    async def finalize_openai_turn(
+        self,
+        *,
+        provider: str,
+        raw_usage: dict[str, Any] | None,
+        permit: OpenAITurnPermit | None,
+    ) -> NormalizedChatUsage | None:
+        if provider.lower() != "openai":
+            return normalize_chat_usage(raw_usage)
+
+        normalized_usage = normalize_chat_usage(raw_usage)
+        if normalized_usage is None and permit is not None:
+            normalized_usage = permit.estimated_usage
+
+        condition = self.turn_permit_condition()
+        async with condition:
+            with self._lock:
+                self.ensure_loaded_locked()
+                changed = self.ensure_openai_daily_usage_current_locked()
+
+                if permit is not None:
+                    self._turn_permits.pop(permit.permit_id, None)
+
+                if normalized_usage is None:
+                    if changed:
+                        self.save_locked()
+                    condition.notify_all()
+                    return None
+
+                ledger = self._state["openai_daily_usage"]
+                ledger["used_input_tokens"] += normalized_usage.input_tokens
+                ledger["used_output_tokens"] += normalized_usage.output_tokens
+                ledger["used_total_tokens"] += normalized_usage.total_tokens
+                ledger["request_count"] += 1
+
+                self.save_locked()
+
+            condition.notify_all()
+
+        return normalized_usage
 
     def finalize_request(
         self,
@@ -466,21 +582,16 @@ class ChatUsageTracker:
         use_tools: bool,
         prompt_chars: int,
         raw_usage: dict[str, Any] | None,
-        reservation: OpenAIUsageReservation | None = None,
         scope_id: str | None = None,
         prompt_key: str | None = None,
         prompt_signature: str | None = None,
+        record_openai_daily_usage: bool = True,
     ) -> NormalizedChatUsage | None:
         normalized_usage = normalize_chat_usage(raw_usage)
-        if normalized_usage is None and provider.lower() == "openai" and reservation:
-            normalized_usage = reservation.estimated_usage
 
         with self._lock:
             self.ensure_loaded_locked()
             changed = self.ensure_openai_daily_usage_current_locked()
-
-            if reservation is not None:
-                self._reservations.pop(reservation.reservation_id, None)
 
             if normalized_usage is None:
                 if changed:
@@ -521,7 +632,7 @@ class ChatUsageTracker:
                     prompt_chars=prompt_chars,
                 )
 
-            if provider.lower() == "openai":
+            if provider.lower() == "openai" and record_openai_daily_usage:
                 ledger = self._state["openai_daily_usage"]
                 ledger["used_input_tokens"] += normalized_usage.input_tokens
                 ledger["used_output_tokens"] += normalized_usage.output_tokens
@@ -554,6 +665,7 @@ class ChatUsageTracker:
             "total_output_tokens": 0,
             "total_tokens": 0,
             "total_prompt_chars": 0,
+            "max_output_tokens": 0,
             "last_used_at": None,
         }
 
@@ -583,9 +695,13 @@ class ChatUsageTracker:
         stats["total_output_tokens"] += usage.output_tokens
         stats["total_tokens"] += usage.total_tokens
         stats["total_prompt_chars"] += max(prompt_chars, 0)
+        stats["max_output_tokens"] = max(
+            stats["max_output_tokens"],
+            usage.output_tokens,
+        )
         stats["last_used_at"] = self.utc_now().isoformat()
 
-    def estimate_usage_locked(
+    def estimate_turn_usage_locked(
         self,
         *,
         provider: str,
@@ -593,11 +709,16 @@ class ChatUsageTracker:
         reasoning_effort: str | None,
         use_tools: bool,
         prompt_chars: int,
+        prompt_bytes: int,
         prompt_key: str | None = None,
         prompt_signature: str | None = None,
+        mode: Literal["planning", "strict"] = "strict",
     ) -> NormalizedChatUsage:
-        baseline_input = max(1, math.ceil(max(prompt_chars, 1) / 4))
-        estimated_input = baseline_input
+        estimated_input = max(
+            1,
+            math.ceil(max(prompt_chars, 1) / 4),
+            math.ceil(max(prompt_bytes, 1) / 3),
+        )
 
         prompt_stats: StoredPromptUsageStats | None = None
         if prompt_key and prompt_signature:
@@ -622,25 +743,93 @@ class ChatUsageTracker:
                 math.ceil(max(prompt_chars, 1) * ratio),
             )
 
-        estimated_output = (
-            DEFAULT_OPENAI_TOOLS_OUTPUT_ESTIMATE
-            if use_tools
-            else DEFAULT_OPENAI_OUTPUT_ESTIMATE
-        )
-        estimated_output = max(estimated_output, estimated_input)
-        for stats in (prompt_stats, runtime_stats):
-            if not stats or stats["run_count"] <= 0:
-                continue
-            estimated_output = round(stats["total_output_tokens"] / stats["run_count"])
-            break
-
-        estimated_output = max(0, estimated_output)
+        if mode == "planning":
+            estimated_output = self.planning_output_estimate(
+                model=model,
+                use_tools=use_tools,
+            )
+            for stats in (prompt_stats, runtime_stats):
+                if not stats or stats["run_count"] <= 0:
+                    continue
+                estimated_output = max(
+                    estimated_output,
+                    round(stats["total_output_tokens"] / stats["run_count"]),
+                )
+        else:
+            estimated_output = self.strict_output_floor(
+                model=model, use_tools=use_tools
+            )
+            for stats in (prompt_stats, runtime_stats):
+                if not stats:
+                    continue
+                estimated_output = max(
+                    estimated_output,
+                    stats["max_output_tokens"],
+                )
 
         return NormalizedChatUsage(
             input_tokens=estimated_input,
             output_tokens=estimated_output,
             total_tokens=estimated_input + estimated_output,
         )
+
+    def planning_output_estimate(self, *, model: str, use_tools: bool) -> int:
+        if is_reasoning_model_name(model):
+            return (
+                DEFAULT_REASONING_TOOLS_OUTPUT_ESTIMATE
+                if use_tools
+                else DEFAULT_REASONING_OUTPUT_ESTIMATE
+            )
+        return (
+            DEFAULT_STANDARD_TOOLS_OUTPUT_ESTIMATE
+            if use_tools
+            else DEFAULT_STANDARD_OUTPUT_ESTIMATE
+        )
+
+    def strict_output_floor(self, *, model: str, use_tools: bool) -> int:
+        if is_reasoning_model_name(model):
+            return (
+                DEFAULT_REASONING_TOOLS_OUTPUT_FLOOR
+                if use_tools
+                else DEFAULT_REASONING_OUTPUT_FLOOR
+            )
+        return (
+            DEFAULT_STANDARD_TOOLS_OUTPUT_FLOOR
+            if use_tools
+            else DEFAULT_STANDARD_OUTPUT_FLOOR
+        )
+
+    def active_turn_reserved_total_locked(self) -> int:
+        return sum(
+            permit.estimated_usage.total_tokens
+            for permit in self._turn_permits.values()
+        )
+
+    def count_active_turns_for_transport_locked(self, transport_key: str) -> int:
+        return sum(
+            1
+            for permit in self._turn_permits.values()
+            if permit.transport_key == transport_key
+        )
+
+    def turn_permit_condition(self) -> asyncio.Condition:
+        loop = asyncio.get_running_loop()
+        if self._turn_permit_condition is None:
+            self._turn_permit_condition = asyncio.Condition()
+            self._turn_permit_loop = loop
+            return self._turn_permit_condition
+
+        if self._turn_permit_loop is loop:
+            return self._turn_permit_condition
+
+        if self._turn_permits:
+            raise RuntimeError(
+                "OpenAI turn permits are active on a different event loop."
+            )
+
+        self._turn_permit_condition = asyncio.Condition()
+        self._turn_permit_loop = loop
+        return self._turn_permit_condition
 
     def snapshot_for_stats(
         self, stats: StoredUsageStats | StoredPromptUsageStats
@@ -757,6 +946,7 @@ class ChatUsageTracker:
             "total_output_tokens",
             "total_tokens",
             "total_prompt_chars",
+            "max_output_tokens",
         ):
             coerced = coerce_int(raw_stats.get(key))
             if coerced is not None and coerced >= 0:

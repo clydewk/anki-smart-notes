@@ -173,4 +173,5 @@ vendor/
 
 todo*.md
 rate_limits.json
+chat_usage.json
 *.md

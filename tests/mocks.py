@@ -58,6 +58,9 @@ class MockConfig:
     uuid: str = "test-uuid-12345"
     debug: bool = True
 
+    def __getattr__(self, name: str) -> Any:
+        return object.__getattribute__(self, name)
+
     def __setattr__(self, name: str, value: Any) -> None:
         object.__setattr__(self, name, value)
 

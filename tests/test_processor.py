@@ -19,9 +19,11 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
+from src.chat_usage import ChatUsageTracker
 from tests.mocks import (
     MockConfig,
     MockNote,
@@ -113,6 +115,12 @@ def setup_data(monkeypatch, note, prompts_map, options, allow_empty_fields):
     )
 
     return p
+
+
+def setup_tracker(monkeypatch, tmp_path: Path) -> ChatUsageTracker:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
+    monkeypatch.setattr("src.note_proccessor.chat_usage_tracker", tracker)
+    return tracker
 
 
 """
@@ -596,3 +604,67 @@ async def test_process_note_reports_field_failures(monkeypatch):
     assert result.field_failures[0].field == "f2"
     assert result.field_failures[0].error == "TimeoutError"
     assert result.field_failures[0].aborted_dependents == ("f3",)
+
+
+def test_openai_batch_preflight_recommends_fast_note_count(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import src.config
+
+    note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "seed", "f2": ""})
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"f2": "Prompt {{f1}}"},
+        {},
+        allow_empty_fields=False,
+    )
+    tracker = setup_tracker(monkeypatch, tmp_path)
+
+    src.config.config.openai_daily_token_budget_enabled = True
+    src.config.config.openai_daily_token_budget = 5_000
+    tracker.finalize_request(
+        provider="openai",
+        model="gpt-5.4",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=10,
+        raw_usage={"input_tokens": 2_000, "output_tokens": 0},
+    )
+
+    notes_with_decks = [
+        (MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "one", "f2": ""}), 1),
+        (MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "two", "f2": ""}), 1),
+        (MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "three", "f2": ""}), 1),
+    ]
+    preflight = processor.estimate_openai_batch_preflight_for_notes(notes_with_decks)
+
+    assert preflight is not None
+    assert preflight.note_count == 3
+    assert preflight.request_count == 3
+    assert preflight.recommended_note_count == 1
+    assert preflight.estimated_total_tokens > preflight.fast_budget_tokens
+
+
+def test_openai_batch_preflight_counts_chained_openai_fields(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import src.config
+
+    note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "source", "f2": "", "f3": ""})
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"f2": "Summarize {{f1}}", "f3": "Expand {{f2}}"},
+        {},
+        allow_empty_fields=False,
+    )
+    setup_tracker(monkeypatch, tmp_path)
+
+    src.config.config.openai_daily_token_budget_enabled = True
+    src.config.config.openai_daily_token_budget = 10_000
+
+    estimated_requests = processor.estimate_openai_requests_for_note(note, deck_id=1)
+    assert len(estimated_requests) == 2

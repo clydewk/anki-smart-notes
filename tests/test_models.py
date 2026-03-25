@@ -88,6 +88,8 @@ def openai_test_config() -> SimpleNamespace:
         openai_api_key="sk-test",
         openai_endpoint=None,
         custom_providers=[],
+        openai_daily_token_budget_enabled=False,
+        openai_daily_token_budget=1_000_000,
     )
 
 
@@ -114,7 +116,9 @@ def custom_provider_test_config(
                 "chat_api_mode": chat_api_mode,
                 "streaming_mode": streaming_mode,
             }
-        ]
+        ],
+        openai_daily_token_budget_enabled=False,
+        openai_daily_token_budget=1_000_000,
     )
 
 
@@ -457,11 +461,7 @@ async def test_openai_text_uses_responses_http(
 
     monkeypatch.setattr(
         "src.chat_provider.config",
-        SimpleNamespace(
-            openai_api_key="sk-test",
-            openai_endpoint=None,
-            custom_providers=[],
-        ),
+        openai_test_config(),
     )
 
     async def fake_stream_sse_json(**kwargs: Any):
@@ -752,11 +752,7 @@ async def test_openai_responses_tool_loop_uses_reasoning_timeout_budget(
 
     monkeypatch.setattr(
         "src.chat_provider.config",
-        SimpleNamespace(
-            openai_api_key="sk-test",
-            openai_endpoint=None,
-            custom_providers=[],
-        ),
+        openai_test_config(),
     )
 
     async def fake_stream_sse_json(**kwargs: Any):
