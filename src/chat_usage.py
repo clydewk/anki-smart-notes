@@ -734,28 +734,61 @@ class ChatUsageTracker:
         )
         runtime_stats = self._state["runtime_profile_stats"].get(runtime_key)
 
-        for stats in (prompt_stats, runtime_stats):
-            if not stats or stats["run_count"] <= 0 or stats["total_prompt_chars"] <= 0:
-                continue
-            ratio = stats["total_input_tokens"] / stats["total_prompt_chars"]
-            estimated_input = max(
-                estimated_input,
-                math.ceil(max(prompt_chars, 1) * ratio),
-            )
-
         if mode == "planning":
+            planning_input_stats = None
+            if (
+                prompt_stats
+                and prompt_stats["run_count"] > 0
+                and prompt_stats["total_prompt_chars"] > 0
+            ):
+                planning_input_stats = prompt_stats
+            elif (
+                runtime_stats
+                and runtime_stats["run_count"] > 0
+                and runtime_stats["total_prompt_chars"] > 0
+            ):
+                planning_input_stats = runtime_stats
+            if planning_input_stats is not None:
+                ratio = (
+                    planning_input_stats["total_input_tokens"]
+                    / planning_input_stats["total_prompt_chars"]
+                )
+                estimated_input = max(
+                    estimated_input,
+                    math.ceil(max(prompt_chars, 1) * ratio),
+                )
+
             estimated_output = self.planning_output_estimate(
                 model=model,
                 use_tools=use_tools,
             )
-            for stats in (prompt_stats, runtime_stats):
-                if not stats or stats["run_count"] <= 0:
-                    continue
+            planning_output_stats = None
+            if prompt_stats and prompt_stats["run_count"] > 0:
+                planning_output_stats = prompt_stats
+            elif runtime_stats and runtime_stats["run_count"] > 0:
+                planning_output_stats = runtime_stats
+            if planning_output_stats is not None:
                 estimated_output = max(
                     estimated_output,
-                    round(stats["total_output_tokens"] / stats["run_count"]),
+                    round(
+                        planning_output_stats["total_output_tokens"]
+                        / planning_output_stats["run_count"]
+                    ),
                 )
         else:
+            for stats in (prompt_stats, runtime_stats):
+                if (
+                    not stats
+                    or stats["run_count"] <= 0
+                    or stats["total_prompt_chars"] <= 0
+                ):
+                    continue
+                ratio = stats["total_input_tokens"] / stats["total_prompt_chars"]
+                estimated_input = max(
+                    estimated_input,
+                    math.ceil(max(prompt_chars, 1) * ratio),
+                )
+
             estimated_output = self.strict_output_floor(
                 model=model, use_tools=use_tools
             )

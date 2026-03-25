@@ -413,3 +413,63 @@ def test_finalize_request_updates_scope_and_provider_breakdown(tmp_path) -> None
         ("anthropic", 10),
         ("openai", 5),
     ]
+
+
+def test_planning_estimate_prefers_prompt_history_over_runtime_average(
+    tmp_path,
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
+    prompt_key = build_prompt_usage_key("Basic", 1, "Front")
+    prompt_signature = build_prompt_usage_signature(
+        prompt="Question: {{Front}}",
+        provider="openai",
+        model="gpt-5.4",
+        reasoning_effort=None,
+        use_tools=False,
+    )
+    other_prompt_key = build_prompt_usage_key("Basic", 1, "Back")
+    other_prompt_signature = build_prompt_usage_signature(
+        prompt="Essay: {{Back}}",
+        provider="openai",
+        model="gpt-5.4",
+        reasoning_effort=None,
+        use_tools=False,
+    )
+
+    tracker.finalize_request(
+        provider="openai",
+        model="gpt-5.4",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=200,
+        raw_usage={"input_tokens": 50, "output_tokens": 600},
+        prompt_key=prompt_key,
+        prompt_signature=prompt_signature,
+        record_openai_daily_usage=False,
+    )
+    tracker.finalize_request(
+        provider="openai",
+        model="gpt-5.4",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=50,
+        raw_usage={"input_tokens": 2_000, "output_tokens": 12_000},
+        prompt_key=other_prompt_key,
+        prompt_signature=other_prompt_signature,
+        record_openai_daily_usage=False,
+    )
+
+    usage = tracker.estimate_request_usage(
+        provider="openai",
+        model="gpt-5.4",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=200,
+        prompt_bytes=200,
+        prompt_key=prompt_key,
+        prompt_signature=prompt_signature,
+        mode="planning",
+    )
+
+    assert usage.input_tokens == 67
+    assert usage.output_tokens == 1_024
