@@ -49,6 +49,8 @@ class StoredUsageStats(TypedDict):
     total_output_tokens: int
     total_tokens: int
     total_prompt_chars: int
+    total_response_chars: int
+    response_chars_samples: int
     max_output_tokens: int
     last_used_at: str | None
 
@@ -84,6 +86,7 @@ class PromptUsageStatsSnapshot:
     avg_input_tokens: float
     avg_output_tokens: float
     avg_total_tokens: float
+    avg_response_chars: float | None
 
 
 @dataclass(frozen=True)
@@ -384,12 +387,37 @@ class ChatUsageTracker:
                 aggregate["total_output_tokens"] += prompt_stats["total_output_tokens"]
                 aggregate["total_tokens"] += prompt_stats["total_tokens"]
                 aggregate["total_prompt_chars"] += prompt_stats["total_prompt_chars"]
+                aggregate["total_response_chars"] += prompt_stats[
+                    "total_response_chars"
+                ]
+                aggregate["response_chars_samples"] += prompt_stats[
+                    "response_chars_samples"
+                ]
                 aggregate["max_output_tokens"] = max(
                     aggregate["max_output_tokens"],
                     prompt_stats["max_output_tokens"],
                 )
 
             return self.snapshot_for_stats(aggregate) if aggregate else None
+
+    def get_runtime_profile_usage(
+        self,
+        *,
+        provider: str,
+        model: str,
+        reasoning_effort: str | None,
+        use_tools: bool,
+    ) -> PromptUsageStatsSnapshot | None:
+        with self._lock:
+            self.ensure_loaded_locked()
+            runtime_key = build_runtime_profile_key(
+                provider=provider,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                use_tools=use_tools,
+            )
+            runtime_stats = self._state["runtime_profile_stats"].get(runtime_key)
+            return self.snapshot_for_stats(runtime_stats) if runtime_stats else None
 
     def get_openai_daily_usage(self) -> OpenAIDailyUsageSnapshot:
         with self._lock:
@@ -582,6 +610,7 @@ class ChatUsageTracker:
         use_tools: bool,
         prompt_chars: int,
         raw_usage: dict[str, Any] | None,
+        response_chars: int | None = None,
         scope_id: str | None = None,
         prompt_key: str | None = None,
         prompt_signature: str | None = None,
@@ -614,6 +643,7 @@ class ChatUsageTracker:
                 stats=runtime_stats,
                 usage=normalized_usage,
                 prompt_chars=prompt_chars,
+                response_chars=response_chars,
             )
             changed = True
 
@@ -630,6 +660,7 @@ class ChatUsageTracker:
                     stats=prompt_stats,
                     usage=normalized_usage,
                     prompt_chars=prompt_chars,
+                    response_chars=response_chars,
                 )
 
             if provider.lower() == "openai" and record_openai_daily_usage:
@@ -665,6 +696,8 @@ class ChatUsageTracker:
             "total_output_tokens": 0,
             "total_tokens": 0,
             "total_prompt_chars": 0,
+            "total_response_chars": 0,
+            "response_chars_samples": 0,
             "max_output_tokens": 0,
             "last_used_at": None,
         }
@@ -689,12 +722,16 @@ class ChatUsageTracker:
         stats: StoredUsageStats,
         usage: NormalizedChatUsage,
         prompt_chars: int,
+        response_chars: int | None = None,
     ) -> None:
         stats["run_count"] += 1
         stats["total_input_tokens"] += usage.input_tokens
         stats["total_output_tokens"] += usage.output_tokens
         stats["total_tokens"] += usage.total_tokens
         stats["total_prompt_chars"] += max(prompt_chars, 0)
+        if response_chars is not None:
+            stats["total_response_chars"] += max(response_chars, 0)
+            stats["response_chars_samples"] += 1
         stats["max_output_tokens"] = max(
             stats["max_output_tokens"],
             usage.output_tokens,
@@ -876,6 +913,11 @@ class ChatUsageTracker:
             avg_input_tokens=stats["total_input_tokens"] / run_count,
             avg_output_tokens=stats["total_output_tokens"] / run_count,
             avg_total_tokens=stats["total_tokens"] / run_count,
+            avg_response_chars=(
+                stats["total_response_chars"] / stats["response_chars_samples"]
+                if stats["response_chars_samples"] > 0
+                else None
+            ),
         )
 
     def ensure_loaded_locked(self) -> None:
@@ -979,6 +1021,8 @@ class ChatUsageTracker:
             "total_output_tokens",
             "total_tokens",
             "total_prompt_chars",
+            "total_response_chars",
+            "response_chars_samples",
             "max_output_tokens",
         ):
             coerced = coerce_int(raw_stats.get(key))

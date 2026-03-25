@@ -432,8 +432,20 @@ class NoteProcessor:
         )
 
         estimated_chars = 256
-        if snapshot is not None and snapshot.avg_output_tokens > 0:
-            estimated_chars = round(snapshot.avg_output_tokens * 4)
+        if snapshot is not None and snapshot.avg_response_chars is not None:
+            estimated_chars = round(snapshot.avg_response_chars)
+        else:
+            runtime_snapshot = chat_usage_tracker.get_runtime_profile_usage(
+                provider=str(chat_provider),
+                model=str(chat_model),
+                reasoning_effort=chat_reasoning_effort,
+                use_tools=use_tools,
+            )
+            if (
+                runtime_snapshot is not None
+                and runtime_snapshot.avg_response_chars is not None
+            ):
+                estimated_chars = round(runtime_snapshot.avg_response_chars)
         estimated_chars = max(32, min(estimated_chars, 2048))
         return "x" * estimated_chars
 

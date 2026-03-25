@@ -171,6 +171,40 @@ def test_global_prompt_usage_lookup_aggregates_matching_decks(tmp_path) -> None:
     assert aggregate_snapshot.avg_input_tokens == 12
     assert aggregate_snapshot.avg_output_tokens == 7
     assert aggregate_snapshot.avg_total_tokens == 19
+    assert aggregate_snapshot.avg_response_chars is None
+
+
+def test_prompt_usage_snapshot_tracks_avg_response_chars(tmp_path) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
+    signature = build_prompt_usage_signature(
+        prompt="Question: {{Front}}",
+        provider="openai",
+        model="gpt-5.4",
+        reasoning_effort=None,
+        use_tools=False,
+    )
+
+    tracker.finalize_request(
+        provider="openai",
+        model="gpt-5.4",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=20,
+        raw_usage={"input_tokens": 10, "output_tokens": 5},
+        response_chars=80,
+        prompt_key=build_prompt_usage_key("Basic", 1, "Front"),
+        prompt_signature=signature,
+        record_openai_daily_usage=False,
+    )
+
+    snapshot = tracker.get_prompt_usage(
+        note_type="Basic",
+        deck_id=1,
+        field_lower="Front",
+        signature=signature,
+    )
+    assert snapshot is not None
+    assert snapshot.avg_response_chars == 80
 
 
 def test_openai_daily_usage_resets_on_utc_rollover(tmp_path) -> None:

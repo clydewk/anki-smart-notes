@@ -322,6 +322,10 @@ class FieldProcessor:
                 return None
             raise
 
+        response_text = provider_result.text
+        if response_text and should_convert_to_html:
+            response_text = convert_markdown_to_html(response_text)
+
         chat_usage_tracker.finalize_request(
             provider=str(provider),
             model=str(model),
@@ -329,6 +333,7 @@ class FieldProcessor:
             use_tools=use_tools,
             prompt_chars=prompt_chars,
             raw_usage=provider_result.usage,
+            response_chars=len(response_text),
             scope_id=usage_scope_id,
             prompt_key=prompt_usage_context.prompt_key
             if prompt_usage_context
@@ -338,10 +343,6 @@ class FieldProcessor:
             ),
             record_openai_daily_usage=False,
         )
-
-        response_text = provider_result.text
-        if response_text and should_convert_to_html:
-            response_text = convert_markdown_to_html(response_text)
 
         return response_text
 

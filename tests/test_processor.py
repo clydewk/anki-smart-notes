@@ -23,7 +23,11 @@ from pathlib import Path
 
 import pytest
 
-from src.chat_usage import ChatUsageTracker
+from src.chat_usage import (
+    ChatUsageTracker,
+    build_prompt_usage_key,
+    build_prompt_usage_signature,
+)
 from tests.mocks import (
     MockConfig,
     MockNote,
@@ -668,3 +672,102 @@ def test_openai_batch_preflight_counts_chained_openai_fields(
 
     estimated_requests = processor.estimate_openai_requests_for_note(note, deck_id=1)
     assert len(estimated_requests) == 2
+
+
+def test_estimated_generated_field_value_uses_visible_response_chars(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from src.dag import generate_fields_dag
+
+    note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "source", "f2": "", "f3": ""})
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"f2": "Summarize {{f1}}", "f3": "Expand {{f2}}"},
+        {},
+        allow_empty_fields=False,
+    )
+    tracker = setup_tracker(monkeypatch, tmp_path)
+    dag = generate_fields_dag(note, overwrite_fields=False, deck_id=1)
+    node = dag["f2"]
+    prompt = "Summarize {{f1}}"
+
+    tracker.finalize_request(
+        provider="openai",
+        model="gpt-4o-mini",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=16,
+        raw_usage={"input_tokens": 200, "output_tokens": 4_000},
+        response_chars=96,
+        prompt_key=build_prompt_usage_key(NOTE_TYPE_NAME, 1, "f2"),
+        prompt_signature=build_prompt_usage_signature(
+            prompt=prompt,
+            provider="openai",
+            model="gpt-4o-mini",
+            reasoning_effort=None,
+            use_tools=False,
+        ),
+        record_openai_daily_usage=False,
+    )
+
+    assert (
+        len(
+            processor.estimated_generated_field_value(
+                note_type=NOTE_TYPE_NAME,
+                node=node,
+                prompt=prompt,
+            )
+        )
+        == 96
+    )
+
+
+def test_estimated_generated_field_value_defaults_without_response_chars(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from src.dag import generate_fields_dag
+
+    note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "source", "f2": "", "f3": ""})
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"f2": "Summarize {{f1}}", "f3": "Expand {{f2}}"},
+        {},
+        allow_empty_fields=False,
+    )
+    tracker = setup_tracker(monkeypatch, tmp_path)
+    dag = generate_fields_dag(note, overwrite_fields=False, deck_id=1)
+    node = dag["f2"]
+    prompt = "Summarize {{f1}}"
+
+    tracker.finalize_request(
+        provider="openai",
+        model="gpt-4o-mini",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=16,
+        raw_usage={"input_tokens": 200, "output_tokens": 4_000},
+        prompt_key=build_prompt_usage_key(NOTE_TYPE_NAME, 1, "f2"),
+        prompt_signature=build_prompt_usage_signature(
+            prompt=prompt,
+            provider="openai",
+            model="gpt-4o-mini",
+            reasoning_effort=None,
+            use_tools=False,
+        ),
+        record_openai_daily_usage=False,
+    )
+
+    assert (
+        len(
+            processor.estimated_generated_field_value(
+                note_type=NOTE_TYPE_NAME,
+                node=node,
+                prompt=prompt,
+            )
+        )
+        == 256
+    )
