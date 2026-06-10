@@ -60,6 +60,7 @@ model_labels = {
     "flux-schnell": "Flux Schnell (1x Image Cost)",
     "flux-dev": "Flux Dev (8x Image Cost)",
     "gemini-3-pro-image-preview": "Google Gemini 3 Pro (Image Preview)",
+    "gpt-image-2": "GPT Image 2",
     "gpt-image-1.5": "GPT Image 1.5 (SOTA)",
     "gpt-image-1": "GPT Image 1",
     "gpt-image-1-mini": "GPT Image 1 Mini (Cost Effective)",
@@ -69,7 +70,13 @@ model_labels = {
 provider_models: dict[ImageProviders, list[ImageModels]] = {
     "replicate": ["flux-schnell", "flux-dev"],
     "google": ["gemini-3-pro-image-preview"],
-    "openai": ["gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini", "dall-e-3"],
+    "openai": [
+        "gpt-image-2",
+        "gpt-image-1.5",
+        "gpt-image-1",
+        "gpt-image-1-mini",
+        "dall-e-3",
+    ],
 }
 
 aspect_ratios: list[ImageAspectRatio] = ["1:1", "16:9", "4:3", "3:4", "9:16"]

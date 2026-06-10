@@ -34,9 +34,8 @@ from .models import (
     ChatProviders,
     CustomProvider,
     OpenAIReasoningEffort,
-    openai_chat_models,
+    filter_openai_text_models,
     openai_reasoning_efforts_for_model,
-    provider_model_map,
 )
 from .provider_runtime import (
     ProviderHTTPError,
@@ -63,6 +62,7 @@ ResolvedApiMode = Literal["responses", "chat_completions"]
 ConversationRole = Literal["user", "assistant", "tool"]
 
 MAX_TOOL_TURNS = 6
+REASONING_TRACE_MAX_CHARS = 4000
 
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[str]]
@@ -439,54 +439,9 @@ def parse_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
     return {}
 
 
-def update_openai_chat_models(models: list[str]) -> None:
-    openai_chat_models.clear()
-    openai_chat_models.extend(cast("list[ChatModels]", models))
-    provider_model_map["openai"] = openai_chat_models
-
-
-def filter_openai_text_models(models: list[str]) -> list[str]:
-    blocked_fragments = (
-        "audio",
-        "tts",
-        "transcribe",
-        "embedding",
-        "moderation",
-        "realtime",
-        "image",
-        "dall-e",
-        "whisper",
-        "search-preview",
-    )
-
-    filtered = [
-        model
-        for model in models
-        if model.startswith(("gpt-", "o1", "o3", "o4"))
-        and not any(fragment in model for fragment in blocked_fragments)
-    ]
-
-    def sort_key(model: str) -> tuple[int, str]:
-        if model == "gpt-5-nano":
-            return (0, model)
-        if model == "gpt-4o-mini":
-            return (1, model)
-        if model == "gpt-5-mini":
-            return (2, model)
-        if model == "gpt-5.3-chat-latest":
-            return (3, model)
-        if model == "gpt-5-chat-latest":
-            return (4, model)
-        if model == "gpt-5":
-            return (5, model)
-        return (6, model)
-
-    return sorted(dict.fromkeys(filtered), key=sort_key)
-
-
 class ChatProvider:
     def __init__(self) -> None:
-        self._openai_models_cache: list[str] = list(openai_chat_models)
+        self._openai_models_cache: list[str] = []
 
     async def async_get_chat_response(
         self,
@@ -668,7 +623,6 @@ class ChatProvider:
 
         if models:
             self._openai_models_cache = models
-            update_openai_chat_models(models)
         return list(self._openai_models_cache)
 
     def get_cached_openai_chat_models(self) -> list[str]:
@@ -1051,6 +1005,13 @@ class ChatProvider:
             await chat_usage_tracker.release_openai_turn_permit(permit)
             raise
 
+        self._log_reasoning_trace(
+            provider=provider_name,
+            model=request.model,
+            source="responses",
+            payload=response,
+        )
+
         try:
             turn_result = self._parse_openai_responses_turn(response)
         except Exception:
@@ -1132,6 +1093,12 @@ class ChatProvider:
                 model=request.model,
                 timeouts=responses_timeouts(request.reasoning_effort),
             ):
+                self._log_reasoning_trace(
+                    provider=provider_name,
+                    model=request.model,
+                    source="responses_stream",
+                    payload=event,
+                )
                 event_type = str(event.get("type", ""))
                 if event_type == "done":
                     continue
@@ -1391,6 +1358,13 @@ class ChatProvider:
                 await chat_usage_tracker.release_openai_turn_permit(permit)
                 raise ResponseFormatError("Responses API returned an invalid payload.")
 
+            self._log_reasoning_trace(
+                provider=provider_name,
+                model=request.model,
+                source="responses",
+                payload=response,
+            )
+
             try:
                 response_id = self._response_id(response)
                 usage = self._extract_usage(response)
@@ -1442,6 +1416,12 @@ class ChatProvider:
                 model=request.model,
                 timeouts=responses_timeouts(request.reasoning_effort),
             ):
+                self._log_reasoning_trace(
+                    provider=provider_name,
+                    model=request.model,
+                    source="responses_stream",
+                    payload=event,
+                )
                 event_type = str(event.get("type", ""))
 
                 if event_type == "done":
@@ -1687,6 +1667,12 @@ class ChatProvider:
                 model=request.model,
                 timeouts=responses_timeouts(request.reasoning_effort),
             ):
+                self._log_reasoning_trace(
+                    provider=provider_name,
+                    model=request.model,
+                    source="chat_stream",
+                    payload=event,
+                )
                 event_type = str(event.get("type", ""))
                 if event_type == "done":
                     continue
@@ -1722,6 +1708,12 @@ class ChatProvider:
             provider=provider_name,
             model=request.model,
             timeouts=json_timeouts(),
+        )
+        self._log_reasoning_trace(
+            provider=provider_name,
+            model=request.model,
+            source="chat",
+            payload=response,
         )
         text = self._extract_openai_chat_text(response)
         usage = self._extract_usage(response)
@@ -1875,6 +1867,12 @@ class ChatProvider:
             provider=provider_name,
             model=request.model,
             timeouts=json_timeouts(),
+        )
+        self._log_reasoning_trace(
+            provider=provider_name,
+            model=request.model,
+            source="chat",
+            payload=response,
         )
         return self._parse_openai_chat_turn(response)
 
@@ -2440,6 +2438,84 @@ class ChatProvider:
             usage=self._extract_usage(response),
             response_id=self._response_id(response),
         )
+
+    def _log_reasoning_trace(
+        self,
+        *,
+        provider: str,
+        model: str,
+        source: str,
+        payload: Any,
+    ) -> None:
+        if not bool(getattr(config, "debug", False)):
+            return
+
+        for trace in self._extract_reasoning_traces(payload):
+            clean_trace = " ".join(trace.split())
+            if not clean_trace:
+                continue
+            if len(clean_trace) > REASONING_TRACE_MAX_CHARS:
+                clean_trace = (
+                    clean_trace[:REASONING_TRACE_MAX_CHARS].rstrip() + "... [truncated]"
+                )
+            logger.debug(
+                "Reasoning trace provider=%s model=%s source=%s: %s",
+                provider,
+                model,
+                source,
+                clean_trace,
+            )
+
+    def _extract_reasoning_traces(self, payload: Any) -> list[str]:
+        traces: list[str] = []
+
+        def collect(value: Any, *, in_reasoning: bool = False) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    collect(item, in_reasoning=in_reasoning)
+                return
+
+            if not isinstance(value, dict):
+                return
+
+            raw_type = value.get("type")
+            item_type = raw_type if isinstance(raw_type, str) else ""
+            next_in_reasoning = in_reasoning or any(
+                marker in item_type.lower()
+                for marker in ("reasoning", "thinking", "thought")
+            )
+
+            for key, child in value.items():
+                lower_key = str(key).lower()
+                if any(
+                    blocked in lower_key
+                    for blocked in ("encrypted", "signature", "cipher")
+                ):
+                    continue
+
+                child_in_reasoning = next_in_reasoning or any(
+                    marker in lower_key
+                    for marker in ("reasoning", "thinking", "thought")
+                )
+
+                if isinstance(child, str):
+                    if child_in_reasoning and lower_key in {
+                        "text",
+                        "content",
+                        "summary",
+                        "reasoning",
+                        "reasoning_content",
+                        "thinking",
+                        "thought",
+                        "delta",
+                    }:
+                        traces.append(child)
+                    continue
+
+                collect(child, in_reasoning=child_in_reasoning)
+
+        collect(payload)
+        return traces
 
     def _extract_model_ids(self, payload: Any) -> list[str]:
         if not isinstance(payload, dict):

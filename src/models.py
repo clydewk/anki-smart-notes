@@ -17,6 +17,8 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import re
+from dataclasses import dataclass
 from typing import Any, Literal, Optional, TypedDict, Union, cast
 
 # Providers
@@ -24,36 +26,65 @@ from typing import Any, Literal, Optional, TypedDict, Union, cast
 TTSProviders = Literal["openai", "elevenLabs", "google", "azure"]
 ChatProviders = Literal["openai", "anthropic", "deepseek", "google"]
 
+# Reasoning Efforts
+# "none" is a UI concept meaning "don't use reasoning, use temperature instead"
+OpenAIReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+OPENAI_DEFAULT_REASONING_EFFORTS: tuple[OpenAIReasoningEffort, ...] = (
+    "low",
+    "medium",
+    "high",
+)
+OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH: tuple[OpenAIReasoningEffort, ...] = (
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
+
+
 # Chat Models
 
-OpenAIModels = Literal[
-    "gpt-5.2",
-    "gpt-5.4",
-    "gpt-5.3-chat-latest",
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-5-nano",
-    "gpt-5-chat-latest",
-    "gpt-4o-mini",
-]
-DeepseekModels = Literal["deepseek-v3"]
-AnthropicModels = Literal[
-    "claude-3-5-haiku-latest", "claude-sonnet-4-0", "claude-opus-4-1"
-]
-GoogleChatModels = Literal["gemini-3-pro-preview", "gemini-3-flash-preview"]
+OpenAIModels = str
+DeepseekModels = str
+AnthropicModels = str
+GoogleChatModels = str
+ChatModels = str
 
-ChatModels = Union[OpenAIModels, AnthropicModels, DeepseekModels, GoogleChatModels]
 
-# Order that the models are displayed in the UI
+@dataclass(frozen=True)
+class OpenAIChatModelSpec:
+    model: str
+    label: str
+    reasoning_efforts: tuple[OpenAIReasoningEffort, ...]
+
+
+OPENAI_CHAT_MODEL_CATALOG: tuple[OpenAIChatModelSpec, ...] = (
+    OpenAIChatModelSpec(
+        "gpt-5.5", "GPT-5.5", OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH
+    ),
+    OpenAIChatModelSpec(
+        "gpt-5.4", "GPT-5.4", OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH
+    ),
+    OpenAIChatModelSpec(
+        "gpt-5.4-mini",
+        "GPT-5.4 Mini",
+        OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH,
+    ),
+    OpenAIChatModelSpec(
+        "gpt-5.4-nano",
+        "GPT-5.4 Nano",
+        OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH,
+    ),
+)
+
+# Order that the models are displayed in the curated OpenAI UI
 openai_chat_models: list[ChatModels] = [
-    "gpt-5-nano",
-    "gpt-4o-mini",
-    "gpt-5-mini",
-    "gpt-5.3-chat-latest",
-    "gpt-5",
-    "gpt-5.2",
-    "gpt-5.4",
+    spec.model for spec in OPENAI_CHAT_MODEL_CATALOG
 ]
+OPENAI_CHAT_MODEL_LABELS: dict[str, str] = {
+    spec.model: spec.label for spec in OPENAI_CHAT_MODEL_CATALOG
+}
 
 anthropic_chat_models: list[ChatModels] = [
     "claude-opus-4-1",
@@ -77,12 +108,6 @@ provider_model_map: dict[ChatProviders, list[ChatModels]] = {
 
 
 legacy_openai_chat_models: list[str] = [
-    "gpt-5.3-chat-latest",
-    "gpt-5.2",
-    "gpt-5.4",
-    "gpt-5",
-    "gpt-5-nano",
-    "gpt-5-mini",
     "gpt-4o-mini",
     "gpt-4o",
     "gpt-4-turbo",
@@ -96,22 +121,8 @@ legacy_openai_chat_models: list[str] = [
     "o4-mini",
 ]
 
-# Reasoning Efforts
-# "none" is a UI concept meaning "don't use reasoning, use temperature instead"
-# gpt-5: added "minimal"
-# gpt-5.1: dropped "minimal", added "none"
-# gpt-5.2: added "xhigh"
-OpenAIReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
-OPENAI_DEFAULT_REASONING_EFFORTS: tuple[OpenAIReasoningEffort, ...] = (
-    "low",
-    "medium",
-    "high",
-)
 OPENAI_REASONING_EFFORTS_BY_MODEL: dict[str, tuple[OpenAIReasoningEffort, ...]] = {
-    "gpt-5": ("minimal", "low", "medium", "high"),
-    "gpt-5.1": ("none", "low", "medium", "high"),
-    "gpt-5.2": ("none", "low", "medium", "high", "xhigh"),
-    "gpt-5.4": ("none", "low", "medium", "high", "xhigh"),
+    spec.model: spec.reasoning_efforts for spec in OPENAI_CHAT_MODEL_CATALOG
 }
 
 
@@ -122,6 +133,91 @@ def openai_reasoning_efforts_for_model(model: str) -> list[OpenAIReasoningEffort
     )
 
 
+def openai_model_label(model: str) -> str:
+    if model in OPENAI_CHAT_MODEL_LABELS:
+        return OPENAI_CHAT_MODEL_LABELS[model]
+
+    chat_latest_match = re.fullmatch(r"gpt-(\d+(?:\.\d+)?)-chat-latest", model)
+    if chat_latest_match:
+        return f"GPT-{chat_latest_match.group(1)} Chat Latest"
+
+    model_match = re.fullmatch(r"gpt-(\d+(?:\.\d+)?)(?:-(mini|nano|pro))?", model)
+    if not model_match:
+        return model
+
+    label = f"GPT-{model_match.group(1)}"
+    tier = model_match.group(2)
+    if tier:
+        label = f"{label} {tier.title()}"
+    return label
+
+
+def is_dated_openai_model_snapshot(model: str) -> bool:
+    return re.search(r"-\d{4}-\d{2}-\d{2}$", model) is not None
+
+
+def is_available_openai_chat_model(model: str) -> bool:
+    normalized = model.lower()
+    if normalized in openai_chat_models:
+        return True
+    if is_dated_openai_model_snapshot(normalized):
+        return False
+    return (
+        re.fullmatch(r"gpt-5(?:\.\d+)?(?:-(?:mini|nano|pro|chat-latest))?", normalized)
+        is not None
+    )
+
+
+def openai_chat_model_sort_key(model: str) -> tuple[int, int, int, int, str]:
+    if model in openai_chat_models:
+        return (0, openai_chat_models.index(model), 0, 0, model)
+
+    model_match = re.fullmatch(
+        r"gpt-(5)(?:\.(\d+))?(?:-(mini|nano|chat-latest|pro))?", model
+    )
+    if not model_match:
+        return (2, 0, 0, 0, model)
+
+    minor = int(model_match.group(2) or 0)
+    tier_order = {
+        "": 0,
+        "mini": 1,
+        "nano": 2,
+        "chat-latest": 3,
+        "pro": 4,
+    }
+    tier = model_match.group(3) or ""
+    return (1, -minor, tier_order.get(tier, 9), 0, model)
+
+
+def filter_openai_text_models(models: list[str]) -> list[str]:
+    filtered = [
+        model.lower()
+        for model in models
+        if is_available_openai_chat_model(model.lower())
+    ]
+    return sorted(dict.fromkeys(filtered), key=openai_chat_model_sort_key)
+
+
+def openai_chat_models_for_display(
+    available_models: list[str],
+    *,
+    include_available: bool = False,
+    current_model: Optional[str] = None,
+) -> list[ChatModels]:
+    models = list(openai_chat_models)
+
+    if include_available:
+        for model in filter_openai_text_models(available_models):
+            if model not in models:
+                models.append(model)
+
+    if current_model and current_model not in models:
+        models.append(current_model)
+
+    return models
+
+
 # TTS Models
 
 OpenAITTSModels = Literal["tts-1", "tts-1-hd", "gpt-4o-mini-tts"]
@@ -130,6 +226,7 @@ GoogleModels = Literal[
     "standard",
     "wavenet",
     "neural",
+    "gemini-3.1-flash-tts-preview",
     "gemini-2.5-flash-preview-tts",
     "gemini-2.5-pro-preview-tts",
 ]
@@ -165,7 +262,11 @@ SmartFieldType = Literal["chat", "tts", "image"]
 ReplicateImageModels = Literal["flux-dev", "flux-schnell"]
 GoogleImageModels = Literal["gemini-3-pro-image-preview"]
 OpenAIImageModels = Literal[
-    "gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini", "dall-e-3"
+    "gpt-image-2",
+    "gpt-image-1.5",
+    "gpt-image-1",
+    "gpt-image-1-mini",
+    "dall-e-3",
 ]
 ImageModels = Union[ReplicateImageModels, GoogleImageModels, OpenAIImageModels]
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -126,6 +127,7 @@ class TrafficController:
         self._condition = asyncio.Condition()
         self._cooldown_until: float | None = None
         self._ramp_blocked_until: float | None = None
+        self._unavailable_error: str | None = None
         self._metrics = TransportMetrics(concurrency_window=self._window)
 
     async def acquire(self) -> None:
@@ -133,6 +135,8 @@ class TrafficController:
             sleep_for = 0.0
             async with self._condition:
                 now = time.time()
+                if self._unavailable_error is not None:
+                    raise ProviderUnavailableError(self._unavailable_error)
                 if self._cooldown_until is not None and now < self._cooldown_until:
                     sleep_for = self._cooldown_until - now
                 elif self._inflight < self._window:
@@ -188,6 +192,14 @@ class TrafficController:
         if shared_capacity and retry_after_sec is None and reset_after_sec is None:
             self._ramp_blocked_until = now + 900
             self._metrics.ramp_blocked_until = self._ramp_blocked_until
+
+    def note_quota_exhausted(self, message: str) -> None:
+        self._unavailable_error = message
+        self.note_throttle(
+            retry_after_sec=None,
+            reset_after_sec=None,
+            shared_capacity=False,
+        )
 
     def note_timeout(self) -> None:
         self._metrics.timeouts += 1
@@ -274,8 +286,82 @@ def is_shared_capacity_error(provider: str, body_text: str) -> bool:
     )
 
 
-def is_daily_quota_error(body_text: str) -> bool:
+def parse_google_retry_delay(body_text: str) -> float | None:
+    try:
+        payload = json.loads(body_text)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, dict):
+        details = payload.get("details")
+        if isinstance(details, list):
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                retry_delay = detail.get("retryDelay")
+                if isinstance(retry_delay, str):
+                    parsed = parse_reset_header(retry_delay)
+                    if parsed is not None:
+                        return parsed
+
+        error = payload.get("error")
+        if isinstance(error, dict):
+            nested_delay = parse_google_retry_delay(json.dumps(error))
+            if nested_delay is not None:
+                return nested_delay
+
+    retry_match = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", body_text, re.I)
+    if retry_match:
+        return float(retry_match.group(1))
+
+    return None
+
+
+def has_daily_quota_violation(body_text: str) -> bool:
+    try:
+        payload = json.loads(body_text)
+    except json.JSONDecodeError:
+        payload = None
+
+    if not isinstance(payload, dict):
+        return "daily limit" in body_text.lower() or "per day" in body_text.lower()
+
+    details = payload.get("details")
+    if not isinstance(details, list):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return has_daily_quota_violation(json.dumps(error))
+        return False
+
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        violations = detail.get("violations")
+        if not isinstance(violations, list):
+            continue
+        for violation in violations:
+            if not isinstance(violation, dict):
+                continue
+            quota_id = str(violation.get("quotaId", "")).lower()
+            quota_metric = str(violation.get("quotaMetric", "")).lower()
+            if "perday" in quota_id or "per_day" in quota_id or "per day" in quota_id:
+                return True
+            if "daily" in quota_id or "daily" in quota_metric:
+                return True
+
+    return False
+
+
+def is_terminal_quota_error(provider: str, body_text: str) -> bool:
     text = body_text.lower()
+    if provider in {"google", "google_tts"}:
+        return (
+            "daily limit" in text
+            or "monthly usage limit" in text
+            or "insufficient_quota" in text
+            or has_daily_quota_violation(body_text)
+        )
+
     return (
         "quota" in text
         or "daily limit" in text
@@ -301,7 +387,7 @@ def build_httpx_timeout(
 QUEUE_LOG_THRESHOLD_SEC = 0.5
 SLOW_REQUEST_LOG_THRESHOLD_SEC = 5.0
 PROVIDER_ERROR_DETAIL_LOG_LIMIT = 300
-OFFICIAL_PROVIDER_NAMES = {"openai", "anthropic", "deepseek", "google"}
+OFFICIAL_PROVIDER_NAMES = {"openai", "anthropic", "deepseek", "google", "google_tts"}
 PROVIDER_TRACE_HEADER_NAMES = (
     "x-request-id",
     "request-id",
@@ -854,6 +940,8 @@ class ProviderRuntime:
     ) -> bool:
         retryable = error.status in {408, 429, 500, 502, 503, 504}
         retry_after = parse_retry_after(error.headers)
+        if retry_after is None and provider in {"google", "google_tts"}:
+            retry_after = parse_google_retry_delay(error.body)
         reset_after = parse_rate_limit_reset(error.headers)
 
         if not retryable:
@@ -882,12 +970,12 @@ class ProviderRuntime:
             )
             raise error
 
-        if error.status == 429 and is_daily_quota_error(error.body):
-            controller.note_throttle(
-                retry_after_sec=retry_after,
-                reset_after_sec=reset_after,
-                shared_capacity=False,
+        if error.status == 429 and is_terminal_quota_error(provider, error.body):
+            unavailable_message = (
+                f"{provider}:{model} quota exhausted: "
+                f"{extract_provider_error_detail(error.body)}"
             )
+            controller.note_quota_exhausted(unavailable_message)
             self._log_http_error(
                 provider=provider,
                 model=model,
@@ -898,9 +986,7 @@ class ProviderRuntime:
                 reset_after=reset_after,
                 will_retry=False,
             )
-            raise ProviderUnavailableError(
-                f"{provider}:{model} quota exhausted: {extract_provider_error_detail(error.body)}"
-            ) from error
+            raise ProviderUnavailableError(unavailable_message) from error
 
         controller.note_throttle(
             retry_after_sec=retry_after,

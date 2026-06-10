@@ -174,8 +174,11 @@ class TTSProvider:
 
         language_code = "-".join(voice.split("-")[:2])
         data_bytes = await self._execute_request(
-            url=f"https://texttospeech.googleapis.com/v1/text:synthesize?key={api_key}",
-            headers=None,
+            url="https://texttospeech.googleapis.com/v1/text:synthesize",
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
             json_payload={
                 "input": {"text": text},
                 "voice": {"languageCode": language_code, "name": voice},
@@ -194,8 +197,11 @@ class TTSProvider:
             raise Exception("Google API key not found.")
 
         data_bytes = await self._execute_request(
-            url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
+            url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
             json_payload={
                 "contents": [{"parts": [{"text": text}]}],
                 "generationConfig": {
@@ -212,23 +218,84 @@ class TTSProvider:
         data = json.loads(data_bytes)
 
         try:
-            inline_data = data["candidates"][0]["content"]["parts"][0]["inlineData"]
-            audio_b64 = inline_data["data"]
-            pcm_data = base64.b64decode(audio_b64)
-
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(24000)
-                wav_file.writeframes(pcm_data)
-
-            return wav_buffer.getvalue()
+            return self._extract_google_gemini_audio_bytes(data)
         except (KeyError, IndexError) as exc:
             logger.error(f"Unexpected response format from Google Gemini TTS: {data}")
             raise Exception(
                 "Failed to extract audio from Google Gemini response"
             ) from exc
+
+    def _extract_google_gemini_audio_bytes(self, data: Any) -> bytes:
+        if not isinstance(data, dict):
+            raise KeyError("response")
+
+        candidates = data.get("candidates")
+        if not isinstance(candidates, list):
+            raise KeyError("candidates")
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content")
+            if not isinstance(content, dict):
+                continue
+            parts = content.get("parts")
+            if not isinstance(parts, list):
+                continue
+
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                inline_data = part.get("inlineData")
+                if not isinstance(inline_data, dict):
+                    continue
+
+                audio_b64 = inline_data.get("data")
+                if not isinstance(audio_b64, str):
+                    continue
+
+                mime_type = inline_data.get("mimeType")
+                normalized_mime_type = mime_type if isinstance(mime_type, str) else None
+                if normalized_mime_type and not normalized_mime_type.lower().startswith(
+                    "audio/"
+                ):
+                    continue
+
+                audio_bytes = base64.b64decode(audio_b64)
+                return self._google_gemini_audio_to_wav(
+                    audio_bytes, normalized_mime_type
+                )
+
+        raise KeyError("inlineData")
+
+    def _google_gemini_audio_to_wav(
+        self, audio_bytes: bytes, mime_type: str | None
+    ) -> bytes:
+        if audio_bytes.startswith(b"RIFF"):
+            return audio_bytes
+
+        sample_rate = 24000
+        channels = 1
+
+        if mime_type:
+            for parameter in mime_type.split(";")[1:]:
+                key, _, value = parameter.partition("=")
+                normalized_key = key.strip().lower()
+                normalized_value = value.strip()
+
+                if normalized_key == "rate" and normalized_value.isdigit():
+                    sample_rate = int(normalized_value)
+                elif normalized_key == "channels" and normalized_value.isdigit():
+                    channels = int(normalized_value)
+
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_bytes)
+
+        return wav_buffer.getvalue()
 
 
 tts_provider = TTSProvider()

@@ -18,9 +18,11 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import base64
+import io
 import json
+import wave
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Optional, get_args
 
 import pytest
 
@@ -33,14 +35,24 @@ from src.chat_provider import (
     filter_openai_text_models,
     prompt_cache_key_for_request,
 )
+from src.constants import DEFAULT_CHAT_MODEL
 from src.image_provider import ImageProvider
 from src.provider_runtime import ProviderHTTPError, StreamingNotSupportedError
 from src.tts_provider import TTSProvider
 
 
-def test_gpt_5_4_present_in_openai_models() -> None:
-    assert "gpt-5.4" in models.openai_chat_models
-    assert "gpt-5.4" in models.provider_model_map["openai"]
+def test_curated_openai_chat_models_are_ordered_and_labeled() -> None:
+    assert DEFAULT_CHAT_MODEL == "gpt-5.5"
+    assert models.openai_chat_models == [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+    ]
+    assert models.provider_model_map["openai"] == models.openai_chat_models
+    assert models.openai_model_label("gpt-5.5") == "GPT-5.5"
+    assert models.openai_model_label("gpt-5.4-mini") == "GPT-5.4 Mini"
+    assert models.openai_model_label("gpt-5.5-pro") == "GPT-5.5 Pro"
 
 
 def test_default_extras_include_chat_use_tools() -> None:
@@ -48,33 +60,82 @@ def test_default_extras_include_chat_use_tools() -> None:
     assert models.DEFAULT_EXTRAS["chat_use_tools"] is None
 
 
-def test_gpt_5_3_chat_latest_present() -> None:
-    assert "gpt-5.3-chat-latest" in models.openai_chat_models
-    assert "gpt-5.3-chat-latest" in models.provider_model_map["openai"]
+def test_google_tts_models_include_gemini_3_1_flash_preview() -> None:
+    assert "gemini-3.1-flash-tts-preview" in get_args(models.GoogleModels)
+
+
+def test_openai_image_models_include_gpt_image_2() -> None:
+    assert "gpt-image-2" in get_args(models.OpenAIImageModels)
 
 
 def test_gpt_5_4_reasoning_efforts() -> None:
     efforts_54 = models.openai_reasoning_efforts_for_model("gpt-5.4")
-    efforts_52 = models.openai_reasoning_efforts_for_model("gpt-5.2")
+    efforts_55 = models.openai_reasoning_efforts_for_model("gpt-5.5")
+    efforts_54_mini = models.openai_reasoning_efforts_for_model("gpt-5.4-mini")
+    efforts_54_nano = models.openai_reasoning_efforts_for_model("gpt-5.4-nano")
 
-    assert efforts_54 == efforts_52
+    assert efforts_54 == list(models.OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH)
+    assert efforts_55 == efforts_54
+    assert efforts_54_mini == efforts_54
+    assert efforts_54_nano == efforts_54
     assert "xhigh" in efforts_54
-
-    efforts_chat = models.openai_reasoning_efforts_for_model("gpt-5.3-chat-latest")
-    assert efforts_chat == list(models.OPENAI_DEFAULT_REASONING_EFFORTS)
 
 
 def test_filter_openai_text_models_excludes_non_text_models() -> None:
     models_to_filter = [
         "gpt-5.4",
-        "gpt-5-mini",
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.5-2026-04-23",
+        "gpt-5-codex",
+        "gpt-5-search-api",
+        "gpt-3.5-turbo",
+        "gpt-4",
+        "gpt-4o",
         "gpt-image-1",
         "gpt-4o-mini-tts",
         "text-embedding-3-large",
+        "computer-use-preview",
     ]
 
     filtered = filter_openai_text_models(models_to_filter)
-    assert filtered == ["gpt-5-mini", "gpt-5.4"]
+    assert filtered == [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.5-pro",
+    ]
+
+
+def test_openai_chat_models_for_display_merges_available_models() -> None:
+    available_models = ["gpt-5.5-pro", "gpt-5.4-mini", "gpt-3.5-turbo"]
+
+    assert models.openai_chat_models_for_display(available_models) == [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+    ]
+    assert models.openai_chat_models_for_display(
+        available_models,
+        include_available=True,
+    ) == [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.5-pro",
+    ]
+    assert (
+        models.openai_chat_models_for_display(
+            available_models,
+            current_model="custom-account-model",
+        )[-1]
+        == "custom-account-model"
+    )
 
 
 def test_prompt_cache_key_is_stable() -> None:
@@ -292,6 +353,115 @@ async def test_openai_payload_with_reasoning(
 
 
 @pytest.mark.asyncio
+async def test_reasoning_trace_logging_when_debug_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    logged_messages: list[str] = []
+    test_config = openai_test_config()
+    test_config.debug = True
+    monkeypatch.setattr("src.chat_provider.config", test_config)
+
+    def fake_debug(message: str, *args: Any) -> None:
+        logged_messages.append(message % args)
+
+    monkeypatch.setattr("src.chat_provider.logger.debug", fake_debug)
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    response_created_event("resp_1"),
+                    {
+                        "type": "response.output_item.added",
+                        "response_id": "resp_1",
+                        "output_index": 0,
+                        "item": {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "summary": [
+                                {
+                                    "type": "summary_text",
+                                    "text": "Checking local examples.",
+                                }
+                            ],
+                            "encrypted_content": "opaque-secret",
+                        },
+                    },
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "response_id": "resp_1",
+                        "delta": "Using bold-tag convention.",
+                    },
+                    response_completed_event("resp_1", text="final answer"),
+                ]
+            ],
+        ),
+    )
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.4",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort=None,
+        )
+    )
+
+    assert result.text == "final answer"
+    joined_logs = "\n".join(logged_messages)
+    assert "Checking local examples." in joined_logs
+    assert "Using bold-tag convention." in joined_logs
+    assert "opaque-secret" not in joined_logs
+
+
+@pytest.mark.asyncio
+async def test_reasoning_trace_logging_skipped_when_debug_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    logged_messages: list[str] = []
+    test_config = openai_test_config()
+    test_config.debug = False
+    monkeypatch.setattr("src.chat_provider.config", test_config)
+
+    def fake_debug(message: str, *args: Any) -> None:
+        logged_messages.append(message % args)
+
+    monkeypatch.setattr("src.chat_provider.logger.debug", fake_debug)
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    response_created_event("resp_1"),
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "response_id": "resp_1",
+                        "delta": "Hidden trace.",
+                    },
+                    response_completed_event("resp_1", text="final answer"),
+                ]
+            ],
+        ),
+    )
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.4",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort=None,
+        )
+    )
+
+    assert result.text == "final answer"
+    assert not any("Hidden trace." in message for message in logged_messages)
+
+
+@pytest.mark.asyncio
 async def test_custom_provider_without_api_key_omits_auth_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -433,7 +603,12 @@ async def test_fetch_openai_chat_models_updates_cache(
         return {
             "data": [
                 {"id": "gpt-5.4"},
-                {"id": "gpt-5-mini"},
+                {"id": "gpt-5.5"},
+                {"id": "gpt-5.5-pro"},
+                {"id": "gpt-5.4-mini"},
+                {"id": "gpt-5.4-mini-2026-03-17"},
+                {"id": "gpt-5-codex"},
+                {"id": "gpt-3.5-turbo"},
                 {"id": "gpt-image-1"},
                 {"id": "gpt-4o-mini-tts"},
             ]
@@ -446,8 +621,13 @@ async def test_fetch_openai_chat_models_updates_cache(
 
     models = await cp.fetch_openai_chat_models()
 
-    assert models == ["gpt-5-mini", "gpt-5.4"]
-    assert cp.get_cached_openai_chat_models() == ["gpt-5-mini", "gpt-5.4"]
+    assert models == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5-pro"]
+    assert cp.get_cached_openai_chat_models() == [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.5-pro",
+    ]
     assert captured["url"] == "https://api.openai.com/v1/models"
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
 
@@ -519,6 +699,8 @@ async def test_fetch_openai_chat_models_uses_http_endpoint(
         return {
             "data": [
                 {"id": "gpt-5.4"},
+                {"id": "gpt-5.5"},
+                {"id": "gpt-5.5-pro"},
                 {"id": "gpt-image-1"},
                 {"id": "gpt-4o-mini-tts"},
             ]
@@ -531,7 +713,7 @@ async def test_fetch_openai_chat_models_uses_http_endpoint(
 
     models = await cp.fetch_openai_chat_models()
 
-    assert models == ["gpt-5.4"]
+    assert models == ["gpt-5.5", "gpt-5.4", "gpt-5.5-pro"]
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
 
 
@@ -576,6 +758,85 @@ async def test_openai_tts_uses_http_endpoint(
     assert captured["url"].endswith("/v1/audio/speech")
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
     assert captured["payload"]["model"] == "tts-1"
+
+
+@pytest.mark.asyncio
+async def test_google_gemini_tts_uses_header_auth_and_wraps_pcm_as_wav(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = TTSProvider()
+    captured: dict[str, Any] = {}
+    pcm_bytes = b"\x01\x00\x02\x00"
+
+    monkeypatch.setattr(
+        "src.tts_provider.config",
+        SimpleNamespace(
+            openai_api_key=None,
+            openai_endpoint=None,
+            custom_providers=[],
+            elevenlabs_api_key=None,
+            google_api_key="google-test-key",
+        ),
+    )
+
+    async def fake_request_bytes(**kwargs: Any) -> bytes:
+        captured["url"] = kwargs["url"]
+        captured["headers"] = kwargs["headers"]
+        captured["payload"] = kwargs["json_payload"]
+        return json.dumps(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": "metadata"},
+                                {
+                                    "inlineData": {
+                                        "mimeType": "audio/L16;rate=24000",
+                                        "data": base64.b64encode(pcm_bytes).decode(
+                                            "ascii"
+                                        ),
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+    monkeypatch.setattr(
+        "src.tts_provider.provider_runtime.request_bytes",
+        fake_request_bytes,
+    )
+
+    data = await provider.async_get_tts_response(
+        input="hello",
+        model="gemini-3.1-flash-tts-preview",
+        provider="google",
+        voice="Kore",
+        strip_html=False,
+    )
+
+    assert (
+        captured["url"]
+        == "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent"
+    )
+    assert captured["headers"]["x-goog-api-key"] == "google-test-key"
+    assert "key=" not in captured["url"]
+    assert captured["payload"]["generationConfig"]["responseModalities"] == ["AUDIO"]
+    assert (
+        captured["payload"]["generationConfig"]["speechConfig"]["voiceConfig"][
+            "prebuiltVoiceConfig"
+        ]["voiceName"]
+        == "Kore"
+    )
+
+    with wave.open(io.BytesIO(data), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getframerate() == 24000
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.readframes(wav_file.getnframes()) == pcm_bytes
 
 
 @pytest.mark.asyncio
@@ -626,6 +887,55 @@ async def test_openai_image_uses_http_endpoint(
     assert captured["url"].endswith("/v1/images/generations")
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
     assert captured["payload"]["model"] == "gpt-image-1"
+
+
+@pytest.mark.asyncio
+async def test_openai_image_2_uses_supported_high_resolution_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ImageProvider()
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        "src.image_provider.config",
+        SimpleNamespace(
+            openai_api_key="sk-test",
+            openai_endpoint=None,
+            custom_providers=[],
+            replicate_api_key=None,
+            google_api_key=None,
+        ),
+    )
+
+    async def fake_request_bytes(**kwargs: Any) -> bytes:
+        captured["payload"] = kwargs["json_payload"]
+        return json.dumps(
+            {
+                "data": [
+                    {
+                        "b64_json": base64.b64encode(b"image-bytes").decode("ascii"),
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+    monkeypatch.setattr(
+        "src.image_provider.provider_runtime.request_bytes",
+        fake_request_bytes,
+    )
+
+    data = await provider.async_get_image_response(
+        prompt="cat",
+        model="gpt-image-2",
+        provider="openai",
+        note_id=1,
+        aspect_ratio="16:9",
+        resolution="4096x4096",
+    )
+
+    assert data == b"image-bytes"
+    assert captured["payload"]["model"] == "gpt-image-2"
+    assert captured["payload"]["size"] == "3840x2160"
 
 
 @pytest.mark.asyncio

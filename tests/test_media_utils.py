@@ -17,25 +17,16 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import cast
+from src.media_utils import extract_sound_file_name
 
-from anki.decks import DeckId
 
-from .models import ChatModels, ChatProviders
+def test_extract_sound_file_name() -> None:
+    assert (
+        extract_sound_file_name("[sound:文法+-example 1_audio-1481165522264.wav]")
+        == "文法+-example 1_audio-1481165522264.wav"
+    )
 
-RETRY_BASE_SECONDS = 5
-MAX_RETRIES = 5
-MAX_RETRY_WAIT_SECONDS = 60  # Cap exponential backoff to prevent extremely long waits
-GOOGLE_IMAGE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
-DEFAULT_CHAT_MODEL: ChatModels = "gpt-5.5"
-DEFAULT_CHAT_PROVIDER: ChatProviders = "openai"
-
-DEFAULT_TEMPERATURE = 1
-
-API_KEY_MISSING_MESSAGE = (
-    "Smart Notes: API Key missing for provider {}. Please configure it in settings."
-)
-
-GLOBAL_DECK_ID: DeckId = cast("DeckId", -1)
-GLOBAL_DECK_NAME = "All Decks"
+def test_extract_sound_file_name_returns_none_without_sound_tag() -> None:
+    assert extract_sound_file_name("") is None
+    assert extract_sound_file_name("not audio") is None

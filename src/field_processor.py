@@ -91,7 +91,7 @@ class FieldProcessor:
         node: FieldNode,
         note: Note,
         show_error_box: bool = False,
-        usage_scope_id: str | None = None,
+        usage_scope_id: Optional[str] = None,
     ) -> Optional[str]:
         # Only show error box if we're running on the target node
         input = node.input
@@ -257,8 +257,8 @@ class FieldProcessor:
         reasoning_effort: Optional[OpenAIReasoningEffort] = None,
         use_tools: bool = False,
         show_error_box: bool = True,
-        prompt_usage_context: PromptUsageContext | None = None,
-        usage_scope_id: str | None = None,
+        prompt_usage_context: Optional[PromptUsageContext] = None,
+        usage_scope_id: Optional[str] = None,
     ) -> Optional[str]:
         interpolated_prompt = interpolate_prompt(prompt, note)
 

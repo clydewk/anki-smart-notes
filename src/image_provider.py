@@ -428,7 +428,9 @@ class ImageProvider:
         aspect_ratio: ImageAspectRatio | None,
         resolution: ImageResolution | None,
     ) -> str:
-        del resolution
+        if model == "gpt-image-2":
+            return self._openai_image_2_size(aspect_ratio, resolution)
+
         if "gpt-image" in model:
             if aspect_ratio == "16:9" or aspect_ratio == "4:3":
                 return "1536x1024"
@@ -440,6 +442,39 @@ class ImageProvider:
             return "1792x1024"
         if aspect_ratio == "9:16":
             return "1024x1792"
+        return "1024x1024"
+
+    def _openai_image_2_size(
+        self,
+        aspect_ratio: ImageAspectRatio | None,
+        resolution: ImageResolution | None,
+    ) -> str:
+        if resolution == "4096x4096":
+            if aspect_ratio == "16:9":
+                return "3840x2160"
+            if aspect_ratio == "4:3":
+                return "2736x2048"
+            if aspect_ratio == "9:16":
+                return "2160x3840"
+            if aspect_ratio == "3:4":
+                return "2048x2736"
+            return "2048x2048"
+
+        if resolution == "2048x2048":
+            if aspect_ratio == "16:9":
+                return "2048x1152"
+            if aspect_ratio == "4:3":
+                return "2048x1536"
+            if aspect_ratio == "9:16":
+                return "1152x2048"
+            if aspect_ratio == "3:4":
+                return "1536x2048"
+            return "2048x2048"
+
+        if aspect_ratio == "16:9" or aspect_ratio == "4:3":
+            return "1536x1024"
+        if aspect_ratio == "9:16" or aspect_ratio == "3:4":
+            return "1024x1536"
         return "1024x1024"
 
 

@@ -338,20 +338,20 @@ def get_gemini_voices() -> list[TTSMeta]:
     # But for default settings...
     # I'll add both.
 
-    models: list[tuple[str, PriceTiers]] = [
-        ("gemini-2.5-flash-preview-tts", "low"),
-        ("gemini-2.5-pro-preview-tts", "standard"),
+    models: list[tuple[str, str, PriceTiers]] = [
+        ("gemini-3.1-flash-tts-preview", "Gemini 3.1 Flash", "low"),
+        ("gemini-2.5-flash-preview-tts", "Gemini 2.5 Flash", "low"),
+        ("gemini-2.5-pro-preview-tts", "Gemini 2.5 Pro", "standard"),
     ]
 
     for name in gemini_voice_names:
-        for model, tier in models:
-            friendly_model = "Flash" if "flash" in model else "Pro"
+        for model, friendly_model, tier in models:
             voices.append(
                 {
                     "tts_provider": "google",
                     "voice": name,
                     "model": model,
-                    "friendly_voice": f"{name} (Gemini {friendly_model})",
+                    "friendly_voice": f"{name} ({friendly_model})",
                     "gender": "All",
                     "language": ALL,
                     "price_tier": tier,

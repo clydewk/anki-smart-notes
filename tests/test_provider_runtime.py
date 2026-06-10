@@ -18,6 +18,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator
 from typing import Any, Optional
@@ -29,11 +30,17 @@ from src.provider_runtime import (
     ProviderHTTPError,
     ProviderRuntime,
     ProviderTimeoutError,
+    ProviderUnavailableError,
     RequestTimeouts,
     TrafficController,
     extract_provider_error_detail,
     format_provider_http_error_for_log,
+    parse_google_retry_delay,
 )
+
+
+def json_body(value: object) -> str:
+    return json.dumps(value)
 
 
 def test_traffic_controller_ramps_after_success_streak() -> None:
@@ -271,6 +278,26 @@ def test_format_provider_http_error_for_log_includes_trace_id() -> None:
     assert "message=Upstream timeout" in formatted
 
 
+def test_parse_google_retry_delay_from_retry_info() -> None:
+    body = """
+    {
+        "error": {
+            "code": 429,
+            "message": "Quota exceeded. Please retry in 21.5s.",
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "21s"
+                }
+            ]
+        }
+    }
+    """
+
+    assert parse_google_retry_delay(body) == 21.0
+
+
 @pytest.mark.asyncio
 async def test_handle_http_error_logs_non_retryable_failures(
     monkeypatch: pytest.MonkeyPatch,
@@ -343,6 +370,103 @@ async def test_handle_http_error_logs_retryable_failures_before_retry(
     assert log_call.args[1:6] == ("openai", "gpt-5.4", 1, 3, "yes")
     assert "status=500" in log_call.args[6]
     assert "trace_id=req_retry" in log_call.args[6]
+
+
+@pytest.mark.asyncio
+async def test_handle_google_retry_info_quota_error_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = ProviderRuntimeHarness()
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("src.provider_runtime.asyncio.sleep", sleep_mock)
+
+    should_retry = await runtime.handle_http_error(
+        controller=TrafficController(initial_window=1),
+        provider="google_tts",
+        model="gemini-3.1-flash-tts-preview",
+        attempt=0,
+        max_retries=2,
+        error=ProviderHTTPError(
+            429,
+            "Too Many Requests",
+            json_body(
+                {
+                    "error": {
+                        "code": 429,
+                        "message": "Quota exceeded. Please retry in 3s.",
+                        "status": "RESOURCE_EXHAUSTED",
+                        "details": [
+                            {
+                                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                                "violations": [
+                                    {
+                                        "quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                                    }
+                                ],
+                            },
+                            {
+                                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                "retryDelay": "3s",
+                            },
+                        ],
+                    }
+                }
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent",
+            {},
+        ),
+    )
+
+    assert should_retry is True
+    sleep_mock.assert_awaited_once_with(3.0)
+
+
+@pytest.mark.asyncio
+async def test_handle_google_daily_quota_error_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = ProviderRuntimeHarness()
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("src.provider_runtime.asyncio.sleep", sleep_mock)
+    controller = TrafficController(initial_window=1)
+
+    with pytest.raises(ProviderUnavailableError):
+        await runtime.handle_http_error(
+            controller=controller,
+            provider="google_tts",
+            model="gemini-3.1-flash-tts-preview",
+            attempt=0,
+            max_retries=2,
+            error=ProviderHTTPError(
+                429,
+                "Too Many Requests",
+                json_body(
+                    {
+                        "error": {
+                            "code": 429,
+                            "message": "You exceeded your current quota.",
+                            "status": "RESOURCE_EXHAUSTED",
+                            "details": [
+                                {
+                                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                                    "violations": [
+                                        {
+                                            "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    }
+                ),
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent",
+                {},
+            ),
+        )
+
+    sleep_mock.assert_not_awaited()
+    with pytest.raises(ProviderUnavailableError):
+        await controller.acquire()
 
 
 @pytest.mark.asyncio

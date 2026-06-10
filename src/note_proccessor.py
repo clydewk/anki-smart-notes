@@ -22,7 +22,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 from anki.cards import Card, CardId
 from anki.decks import DeckId
@@ -182,7 +182,7 @@ class NoteProcessor:
         self,
         card_ids: Sequence[CardId],
         overwrite_fields: bool = False,
-    ) -> OpenAIBatchPreflight | None:
+    ) -> Optional[OpenAIBatchPreflight]:
         if not mw or not mw.col or not self.config.openai_daily_token_budget_enabled:
             return None
 
@@ -198,7 +198,7 @@ class NoteProcessor:
         self,
         notes_with_decks: Sequence[tuple[Note, DeckId]],
         overwrite_fields: bool = False,
-    ) -> OpenAIBatchPreflight | None:
+    ) -> Optional[OpenAIBatchPreflight]:
         if not self.config.openai_daily_token_budget_enabled:
             return None
 
@@ -338,7 +338,7 @@ class NoteProcessor:
         node: FieldNode,
         prompt: str,
         interpolated_prompt: str,
-    ) -> EstimatedOpenAIRequest | None:
+    ) -> Optional[EstimatedOpenAIRequest]:
         if node.field_type != "chat":
             return None
 
@@ -610,7 +610,7 @@ class NoteProcessor:
 
             async def worker(
                 nid: NoteId,
-            ) -> tuple[Optional[Note], NoteProcessingResult | Exception]:
+            ) -> tuple[Optional[Note], Union[NoteProcessingResult, Exception]]:
                 if cancellation_state["cancelled"]:
                     return (
                         None,
@@ -834,7 +834,7 @@ class NoteProcessor:
         target_field: Optional[str] = None,
         on_field_update: Optional[Callable[[], None]] = None,
         show_progress: bool = False,
-        usage_scope_id: str | None = None,
+        usage_scope_id: Optional[str] = None,
     ) -> NoteProcessingResult:
         """Process a single note and return updated fields plus any field-level failures."""
 
@@ -1001,7 +1001,7 @@ class NoteProcessor:
         node: FieldNode,
         note: Note,
         show_error_message_box: bool,
-        usage_scope_id: str | None = None,
+        usage_scope_id: Optional[str] = None,
     ) -> Optional[str]:
         started_at = time.perf_counter()
         status = "completed"

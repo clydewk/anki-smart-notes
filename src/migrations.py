@@ -23,7 +23,7 @@ from typing import Literal, TypedDict, Union
 from .config import config
 from .constants import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER
 from .logger import logger
-from .models import provider_model_map
+from .models import is_available_openai_chat_model, provider_model_map
 
 ModelType = Literal["chat", "tts"]
 
@@ -35,16 +35,16 @@ class TTSMigrations(TypedDict):
 
 migration_map: dict[str, Union[dict[str, str], TTSMigrations]] = {
     "chat": {
-        "o1-mini": "gpt-5-mini",
-        "gpt-4o": "gpt-5.3-chat-latest",
-        "gpt-4-turbo": "gpt-5.3-chat-latest",
-        "gpt-4": "gpt-5.3-chat-latest",
-        "o3-mini": "gpt-5-mini",
-        "gpt-4.1": "gpt-5.3-chat-latest",
-        "gpt-4.1-mini": "gpt-5-mini",
-        "gpt-4.1-nano": "gpt-5-nano",
-        "o3": "gpt-5",
-        "o4-mini": "gpt-5-mini",
+        "o1-mini": "gpt-5.4-mini",
+        "gpt-4o": "gpt-5.5",
+        "gpt-4-turbo": "gpt-5.5",
+        "gpt-4": "gpt-5.5",
+        "o3-mini": "gpt-5.4-mini",
+        "gpt-4.1": "gpt-5.5",
+        "gpt-4.1-mini": "gpt-5.4-mini",
+        "gpt-4.1-nano": "gpt-5.4-nano",
+        "o3": "gpt-5.5",
+        "o4-mini": "gpt-5.4-mini",
     },
     "tts": {
         "models": {
@@ -89,7 +89,9 @@ def migrate_models() -> None:
         model for models_list in provider_model_map.values() for model in models_list
     }
 
-    if config.chat_model not in valid_models:
+    if config.chat_model not in valid_models and not is_available_openai_chat_model(
+        str(config.chat_model)
+    ):
         logger.warning(f"Invalid chat model: {config.chat_model}, setting to default")
         config.chat_model = DEFAULT_CHAT_MODEL
         config.chat_provider = DEFAULT_CHAT_PROVIDER
@@ -106,7 +108,11 @@ def migrate_models() -> None:
                         f"Custom chat prompt migration: {extras['chat_model']} -> {new_model}"
                     )
                     extras["chat_model"] = new_model  # type: ignore
-                elif chat_model and chat_model not in valid_models:
+                elif (
+                    chat_model
+                    and chat_model not in valid_models
+                    and not is_available_openai_chat_model(chat_model)
+                ):
                     logger.warning(
                         f"Invalid custom chat model in extras: {extras['chat_model']}, setting to default"
                     )

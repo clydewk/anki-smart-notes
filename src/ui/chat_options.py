@@ -17,7 +17,7 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Any, Optional, TypedDict, cast
+from typing import Any, Optional, TypedDict
 
 from aqt import QGroupBox, QLabel, QSpacerItem, QWidget
 
@@ -29,6 +29,8 @@ from ..models import (
     OpenAIReasoningEffort,
     OverridableChatOptionsDict,
     ProviderSettings,
+    openai_chat_models_for_display,
+    openai_model_label,
     openai_reasoning_efforts_for_model,
     overridable_chat_options,
     provider_model_map,
@@ -51,22 +53,21 @@ class ChatOptionsState(TypedDict):
     chat_reasoning_efforts: list[OpenAIReasoningEffort]
     chat_markdown_to_html: bool
     chat_use_tools: bool
+    show_available_openai_models: bool
     provider_settings: dict[str, ProviderSettings]
 
 
 models_map: dict[str, str] = {
-    "gpt-5-mini": "GPT-5 Mini (1x cost)",
-    "gpt-5-chat-latest": "GPT-5 (No Reasoning, 5x cost)",
-    "gpt-5": "GPT-5 (Reasoning, 5x++ cost)",
-    "gpt-5-nano": "GPT-5 Nano (0.2x cost)",
-    "gpt-4o-mini": "GPT-4o Mini (0.3x cost)",
-    "claude-opus-4-1": "Claude Opus 4.1 (40x Cost)",
-    "claude-sonnet-4-0": "Claude Sonnet 4.0 (3x Cost)",
-    "claude-3-5-haiku-latest": "Claude 3.5 Haiku (2x Cost)",
-    "deepseek-v3": "Deepseek v3 (0.7x Cost)",
+    "claude-opus-4-1": "Claude Opus 4.1",
+    "claude-sonnet-4-0": "Claude Sonnet 4.0",
+    "claude-3-5-haiku-latest": "Claude 3.5 Haiku",
+    "deepseek-v3": "DeepSeek V3",
     "gemini-3-pro-preview": "Gemini 3 Pro",
     "gemini-3-flash-preview": "Gemini 3 Flash",
 }
+
+for model in openai_chat_models_for_display([]):
+    models_map[model] = openai_model_label(model)
 
 providers_map = {
     "openai": "OpenAI",
@@ -123,6 +124,13 @@ class ChatOptions(QWidget):
         self.chat_model.setMinimumWidth(350)
         self.chat_model.on_change.connect(self._on_model_change)
 
+        self.show_available_models = ReactiveCheckBox(
+            self.state, "show_available_openai_models"
+        )
+        self.show_available_models.on_change.connect(
+            self._on_show_available_openai_models_change
+        )
+
         self.reasoning_effort = ReactiveComboBox(
             self.state,
             "chat_reasoning_efforts",
@@ -136,6 +144,10 @@ class ChatOptions(QWidget):
         chat_box.setLayout(chat_form)
         chat_form.addRow("Provider:", self.chat_provider)
         chat_form.addRow("Model:", self.chat_model)
+        chat_form.addRow(
+            "Show available OpenAI models:",
+            self.show_available_models,
+        )
 
         text_rules = QGroupBox("🔤 Text Processing")
         text_layout = default_form_layout()
@@ -194,6 +206,7 @@ class ChatOptions(QWidget):
         self._on_reasoning_effort_change(self.state.s.get("chat_reasoning_effort"))
         self._on_model_change(self.state.s["chat_model"])
         self._update_editable_state(self.state.s["chat_provider"])
+        self._update_available_models_visibility(self.state.s["chat_provider"])
         current_provider = self.state.s["chat_provider"]
         current_model = self.state.s["chat_model"]
         current_temp = self.state.s["chat_temperature"]
@@ -211,23 +224,43 @@ class ChatOptions(QWidget):
         is_custom = provider not in all_chat_providers
         self.chat_model.setEditable(is_custom)
 
+    def _update_available_models_visibility(self, provider: str) -> None:
+        self.show_available_models.setVisible(provider == "openai")
+
+    def _sync_model_labels(self, models: list[str]) -> None:
+        for model in models:
+            if model.startswith("gpt-"):
+                models_map[model] = openai_model_label(model)
+
+        self.chat_model.state_to_ui = models_map
+        self.chat_model.ui_to_state = {v: k for k, v in models_map.items()}
+
+    def _models_for_provider(self, provider: str, current_model: str) -> list[str]:
+        if provider == "openai":
+            return openai_chat_models_for_display(
+                chat_provider.get_cached_openai_chat_models(),
+                include_available=self.state.s["show_available_openai_models"],
+                current_model=current_model,
+            )
+
+        if provider in all_chat_providers:
+            return list(provider_model_map[provider])
+
+        custom_provider = next(
+            (p for p in (config.custom_providers or []) if p["name"] == provider), None
+        )
+        if not custom_provider:
+            return []
+
+        return custom_provider.get("chat_models") or custom_provider.get("models") or []
+
     def _on_provider_change(self, text: str) -> None:
         is_custom = text not in all_chat_providers
-        models = provider_model_map.get(text, [])
-
-        if is_custom:
-            custom_provider = next(
-                (p for p in (config.custom_providers or []) if p["name"] == text), None
-            )
-            if custom_provider:
-                models = cast(
-                    "list[ChatModels]",
-                    custom_provider.get("chat_models")
-                    or custom_provider.get("models")
-                    or [],
-                )
-
         last_settings = self.state.s["provider_settings"].get(text)
+        current_model = (
+            last_settings["model"] if last_settings else self.state.s["chat_model"]
+        )
+        models = self._models_for_provider(text, current_model=current_model)
         new_model = ""
         new_temp = self.state.s["chat_temperature"]
         new_effort = self.state.s["chat_reasoning_effort"]
@@ -251,6 +284,8 @@ class ChatOptions(QWidget):
             )
 
         self._update_editable_state(text)
+        self._update_available_models_visibility(text)
+        self._sync_model_labels(models)
         self.state.update(
             {
                 "chat_provider": text,
@@ -296,6 +331,7 @@ class ChatOptions(QWidget):
             for k in overridable_chat_options  # type: ignore
         }
         ret["chat_use_tools"] = config.chat_use_tools
+        ret["show_available_openai_models"] = False
 
         custom_provider_names = [p["name"] for p in (config.custom_providers or [])]
         ret["chat_providers"] = all_chat_providers + custom_provider_names
@@ -304,8 +340,10 @@ class ChatOptions(QWidget):
         current_provider = ret["chat_provider"]
         if current_provider in provider_model_map:
             if current_provider == "openai":
-                ret["chat_models"] = cast(
-                    "list[ChatModels]", chat_provider.get_cached_openai_chat_models()
+                ret["chat_models"] = openai_chat_models_for_display(
+                    chat_provider.get_cached_openai_chat_models(),
+                    include_available=False,
+                    current_model=ret.get("chat_model"),
                 )
             else:
                 ret["chat_models"] = provider_model_map[current_provider]
@@ -318,15 +356,14 @@ class ChatOptions(QWidget):
                 ),
                 None,
             )
-            ret["chat_models"] = cast(
-                "list[ChatModels]",
+            ret["chat_models"] = (
                 (
                     custom_provider.get("chat_models")
                     or custom_provider.get("models")
                     or []
                 )
                 if custom_provider
-                else [],
+                else []
             )
 
         current_model = ret.get("chat_model")
@@ -367,6 +404,35 @@ class ChatOptions(QWidget):
         is_reasoning = effort and effort != "none"
         self.temperature.setEnabled(not is_reasoning)
 
+    def _on_show_available_openai_models_change(self, _: bool) -> None:
+        if self.state.s["chat_provider"] != "openai":
+            return
+
+        current_model = self.state.s["chat_model"]
+        models = self._models_for_provider("openai", current_model=current_model)
+        self._sync_model_labels(models)
+
+        next_model = current_model if current_model in models else models[0]
+        next_efforts = openai_reasoning_efforts_for_model(next_model)
+        next_effort = self.state.s["chat_reasoning_effort"]
+        if next_effort not in next_efforts:
+            next_effort = "none" if "none" in next_efforts else next_efforts[0]
+
+        self.state.update(
+            {
+                "chat_models": models,
+                "chat_model": next_model,
+                "chat_reasoning_efforts": next_efforts,
+                "chat_reasoning_effort": next_effort,
+            }
+        )
+        self._update_provider_settings(
+            "openai",
+            model=next_model,
+            reasoning_effort=next_effort,
+        )
+        self._refresh_openai_models_if_needed("openai")
+
     def _update_provider_settings(self, provider: str, **kwargs: Any) -> None:
         settings_map = self.state.s["provider_settings"]
 
@@ -402,7 +468,13 @@ class ChatOptions(QWidget):
                 return
 
             current_model = self.state.s["chat_model"]
-            next_model = current_model if current_model in models else models[0]
+            display_models = self._models_for_provider(
+                "openai", current_model=current_model
+            )
+            self._sync_model_labels(display_models)
+            next_model = (
+                current_model if current_model in display_models else display_models[0]
+            )
             next_efforts = openai_reasoning_efforts_for_model(next_model)
             next_effort = self.state.s["chat_reasoning_effort"]
             if next_effort not in next_efforts:
@@ -414,8 +486,8 @@ class ChatOptions(QWidget):
 
             self.state.update(
                 {
-                    "chat_models": cast("list[ChatModels]", models),
-                    "chat_model": cast("ChatModels", next_model),
+                    "chat_models": display_models,
+                    "chat_model": next_model,
                     "chat_reasoning_efforts": next_efforts,
                     "chat_reasoning_effort": next_effort,
                 }

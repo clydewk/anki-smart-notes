@@ -26,7 +26,7 @@ from collections.abc import Sequence
 from typing import Any, Callable, Optional
 
 from anki.cards import Card
-from aqt import QAction, QMenu, browser, editor, gui_hooks, mw
+from aqt import QAction, QMenu, browser, editor, gui_hooks, mw, sound
 from aqt.addcards import AddCards
 from aqt.browser.sidebar.item import SidebarItemType
 
@@ -34,6 +34,7 @@ from .chat_usage import chat_usage_tracker, format_token_count
 from .config import bump_usage_counter, config
 from .decks import deck_id_to_name_map
 from .logger import logger, setup_logger
+from .media_utils import extract_sound_file_name
 from .migrations import migrate_models
 from .note_proccessor import BatchStatistics, NoteProcessor
 from .notes import get_field_from_index, is_ai_field, is_card_fully_processed
@@ -44,6 +45,8 @@ from .ui.changelog import perform_update_check
 from .ui.field_menu import FieldMenu
 from .ui.sparkle import Sparkle
 from .ui.ui_utils import show_message_box
+
+SMART_NOTES_PLAY_AUDIO_PREFIX = "smartnotes-play-audio:"
 
 
 def with_processor(fn: Any):
@@ -393,6 +396,47 @@ def on_start_actions() -> None:
     run_async_in_background(cache_leaf_decks_map)
 
 
+def play_reviewer_audio_field(field_name: str) -> None:
+    if not mw or not getattr(mw, "reviewer", None):
+        return
+
+    reviewer_card = getattr(mw.reviewer, "card", None)
+    if not reviewer_card:
+        return
+
+    note = reviewer_card.note()
+    try:
+        sound_field = note[field_name]
+    except Exception as exc:
+        logger.warning(f"Could not read audio field {field_name}: {exc}")
+        return
+
+    file_name = extract_sound_file_name(sound_field)
+    if not file_name:
+        logger.debug(f"Audio field {field_name} does not contain a sound tag")
+        return
+
+    try:
+        stop_and_clear_queue = getattr(sound.av_player, "stop_and_clear_queue", None)
+        if stop_and_clear_queue:
+            stop_and_clear_queue()
+        sound.av_player.play_file(file_name)
+    except Exception as exc:
+        logger.warning(f"Could not play audio file {file_name}: {exc}")
+
+
+@with_sentry
+def on_webview_message(
+    handled: tuple[bool, Any], message: str, context: Any
+) -> tuple[bool, Any]:
+    if not message.startswith(SMART_NOTES_PLAY_AUDIO_PREFIX):
+        return handled
+
+    field_name = message[len(SMART_NOTES_PLAY_AUDIO_PREFIX) :]
+    play_reviewer_audio_field(field_name)
+    return (True, None)
+
+
 @with_processor  # type: ignore
 def on_main_window(processor: NoteProcessor):
     if not mw:
@@ -550,5 +594,6 @@ def setup_hooks(processor: NoteProcessor):
     gui_hooks.editor_did_init_buttons.append(add_editor_top_button(processor))
     gui_hooks.editor_will_show_context_menu.append(on_editor_context(processor))
     gui_hooks.reviewer_did_show_question.append(on_review(processor))
+    gui_hooks.webview_did_receive_js_message.append(on_webview_message)
     gui_hooks.main_window_did_init.append(on_main_window(processor))
     gui_hooks.profile_will_close.append(cleanup)

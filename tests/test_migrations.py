@@ -20,16 +20,13 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 
-def test_migrate_chat_models_global(mock_config, mock_logger, monkeypatch):
+def test_migrate_chat_models_global(mock_config, mock_logger):
     from src.migrations import migrate_models
-
-    monkeypatch.setattr("src.migrations.DEFAULT_CHAT_MODEL", "gpt-5-mini")
-    monkeypatch.setattr("src.migrations.DEFAULT_CHAT_PROVIDER", "openai")
 
     mock_config.chat_model = "gpt-4o"
     migrate_models()
 
-    assert mock_config.chat_model == "gpt-5.3-chat-latest"
+    assert mock_config.chat_model == "gpt-5.5"
 
 
 def test_migrate_tts_models_global(mock_config, mock_logger):
@@ -41,11 +38,8 @@ def test_migrate_tts_models_global(mock_config, mock_logger):
     assert mock_config.tts_model == "eleven_flash_v2_5"
 
 
-def test_migrate_chat_models_custom_prompts(mock_config, mock_logger, monkeypatch):
+def test_migrate_chat_models_custom_prompts(mock_config, mock_logger):
     from src.migrations import migrate_models
-
-    monkeypatch.setattr("src.migrations.DEFAULT_CHAT_MODEL", "gpt-5-mini")
-    monkeypatch.setattr("src.migrations.DEFAULT_CHAT_PROVIDER", "openai")
 
     mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
         "chat_model"
@@ -57,7 +51,7 @@ def test_migrate_chat_models_custom_prompts(mock_config, mock_logger, monkeypatc
         mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
             "chat_model"
         ]
-        == "gpt-5-mini"
+        == "gpt-5.4-mini"
     )
 
 
@@ -78,11 +72,8 @@ def test_migrate_tts_models_custom_prompts(mock_config, mock_logger):
     )
 
 
-def test_migrate_multiple_models(mock_config, mock_logger, monkeypatch):
+def test_migrate_multiple_models(mock_config, mock_logger):
     from src.migrations import migrate_models
-
-    monkeypatch.setattr("src.migrations.DEFAULT_CHAT_MODEL", "gpt-5-mini")
-    monkeypatch.setattr("src.migrations.DEFAULT_CHAT_PROVIDER", "openai")
 
     mock_config.chat_model = "gpt-4"
     mock_config.tts_model = "eleven_turbo_v2_5"
@@ -95,13 +86,13 @@ def test_migrate_multiple_models(mock_config, mock_logger, monkeypatch):
 
     migrate_models()
 
-    assert mock_config.chat_model == "gpt-5.3-chat-latest"
+    assert mock_config.chat_model == "gpt-5.5"
     assert mock_config.tts_model == "eleven_flash_v2_5"
     assert (
         mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
             "chat_model"
         ]
-        == "gpt-5-mini"
+        == "gpt-5.4-mini"
     )
     assert (
         mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
@@ -121,6 +112,15 @@ def test_no_migration_needed(mock_config, mock_logger):
 
     assert mock_config.chat_model == "gpt-5-mini"
     assert mock_config.tts_model == "eleven_flash_v2_5"
+
+
+def test_available_openai_model_is_not_reset(mock_config, mock_logger):
+    from src.migrations import migrate_models
+
+    mock_config.chat_model = "gpt-5.5-pro"
+    migrate_models()
+
+    assert mock_config.chat_model == "gpt-5.5-pro"
 
 
 def test_migrate_tts_voice_global(mock_config, mock_logger):

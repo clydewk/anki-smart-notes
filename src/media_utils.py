@@ -19,6 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import functools
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -37,6 +38,15 @@ HARDCODED_PATHS = (
     "/bin",
     os.path.join(os.getenv("HOME", "/home/user"), ".local", "bin"),
 )
+
+SOUND_TAG_RE = re.compile(r"\[sound:([^\]]+)\]")
+
+
+def extract_sound_file_name(sound_field: str) -> Optional[str]:
+    match = SOUND_TAG_RE.search(sound_field)
+    if not match:
+        return None
+    return match.group(1)
 
 
 @functools.cache
