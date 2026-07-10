@@ -18,6 +18,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import html
+import json
 import re
 from typing import Any, Optional, TypedDict, cast
 from urllib.parse import urlparse
@@ -29,6 +30,7 @@ from aqt import (
     QDesktopServices,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QGraphicsOpacityEffect,
     QGroupBox,
     QHBoxLayout,
@@ -45,6 +47,7 @@ from aqt import (
     QUrl,
     QVBoxLayout,
     QWidget,
+    mw,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
@@ -64,6 +67,12 @@ from ..models import (
     normalize_built_in_tools_config,
 )
 from ..note_proccessor import NoteProcessor
+from ..prompt_io import (
+    ImportPreview,
+    PromptImportError,
+    create_prompt_export,
+    preview_prompt_import,
+)
 from ..prompts import get_all_prompts, get_extras, get_prompts_for_note, remove_prompt
 from ..sentry import run_async_in_background_with_sentry
 from ..utils import get_fields, get_version
@@ -179,6 +188,8 @@ class AddonOptionsDialog(QDialog):
     table: QTableWidget
     restore_defaults: QPushButton
     edit_button: QPushButton
+    import_button: QPushButton
+    export_button: QPushButton
     state: StateManager[State]
     save_timer: QTimer
 
@@ -335,6 +346,18 @@ class AddonOptionsDialog(QDialog):
 
         buttons_layout.addWidget(self.edit_button)
         buttons_layout.addWidget(self.remove_button)
+
+        self.import_button = QPushButton("Import")
+        self.import_button.setFixedWidth(80)
+        self.import_button.clicked.connect(self.on_import_prompts)
+
+        self.export_button = QPushButton("Export")
+        self.export_button.setFixedWidth(80)
+        self.export_button.clicked.connect(self.on_export_prompts)
+
+        buttons_layout.addSpacing(12)
+        buttons_layout.addWidget(self.import_button)
+        buttons_layout.addWidget(self.export_button)
 
         buttons_layout.addStretch()
 
@@ -1156,6 +1179,111 @@ class AddonOptionsDialog(QDialog):
     def on_row_selected(self, current: Optional[QTableWidgetItem]) -> None:
         if current:
             self.state.update({"selected_row": current.row()})
+
+    def on_export_prompts(self, _) -> None:
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Smart Notes Prompts",
+            "prompts.smart-notes-prompts.json",
+            "Smart Notes Prompt Export (*.smart-notes-prompts.json);;JSON (*.json)",
+        )
+        if not file_path:
+            return
+
+        export = create_prompt_export(
+            self.state.s["prompts_map"],
+            deck_id_to_name_map(),
+        )
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(export, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+        except OSError as e:
+            show_message_box("Could not export prompts.", str(e))
+            return
+
+        show_message_box("Smart Notes prompts exported.")
+
+    def on_import_prompts(self, _) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Smart Notes Prompts",
+            "",
+            "Smart Notes Prompt Export (*.smart-notes-prompts.json);;JSON (*.json)",
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            show_message_box("Could not import prompts.", str(e))
+            return
+
+        try:
+            preview = preview_prompt_import(
+                payload=payload,
+                existing_prompts_map=self.state.s["prompts_map"],
+                deck_ids_by_name=deck_name_to_id_map(),
+                fields_by_note_type=self.fields_by_note_type(),
+            )
+        except PromptImportError as e:
+            show_message_box("Could not import prompts.", str(e))
+            return
+
+        if preview.imported_count == 0:
+            show_message_box(
+                "No prompts were imported.",
+                self.import_preview_details(preview),
+            )
+            return
+
+        did_confirm = show_message_box(
+            "Import Smart Notes prompts?",
+            self.import_preview_details(preview),
+            custom_ok="Import",
+            show_cancel=True,
+        )
+        if not did_confirm:
+            return
+
+        self.state.update({"prompts_map": preview.prompts_map, "selected_row": None})
+        if self.write_config():
+            show_message_box("Smart Notes prompts imported.")
+
+    def fields_by_note_type(self) -> dict[str, list[str]]:
+        if not mw or not mw.col:
+            return {}
+
+        fields_by_note_type: dict[str, list[str]] = {}
+        for model in mw.col.models.all():
+            name = model.get("name")
+            fields = model.get("flds")
+            if not isinstance(name, str) or not isinstance(fields, list):
+                continue
+            fields_by_note_type[name] = [
+                field["name"]
+                for field in sorted(fields, key=lambda field: field["ord"])
+                if isinstance(field.get("name"), str)
+            ]
+        return fields_by_note_type
+
+    def import_preview_details(self, preview: ImportPreview) -> str:
+        lines = [
+            f"Add: {preview.added_count}",
+            f"Replace: {preview.replaced_count}",
+            f"Skip: {len(preview.skipped)}",
+        ]
+        if preview.skipped:
+            lines.append("")
+            lines.append("Skipped prompts:")
+            for skipped in preview.skipped[:8]:
+                target = f"{skipped.note_type} / {skipped.deck_name} / {skipped.field}"
+                lines.append(f"- {target}: {skipped.reason}")
+            if len(preview.skipped) > 8:
+                lines.append(f"- ...and {len(preview.skipped) - 8} more")
+        return "\n".join(lines)
 
     def on_edit(self, _) -> None:
         row = self.state.s["selected_row"]

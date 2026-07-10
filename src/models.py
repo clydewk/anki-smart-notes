@@ -28,7 +28,9 @@ ChatProviders = Literal["openai", "anthropic", "deepseek", "google"]
 
 # Reasoning Efforts
 # "none" is a UI concept meaning "don't use reasoning, use temperature instead"
-OpenAIReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+OpenAIReasoningEffort = Literal[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+]
 OPENAI_DEFAULT_REASONING_EFFORTS: tuple[OpenAIReasoningEffort, ...] = (
     "low",
     "medium",
@@ -40,6 +42,10 @@ OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH: tuple[OpenAIReasoningEffort, ...] 
     "medium",
     "high",
     "xhigh",
+)
+OPENAI_REASONING_EFFORTS_WITH_MAX: tuple[OpenAIReasoningEffort, ...] = (
+    *OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH,
+    "max",
 )
 
 
@@ -61,19 +67,17 @@ class OpenAIChatModelSpec:
 
 OPENAI_CHAT_MODEL_CATALOG: tuple[OpenAIChatModelSpec, ...] = (
     OpenAIChatModelSpec(
-        "gpt-5.5", "GPT-5.5", OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH
+        "gpt-5.6-sol", "GPT-5.6 Sol", OPENAI_REASONING_EFFORTS_WITH_MAX
     ),
     OpenAIChatModelSpec(
-        "gpt-5.4", "GPT-5.4", OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH
+        "gpt-5.6-terra", "GPT-5.6 Terra", OPENAI_REASONING_EFFORTS_WITH_MAX
     ),
     OpenAIChatModelSpec(
-        "gpt-5.4-mini",
-        "GPT-5.4 Mini",
-        OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH,
+        "gpt-5.6-luna", "GPT-5.6 Luna", OPENAI_REASONING_EFFORTS_WITH_MAX
     ),
     OpenAIChatModelSpec(
-        "gpt-5.4-nano",
-        "GPT-5.4 Nano",
+        "gpt-5.5",
+        "GPT-5.5",
         OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH,
     ),
 )
@@ -108,6 +112,9 @@ provider_model_map: dict[ChatProviders, list[ChatModels]] = {
 
 
 legacy_openai_chat_models: list[str] = [
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
     "gpt-4o-mini",
     "gpt-4o",
     "gpt-4-turbo",
@@ -122,7 +129,8 @@ legacy_openai_chat_models: list[str] = [
 ]
 
 OPENAI_REASONING_EFFORTS_BY_MODEL: dict[str, tuple[OpenAIReasoningEffort, ...]] = {
-    spec.model: spec.reasoning_efforts for spec in OPENAI_CHAT_MODEL_CATALOG
+    **{spec.model: spec.reasoning_efforts for spec in OPENAI_CHAT_MODEL_CATALOG},
+    "gpt-5.6": OPENAI_REASONING_EFFORTS_WITH_MAX,
 }
 
 
@@ -141,7 +149,9 @@ def openai_model_label(model: str) -> str:
     if chat_latest_match:
         return f"GPT-{chat_latest_match.group(1)} Chat Latest"
 
-    model_match = re.fullmatch(r"gpt-(\d+(?:\.\d+)?)(?:-(mini|nano|pro))?", model)
+    model_match = re.fullmatch(
+        r"gpt-(\d+(?:\.\d+)?)(?:-(mini|nano|pro|sol|terra|luna))?", model
+    )
     if not model_match:
         return model
 
@@ -162,10 +172,17 @@ def is_available_openai_chat_model(model: str) -> bool:
         return True
     if is_dated_openai_model_snapshot(normalized):
         return False
-    return (
-        re.fullmatch(r"gpt-5(?:\.\d+)?(?:-(?:mini|nano|pro|chat-latest))?", normalized)
-        is not None
+    model_match = re.fullmatch(
+        r"gpt-(5(?:\.\d+)?)(?:-(mini|nano|pro|chat-latest|sol|terra|luna))?",
+        normalized,
     )
+    if not model_match:
+        return False
+
+    tier = model_match.group(2)
+    if model_match.group(1) == "5.6":
+        return tier in {None, "sol", "terra", "luna"}
+    return tier not in {"sol", "terra", "luna"}
 
 
 def openai_chat_model_sort_key(model: str) -> tuple[int, int, int, int, str]:
@@ -173,7 +190,8 @@ def openai_chat_model_sort_key(model: str) -> tuple[int, int, int, int, str]:
         return (0, openai_chat_models.index(model), 0, 0, model)
 
     model_match = re.fullmatch(
-        r"gpt-(5)(?:\.(\d+))?(?:-(mini|nano|chat-latest|pro))?", model
+        r"gpt-(5)(?:\.(\d+))?(?:-(mini|nano|chat-latest|pro|sol|terra|luna))?",
+        model,
     )
     if not model_match:
         return (2, 0, 0, 0, model)
@@ -181,10 +199,13 @@ def openai_chat_model_sort_key(model: str) -> tuple[int, int, int, int, str]:
     minor = int(model_match.group(2) or 0)
     tier_order = {
         "": 0,
-        "mini": 1,
-        "nano": 2,
-        "chat-latest": 3,
-        "pro": 4,
+        "sol": 1,
+        "terra": 2,
+        "luna": 3,
+        "mini": 4,
+        "nano": 5,
+        "chat-latest": 6,
+        "pro": 7,
     }
     tier = model_match.group(3) or ""
     return (1, -minor, tier_order.get(tier, 9), 0, model)

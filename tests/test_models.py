@@ -42,16 +42,17 @@ from src.tts_provider import TTSProvider
 
 
 def test_curated_openai_chat_models_are_ordered_and_labeled() -> None:
-    assert DEFAULT_CHAT_MODEL == "gpt-5.5"
+    assert DEFAULT_CHAT_MODEL == "gpt-5.6-sol"
     assert models.openai_chat_models == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.4-nano",
     ]
     assert models.provider_model_map["openai"] == models.openai_chat_models
-    assert models.openai_model_label("gpt-5.5") == "GPT-5.5"
-    assert models.openai_model_label("gpt-5.4-mini") == "GPT-5.4 Mini"
+    assert models.openai_model_label("gpt-5.6-sol") == "GPT-5.6 Sol"
+    assert models.openai_model_label("gpt-5.6-terra") == "GPT-5.6 Terra"
+    assert models.openai_model_label("gpt-5.6-luna") == "GPT-5.6 Luna"
     assert models.openai_model_label("gpt-5.5-pro") == "GPT-5.5 Pro"
 
 
@@ -68,22 +69,26 @@ def test_openai_image_models_include_gpt_image_2() -> None:
     assert "gpt-image-2" in get_args(models.OpenAIImageModels)
 
 
-def test_gpt_5_4_reasoning_efforts() -> None:
-    efforts_54 = models.openai_reasoning_efforts_for_model("gpt-5.4")
+def test_openai_reasoning_efforts_match_model_family() -> None:
+    efforts_56 = models.openai_reasoning_efforts_for_model("gpt-5.6-sol")
+    efforts_56_alias = models.openai_reasoning_efforts_for_model("gpt-5.6")
     efforts_55 = models.openai_reasoning_efforts_for_model("gpt-5.5")
-    efforts_54_mini = models.openai_reasoning_efforts_for_model("gpt-5.4-mini")
-    efforts_54_nano = models.openai_reasoning_efforts_for_model("gpt-5.4-nano")
 
-    assert efforts_54 == list(models.OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH)
-    assert efforts_55 == efforts_54
-    assert efforts_54_mini == efforts_54
-    assert efforts_54_nano == efforts_54
-    assert "xhigh" in efforts_54
+    assert efforts_56 == list(models.OPENAI_REASONING_EFFORTS_WITH_MAX)
+    assert efforts_56_alias == efforts_56
+    assert "max" in efforts_56
+    assert efforts_55 == list(models.OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH)
+    assert "max" not in efforts_55
 
 
 def test_filter_openai_text_models_excludes_non_text_models() -> None:
     models_to_filter = [
         "gpt-5.4",
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.6-pro",
         "gpt-5.5",
         "gpt-5.5-pro",
         "gpt-5.4-mini",
@@ -102,11 +107,15 @@ def test_filter_openai_text_models_excludes_non_text_models() -> None:
 
     filtered = filter_openai_text_models(models_to_filter)
     assert filtered == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5.5",
+        "gpt-5.6",
+        "gpt-5.5-pro",
         "gpt-5.4",
         "gpt-5.4-mini",
         "gpt-5.4-nano",
-        "gpt-5.5-pro",
     ]
 
 
@@ -114,20 +123,21 @@ def test_openai_chat_models_for_display_merges_available_models() -> None:
     available_models = ["gpt-5.5-pro", "gpt-5.4-mini", "gpt-3.5-turbo"]
 
     assert models.openai_chat_models_for_display(available_models) == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.4-nano",
     ]
     assert models.openai_chat_models_for_display(
         available_models,
         include_available=True,
     ) == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.4-nano",
         "gpt-5.5-pro",
+        "gpt-5.4-mini",
     ]
     assert (
         models.openai_chat_models_for_display(
@@ -334,10 +344,10 @@ async def test_openai_payload_with_reasoning(
     result = await cp.generate_text(
         TextGenerationRequest(
             prompt="hi",
-            model="gpt-5.4",
+            model="gpt-5.6-sol",
             provider="openai",
             temperature=0.5,
-            reasoning_effort="high",
+            reasoning_effort="max",
             prompt_cache_key="smart-notes:test",
         )
     )
@@ -345,8 +355,8 @@ async def test_openai_payload_with_reasoning(
     assert result.text == "hello"
     assert captured["url"] == "https://api.openai.com/v1/responses"
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
-    assert captured["payload"]["model"] == "gpt-5.4"
-    assert captured["payload"]["reasoning"] == {"effort": "high"}
+    assert captured["payload"]["model"] == "gpt-5.6-sol"
+    assert captured["payload"]["reasoning"] == {"effort": "max"}
     assert captured["payload"]["store"] is False
     assert captured["payload"]["stream"] is True
     assert captured["payload"]["prompt_cache_key"] == "smart-notes:test"
@@ -602,6 +612,9 @@ async def test_fetch_openai_chat_models_updates_cache(
         captured["headers"] = kwargs["headers"]
         return {
             "data": [
+                {"id": "gpt-5.6-luna"},
+                {"id": "gpt-5.6-sol"},
+                {"id": "gpt-5.6-terra"},
                 {"id": "gpt-5.4"},
                 {"id": "gpt-5.5"},
                 {"id": "gpt-5.5-pro"},
@@ -621,12 +634,23 @@ async def test_fetch_openai_chat_models_updates_cache(
 
     models = await cp.fetch_openai_chat_models()
 
-    assert models == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5-pro"]
-    assert cp.get_cached_openai_chat_models() == [
+    assert models == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5.5",
+        "gpt-5.5-pro",
         "gpt-5.4",
         "gpt-5.4-mini",
+    ]
+    assert cp.get_cached_openai_chat_models() == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
         "gpt-5.5-pro",
+        "gpt-5.4",
+        "gpt-5.4-mini",
     ]
     assert captured["url"] == "https://api.openai.com/v1/models"
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
@@ -665,16 +689,18 @@ async def test_openai_text_uses_responses_http(
     result = await cp.generate_text(
         TextGenerationRequest(
             prompt="hi",
-            model="gpt-5.4",
+            model="gpt-5.6-terra",
             provider="openai",
             temperature=0.5,
-            reasoning_effort="high",
+            reasoning_effort="none",
             prompt_cache_key="smart-notes:test",
         )
     )
 
     assert result.text == "fallback text"
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
+    assert captured["payload"]["reasoning"] == {"effort": "none"}
+    assert captured["payload"]["temperature"] == 0.5
     assert captured["payload"]["prompt_cache_key"] == "smart-notes:test"
     assert captured["payload"]["stream"] is True
 
@@ -698,6 +724,7 @@ async def test_fetch_openai_chat_models_uses_http_endpoint(
         captured["headers"] = kwargs["headers"]
         return {
             "data": [
+                {"id": "gpt-5.6-sol"},
                 {"id": "gpt-5.4"},
                 {"id": "gpt-5.5"},
                 {"id": "gpt-5.5-pro"},
@@ -713,7 +740,7 @@ async def test_fetch_openai_chat_models_uses_http_endpoint(
 
     models = await cp.fetch_openai_chat_models()
 
-    assert models == ["gpt-5.5", "gpt-5.4", "gpt-5.5-pro"]
+    assert models == ["gpt-5.6-sol", "gpt-5.5", "gpt-5.5-pro", "gpt-5.4"]
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
 
 
@@ -1085,10 +1112,10 @@ async def test_openai_responses_tool_loop_uses_reasoning_timeout_budget(
     result = await cp.generate_text(
         TextGenerationRequest(
             prompt="hi",
-            model="gpt-5.4",
+            model="gpt-5.6-sol",
             provider="openai",
             temperature=0.5,
-            reasoning_effort="xhigh",
+            reasoning_effort="max",
             tools=[
                 TextToolDefinition(
                     name="mcp_test_echo",

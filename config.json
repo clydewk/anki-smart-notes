@@ -6,7 +6,7 @@
   "elevenlabs_api_key": "",
   "replicate_api_key": "",
   "chat_provider": "openai",
-  "chat_model": "gpt-5.5",
+  "chat_model": "gpt-5.6-sol",
   "chat_temperature": 1,
   "chat_reasoning_effort": null,
   "chat_use_tools": false,

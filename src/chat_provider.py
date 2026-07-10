@@ -278,7 +278,7 @@ def responses_timeouts(
 def responses_liveness_timeout_sec(
     reasoning_effort: OpenAIReasoningEffort | None,
 ) -> float:
-    return 90.0 if reasoning_effort in {"high", "xhigh"} else 45.0
+    return 90.0 if reasoning_effort in {"high", "xhigh", "max"} else 45.0
 
 
 def responses_json_timeouts(
@@ -2371,9 +2371,9 @@ class ChatProvider:
         if previous_response_id:
             payload["previous_response_id"] = previous_response_id
 
-        if request.reasoning_effort and request.reasoning_effort != "none":
+        if request.reasoning_effort:
             payload["reasoning"] = {"effort": request.reasoning_effort}
-        else:
+        if request.reasoning_effort in {None, "none"}:
             payload["temperature"] = request.temperature
 
         if request.tools and allow_tools:

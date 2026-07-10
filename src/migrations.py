@@ -35,16 +35,19 @@ class TTSMigrations(TypedDict):
 
 migration_map: dict[str, Union[dict[str, str], TTSMigrations]] = {
     "chat": {
-        "o1-mini": "gpt-5.4-mini",
-        "gpt-4o": "gpt-5.5",
-        "gpt-4-turbo": "gpt-5.5",
-        "gpt-4": "gpt-5.5",
-        "o3-mini": "gpt-5.4-mini",
-        "gpt-4.1": "gpt-5.5",
-        "gpt-4.1-mini": "gpt-5.4-mini",
-        "gpt-4.1-nano": "gpt-5.4-nano",
-        "o3": "gpt-5.5",
-        "o4-mini": "gpt-5.4-mini",
+        "o1-mini": "gpt-5.6-terra",
+        "gpt-4o": "gpt-5.6-sol",
+        "gpt-4-turbo": "gpt-5.6-sol",
+        "gpt-4": "gpt-5.6-sol",
+        "o3-mini": "gpt-5.6-terra",
+        "gpt-4.1": "gpt-5.6-sol",
+        "gpt-4.1-mini": "gpt-5.6-terra",
+        "gpt-4.1-nano": "gpt-5.6-luna",
+        "o3": "gpt-5.6-sol",
+        "o4-mini": "gpt-5.6-terra",
+        "gpt-5.4": "gpt-5.6-sol",
+        "gpt-5.4-mini": "gpt-5.6-terra",
+        "gpt-5.4-nano": "gpt-5.6-luna",
     },
     "tts": {
         "models": {

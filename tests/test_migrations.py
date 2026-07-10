@@ -26,7 +26,7 @@ def test_migrate_chat_models_global(mock_config, mock_logger):
     mock_config.chat_model = "gpt-4o"
     migrate_models()
 
-    assert mock_config.chat_model == "gpt-5.5"
+    assert mock_config.chat_model == "gpt-5.6-sol"
 
 
 def test_migrate_tts_models_global(mock_config, mock_logger):
@@ -51,7 +51,7 @@ def test_migrate_chat_models_custom_prompts(mock_config, mock_logger):
         mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
             "chat_model"
         ]
-        == "gpt-5.4-mini"
+        == "gpt-5.6-terra"
     )
 
 
@@ -86,13 +86,13 @@ def test_migrate_multiple_models(mock_config, mock_logger):
 
     migrate_models()
 
-    assert mock_config.chat_model == "gpt-5.5"
+    assert mock_config.chat_model == "gpt-5.6-sol"
     assert mock_config.tts_model == "eleven_flash_v2_5"
     assert (
         mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
             "chat_model"
         ]
-        == "gpt-5.4-mini"
+        == "gpt-5.6-terra"
     )
     assert (
         mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
@@ -121,6 +121,25 @@ def test_available_openai_model_is_not_reset(mock_config, mock_logger):
     migrate_models()
 
     assert mock_config.chat_model == "gpt-5.5-pro"
+
+
+def test_migrate_deprecated_gpt_5_4_family(mock_config, mock_logger):
+    from src.migrations import migrate_models
+
+    mock_config.chat_model = "gpt-5.4-mini"
+    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
+        "chat_model"
+    ] = "gpt-5.4-nano"
+
+    migrate_models()
+
+    assert mock_config.chat_model == "gpt-5.6-terra"
+    assert (
+        mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
+            "chat_model"
+        ]
+        == "gpt-5.6-luna"
+    )
 
 
 def test_migrate_tts_voice_global(mock_config, mock_logger):

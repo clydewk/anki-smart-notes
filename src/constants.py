@@ -28,7 +28,7 @@ MAX_RETRIES = 5
 MAX_RETRY_WAIT_SECONDS = 60  # Cap exponential backoff to prevent extremely long waits
 GOOGLE_IMAGE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
-DEFAULT_CHAT_MODEL: ChatModels = "gpt-5.5"
+DEFAULT_CHAT_MODEL: ChatModels = "gpt-5.6-sol"
 DEFAULT_CHAT_PROVIDER: ChatProviders = "openai"
 
 DEFAULT_TEMPERATURE = 1

@@ -85,6 +85,7 @@ reasoning_efforts_map: dict[str, str] = {
     "medium": "Medium",
     "high": "High",
     "xhigh": "Extra High",
+    "max": "Maximum",
 }
 
 
