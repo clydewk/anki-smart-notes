@@ -455,7 +455,7 @@ class NoteProcessor:
         on_success: Optional[Callable[[BatchStatistics], None]],
         overwrite_fields: bool = False,
     ) -> None:
-        """Processes notes in the background with a progress bar, batching into a single undo op"""
+        """Process notes in the background with a non-modal progress dialog."""
 
         if not mw or not mw.col:
             return
@@ -475,19 +475,7 @@ class NoteProcessor:
         logger.debug("Processing notes...")
         logger.debug("Scheduling %d note workers", len(note_ids))
 
-        # Only show fancy progress meter for large batches
         cancellation_state = {"cancelled": False}
-
-        # Disable autosave to avoid "Backing up..." popups during batch processing
-        autosave_was_active = False
-        if hasattr(mw, "autosaveTimer") and mw.autosaveTimer.isActive():
-            mw.autosaveTimer.stop()
-            autosave_was_active = True
-
-        # Also try to disable automatic backups if the method exists (Anki 2.1.50+)
-        if hasattr(mw.col, "set_autosave_enabled"):
-            # Some versions allow disabling at collection level
-            mw.col.set_autosave_enabled(False)
 
         def on_cancel() -> None:
             cancellation_state["cancelled"] = True
@@ -512,37 +500,21 @@ class NoteProcessor:
         logger.addHandler(log_handler)
 
         def wrapped_on_success(res: BatchStatistics) -> None:
-            stats = res
-
             logger.removeHandler(log_handler)
-
-            if autosave_was_active and hasattr(mw, "autosaveTimer"):
-                mw.autosaveTimer.start()
-            if hasattr(mw.col, "set_autosave_enabled"):
-                mw.col.set_autosave_enabled(True)
 
             if progress:
                 progress.close()
-            if not mw or not mw.col:
-                return
-            # Note: DB updates are mainly handled during processing to allow incremental progress saving
-            # But we might have stragglers or need to finalize things.
-            self._reqlinquish_req_in_process()
+            self._release_request()
             if on_success:
-                on_success(stats)
+                on_success(res)
 
         def on_failure(e: Exception) -> None:
             logger.removeHandler(log_handler)
             chat_usage_tracker.close_scope(usage_scope_id)
 
-            if autosave_was_active and hasattr(mw, "autosaveTimer"):
-                mw.autosaveTimer.start()
-            if hasattr(mw.col, "set_autosave_enabled"):
-                mw.col.set_autosave_enabled(True)
-
             if progress:
                 progress.close()
-            self._reqlinquish_req_in_process()
+            self._release_request()
             show_message_box(f"Error: {e}")
 
         def on_update(
@@ -552,33 +524,7 @@ class NoteProcessor:
                 return
 
             if updated:
-                # Temporarily block Anki's progress manager from showing dialogs
-                # to prevent focus-stealing "Processing..." popup during DB writes.
-                # mw.progress uses a timer that shows a dialog after ~600ms of main
-                # thread blocking, so we suppress it during our update.
-                progress_blocked = False
-                if hasattr(mw, "progress") and hasattr(mw.progress, "_win"):
-                    # If a progress window already exists, don't interfere
-                    pass
-                elif hasattr(mw, "progress"):
-                    # Block the progress manager's timer
-                    try:
-                        if hasattr(mw.progress, "_timer"):
-                            mw.progress._timer.stop()
-                            progress_blocked = True
-                    except Exception:
-                        pass
-
-                try:
-                    mw.col.update_notes(updated)
-                finally:
-                    # Restore progress timer if we blocked it
-                    if progress_blocked:
-                        try:
-                            if hasattr(mw.progress, "_timer"):
-                                mw.progress._timer.start()
-                        except Exception:
-                            pass
+                mw.col.update_notes(updated)
 
             if not finished:
                 if progress:
@@ -767,13 +713,9 @@ class NoteProcessor:
         except Exception as e:
             logger.removeHandler(log_handler)
             chat_usage_tracker.close_scope(usage_scope_id)
-            if autosave_was_active and hasattr(mw, "autosaveTimer"):
-                mw.autosaveTimer.start()
-            if hasattr(mw.col, "set_autosave_enabled"):
-                mw.col.set_autosave_enabled(True)
             if progress:
                 progress.close()
-            self._reqlinquish_req_in_process()
+            self._release_request()
             raise e
 
     def process_card(
@@ -797,12 +739,12 @@ class NoteProcessor:
             if updated and mw and mw.col:
                 mw.col.update_note(note)
 
-            self._reqlinquish_req_in_process()
+            self._release_request()
             on_success(updated)
 
         def wrapped_failure(e: Exception) -> None:
             self._handle_failure(e)
-            self._reqlinquish_req_in_process()
+            self._release_request()
             if on_failure:
                 on_failure(e)
 
@@ -993,7 +935,7 @@ class NoteProcessor:
         self.req_in_progress = True
         return True
 
-    def _reqlinquish_req_in_process(self) -> None:
+    def _release_request(self) -> None:
         self.req_in_progress = False
 
     async def _process_node(
