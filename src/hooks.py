@@ -185,6 +185,7 @@ def make_on_batch_success(
         errors = stats.failed
         blocked = stats.blocked
         no_updates = stats.no_updates
+        conflicted = stats.conflicted
         updated_fields = stats.updated_fields
         error_details = stats.error_details
         field_error_details = stats.field_error_details
@@ -199,7 +200,12 @@ def make_on_batch_success(
         was_cancelled = stats.was_cancelled
         updated_count = len(processed) + len(partial)
         completed_count = (
-            len(processed) + len(partial) + len(errors) + len(blocked) + len(no_updates)
+            len(processed)
+            + len(partial)
+            + len(errors)
+            + len(blocked)
+            + len(no_updates)
+            + len(conflicted)
         )
 
         if config.debug:
@@ -219,6 +225,7 @@ def make_on_batch_success(
             debug_parts.append(f"Failed: {len(errors)}")
             debug_parts.append(f"Blocked By Field Failures: {len(blocked)}")
             debug_parts.append(f"No Updates: {len(no_updates)}")
+            debug_parts.append(f"Conflicted: {len(conflicted)}")
             if chat_usage_summary.request_count:
                 debug_parts.append(
                     "Chat tokens: "
@@ -263,9 +270,14 @@ def make_on_batch_success(
 
             debug_info = "\n".join(debug_parts)
 
-        if not updated_count and not len(no_updates) and (len(errors) or len(blocked)):
+        if (
+            not updated_count
+            and not len(no_updates)
+            and not len(conflicted)
+            and (len(errors) or len(blocked))
+        ):
             show_message_box(
-                "No notes were updated. Check the field failure details in Debug Info.",
+                "No notes were updated. Check Debug Info for details.",
                 copy_button_text="Copy Debug Info" if debug_info else None,
                 copy_button_content=debug_info if debug_info else None,
             )
@@ -289,6 +301,11 @@ def make_on_batch_success(
 
             if len(no_updates):
                 parts.append(f"{pluralize('note', len(no_updates))} had no updates")
+
+            if len(conflicted):
+                parts.append(
+                    f"{pluralize('note', len(conflicted))} skipped because it changed"
+                )
 
             if was_cancelled:
                 parts.append("Batch processing cancelled")
@@ -518,19 +535,12 @@ def on_review(processor: NoteProcessor, card: Card):
     if not config.generate_at_review:
         return
 
-    note = card.note()
-
     def on_success(did_change: bool):
         if not did_change:
             return
 
-        if not mw or not mw.col:
-            logger.error("Error: mw not found")
-            return
-
         logger.debug("Did update card on review...")
 
-        mw.col.update_note(note)
         card.load()
         Sparkle()
 

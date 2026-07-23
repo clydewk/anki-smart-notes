@@ -777,6 +777,107 @@ def test_snapshot_note_copies_fields() -> None:
     assert snapshot.fields == {"Front": "original", "Back": ""}
 
 
+class CommitNote:
+    def __init__(self, note_id: int, fields: dict[str, str]) -> None:
+        self.id = note_id
+        self.fields = fields
+
+    def __getitem__(self, field: str) -> str:
+        return self.fields[field]
+
+    def __setitem__(self, field: str, value: str) -> None:
+        self.fields[field] = value
+
+
+class CommitMedia:
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, bytes]] = []
+
+    def write_data(self, filename: str, data: bytes) -> str:
+        self.writes.append((filename, data))
+        return filename
+
+
+class CommitCollection:
+    def __init__(self, note: CommitNote) -> None:
+        self.note = note
+        self.media = CommitMedia()
+        self.updated_notes: list[CommitNote] = []
+        self.changes = object()
+
+    def get_note(self, note_id: int) -> CommitNote:
+        assert note_id == self.note.id
+        return self.note
+
+    def update_notes(self, notes: list[CommitNote]) -> object:
+        self.updated_notes = notes
+        return self.changes
+
+
+def test_commit_processed_notes_applies_unchanged_result() -> None:
+    from src.note_proccessor import PendingMedia, ProcessedNote, commit_processed_notes
+
+    note = CommitNote(1, {"Front": "source", "Back": "", "Extra": "edited"})
+    collection = CommitCollection(note)
+    result = ProcessedNote(
+        note_id=1,
+        original_values={"Front": "source", "Back": ""},
+        updates={"Back": "generated"},
+        media=[PendingMedia("generated.mp3", b"audio")],
+        field_failures=[],
+    )
+
+    outcome = commit_processed_notes(collection, [result])
+
+    assert outcome.committed == [1]
+    assert outcome.conflicted == []
+    assert outcome.changes is collection.changes
+    assert note.fields == {
+        "Front": "source",
+        "Back": "generated",
+        "Extra": "edited",
+    }
+    assert collection.media.writes == [("generated.mp3", b"audio")]
+    assert collection.updated_notes == [note]
+
+
+def test_commit_processed_notes_skips_conflicted_result() -> None:
+    from src.note_proccessor import PendingMedia, ProcessedNote, commit_processed_notes
+
+    note = CommitNote(1, {"Front": "user edit", "Back": ""})
+    collection = CommitCollection(note)
+    result = ProcessedNote(
+        note_id=1,
+        original_values={"Front": "source", "Back": ""},
+        updates={"Back": "generated"},
+        media=[PendingMedia("generated.mp3", b"audio")],
+        field_failures=[],
+    )
+
+    outcome = commit_processed_notes(collection, [result])
+
+    assert outcome.committed == []
+    assert outcome.conflicted == [1]
+    assert note.fields == {"Front": "user edit", "Back": ""}
+    assert collection.media.writes == []
+    assert collection.updated_notes == []
+
+
+class BrokenCommitCollection(CommitCollection):
+    def get_note(self, note_id: int) -> CommitNote:
+        raise RuntimeError("database failed")
+
+
+def test_commit_processed_notes_propagates_collection_failure() -> None:
+    from src.note_proccessor import ProcessedNote, commit_processed_notes
+
+    collection = BrokenCommitCollection(CommitNote(1, {}))
+    result = ProcessedNote(1, {}, {"Back": "generated"}, [], [])
+
+    with pytest.raises(RuntimeError, match="database failed"):
+        commit_processed_notes(collection, [result])
+
+
 @pytest.mark.asyncio
 async def test_process_note_returns_deferred_media_without_mutating_note(
     monkeypatch: pytest.MonkeyPatch,

@@ -36,7 +36,7 @@ from .chat_usage import (
     build_prompt_usage_signature,
     chat_usage_tracker,
 )
-from .collection_ops import query_collection
+from .collection_ops import mutate_collection, query_collection
 from .config import Config, bump_usage_counter, key_or_config_val
 from .dag import generate_fields_dag
 from .logger import logger
@@ -130,6 +130,13 @@ class ProcessedNote:
         return [field.lower() for field in self.updates]
 
 
+@dataclass(frozen=True)
+class CommitResult:
+    committed: list[NoteId]
+    conflicted: list[NoteId]
+    changes: Any
+
+
 @dataclass
 class BatchStatistics:
     processed: list[NoteId]
@@ -137,6 +144,7 @@ class BatchStatistics:
     failed: list[NoteId]
     blocked: list[NoteId]
     no_updates: list[NoteId]
+    conflicted: list[NoteId]
     updated_fields: set[str]
     error_details: dict[int, str]
     field_error_details: dict[int, list[FieldFailureDetail]]
@@ -163,6 +171,9 @@ class OpenAIBatchPreflight:
 class EstimatedOpenAIRequest:
     transport_key: str
     estimated_tokens: int
+
+
+COMMIT_CHUNK_SIZE = 50
 
 
 class ListHandler(logging.Handler):
@@ -212,6 +223,45 @@ def snapshot_cards(collection: Any, card_ids: Sequence[CardId]) -> list[NoteSnap
         )
         for card in unique_cards
     ]
+
+
+def commit_processed_notes(
+    collection: Any,
+    results: Sequence[ProcessedNote],
+) -> CommitResult:
+    """Apply unchanged results in one short collection operation."""
+    notes: list[Note] = []
+    committed: list[NoteId] = []
+    conflicted: list[NoteId] = []
+
+    for result in results:
+        note = collection.get_note(result.note_id)
+        try:
+            unchanged = all(
+                str(note[field] or "") == original
+                for field, original in result.original_values.items()
+            )
+        except KeyError:
+            unchanged = False
+
+        if not unchanged:
+            conflicted.append(result.note_id)
+            continue
+
+        for pending_media in result.media:
+            collection.media.write_data(pending_media.filename, pending_media.data)
+        for field, value in result.updates.items():
+            note[field] = value
+
+        notes.append(note)
+        committed.append(result.note_id)
+
+    changes = collection.update_notes(notes)
+    return CommitResult(
+        committed=committed,
+        conflicted=conflicted,
+        changes=changes,
+    )
 
 
 class ProgressDialog(QDialog):
@@ -575,27 +625,7 @@ class NoteProcessor:
             self._release_request()
             show_message_box(f"Error: {error}")
 
-        def apply_results(
-            results: list[ProcessedNote], processed_count: int, finished: bool
-        ) -> None:
-            if not mw or not mw.col:
-                return
-
-            notes: list[Note] = []
-            for result in results:
-                note = mw.col.get_note(result.note_id)
-                for pending_media in result.media:
-                    mw.col.media.write_data(
-                        pending_media.filename,
-                        pending_media.data,
-                    )
-                for field, value in result.updates.items():
-                    note[field] = value
-                notes.append(note)
-
-            if notes:
-                mw.col.update_notes(notes)
-
+        def update_progress(processed_count: int, finished: bool = False) -> None:
             progress.set_value(processed_count)
             if finished:
                 logger.info("Finished processing all notes")
@@ -618,12 +648,35 @@ class NoteProcessor:
             total_failed: list[NoteId] = []
             total_blocked: list[NoteId] = []
             total_no_updates: list[NoteId] = []
+            total_conflicted: list[NoteId] = []
             all_updated_fields: set[str] = set()
             error_details: dict[int, str] = {}
             field_error_details: dict[int, list[FieldFailureDetail]] = {}
             update_buffer: list[ProcessedNote] = []
             processed_count = 0
             db_writes = 0
+
+            async def commit_chunk(results: list[ProcessedNote]) -> None:
+                nonlocal db_writes
+                if not results:
+                    return
+
+                outcome = await mutate_collection(
+                    lambda collection: commit_processed_notes(collection, results)
+                )
+                if outcome.committed:
+                    db_writes += 1
+                committed = set(outcome.committed)
+                total_conflicted.extend(outcome.conflicted)
+
+                for result in results:
+                    if result.note_id not in committed:
+                        continue
+                    all_updated_fields.update(result.updated_fields)
+                    if result.field_failures:
+                        total_partial.append(result.note_id)
+                    else:
+                        total_processed.append(result.note_id)
 
             async def worker(
                 snapshot: NoteSnapshot,
@@ -688,35 +741,20 @@ class NoteProcessor:
 
                     if status.did_update:
                         update_buffer.append(status)
-                        all_updated_fields.update(status.updated_fields)
-                        if status.field_failures:
-                            total_partial.append(note_id)
-                        else:
-                            total_processed.append(note_id)
                     elif status.field_failures:
                         total_blocked.append(note_id)
                     else:
                         total_no_updates.append(note_id)
 
-                batch_to_update: list[ProcessedNote] = []
-                if len(update_buffer) >= 100:
-                    batch_to_update = update_buffer[:]
-                    update_buffer.clear()
+                if len(update_buffer) >= COMMIT_CHUNK_SIZE:
+                    chunk = update_buffer[:COMMIT_CHUNK_SIZE]
+                    del update_buffer[:COMMIT_CHUNK_SIZE]
+                    await commit_chunk(chunk)
 
-                if batch_to_update:
-                    db_writes += 1
-                run_on_main(
-                    lambda results=batch_to_update,
-                    count=processed_count: apply_results(results, count, False)
-                )
+                run_on_main(lambda count=processed_count: update_progress(count))
 
-            if update_buffer:
-                db_writes += 1
-            run_on_main(
-                lambda results=update_buffer, count=processed_count: apply_results(
-                    results, count, True
-                )
-            )
+            await commit_chunk(update_buffer)
+            run_on_main(lambda count=processed_count: update_progress(count, True))
 
             return BatchStatistics(
                 processed=total_processed,
@@ -724,6 +762,7 @@ class NoteProcessor:
                 failed=total_failed,
                 blocked=total_blocked,
                 no_updates=total_no_updates,
+                conflicted=total_conflicted,
                 updated_fields=all_updated_fields,
                 error_details=error_details,
                 field_error_details=field_error_details,
@@ -755,35 +794,29 @@ class NoteProcessor:
         target_field: str | None = None,
         on_field_update: Callable[[], None] | None = None,
     ) -> None:
-        """Process one detached snapshot and apply its result on the main thread."""
+        """Process one detached snapshot and commit it through the collection worker."""
         if not self._assert_preconditions():
             return
 
-        note = card.note()
         deck_name = mw.col.decks.name(card.did) if mw and mw.col else None
-        snapshot = snapshot_note(note, card.did, deck_name)
+        snapshot = snapshot_note(card.note(), card.did, deck_name)
         if show_progress and mw:
             mw.progress.start(label="✨ Generating...", immediate=True)
 
-        def wrapped_on_success(result: ProcessedNote) -> None:
-            for pending_media in result.media:
-                if mw and mw.col:
-                    mw.col.media.write_data(
-                        pending_media.filename,
-                        pending_media.data,
-                    )
-            for field, value in result.updates.items():
-                note[field] = value
-
-            if result.did_update and note.id and mw and mw.col:
-                mw.col.update_note(note)
-            if on_field_update and result.did_update:
+        def wrapped_on_success(
+            result: tuple[ProcessedNote, CommitResult | None],
+        ) -> None:
+            processed, committed = result
+            did_update = bool(committed and committed.committed)
+            if committed and committed.conflicted:
+                logger.info("Skipped note %s because it changed", processed.note_id)
+            if on_field_update and did_update:
                 on_field_update()
             if show_progress and mw:
                 mw.progress.finish()
 
             self._release_request()
-            on_success(result.did_update)
+            on_success(did_update)
 
         def wrapped_failure(error: Exception) -> None:
             if show_progress and mw:
@@ -793,16 +826,21 @@ class NoteProcessor:
             if on_failure:
                 on_failure(error)
 
-        run_async_in_background_with_sentry(
-            lambda: self._process_note(
+        async def op() -> tuple[ProcessedNote, CommitResult | None]:
+            result = await self._process_note(
                 snapshot,
                 overwrite_fields=overwrite_fields,
                 target_field=target_field,
                 usage_scope_id=None,
-            ),
-            wrapped_on_success,
-            wrapped_failure,
-        )
+            )
+            committed = None
+            if result.did_update:
+                committed = await mutate_collection(
+                    lambda collection: commit_processed_notes(collection, [result])
+                )
+            return result, committed
+
+        run_async_in_background_with_sentry(op, wrapped_on_success, wrapped_failure)
 
     async def _process_note(
         self,
