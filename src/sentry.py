@@ -73,10 +73,8 @@ def run_async_in_background_with_sentry(
     op: Callable[[], Any],
     on_success: Callable[[Any], None],
     on_failure: Optional[Callable[[Exception], None]] = None,
-    with_progress: bool = False,
-    use_collection: bool = True,
-):
-    "Runs an async operation in the background and calls on_success when done."
+) -> None:
+    """Run collection-independent async work with consistent error handling."""
 
     if not mw:
         raise Exception("Error: mw not found in run_async_in_background")
@@ -87,9 +85,7 @@ def run_async_in_background_with_sentry(
         if on_failure:
             on_failure(e)
 
-    run_async_in_background(
-        op, on_success, wrapped_on_failure, with_progress, use_collection=use_collection
-    )
+    run_async_in_background(op, on_success, wrapped_on_failure)
 
 
 def pinger(event: str) -> Callable[[], Any]:

@@ -17,12 +17,9 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import sys
 from unittest.mock import MagicMock
 
 import pytest
-
-sys.modules["aqt.operations"] = MagicMock()
 
 from src.provider_runtime import ProviderHTTPError, ProviderTimeoutError
 from src.sentry import log_async_failure

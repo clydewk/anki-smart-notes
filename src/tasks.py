@@ -32,10 +32,8 @@ def run_async_in_background(
     op: Callable[[], Any],
     on_success: Callable[[Any], None] = lambda _: None,
     on_failure: Optional[Callable[[Exception], None]] = None,
-    with_progress: bool = False,
-    use_collection: bool = True,
-):
-    "Runs an async operation in the background and calls on_success when done."
+) -> None:
+    """Run collection-independent async work in the background."""
 
     if not mw:
         raise Exception("Error: mw not found in run_async_in_background")
@@ -60,17 +58,9 @@ def run_async_in_background(
         parent=mw,
         op=run_op,
         success=on_success,
-    )
+    ).without_collection()
 
     if on_failure:
         query_op.failure(on_failure)
-
-    if with_progress:
-        query_op = query_op.with_progress()
-
-    # Not all versions of Anki support without_collection :(
-    # https://github.com/ankitects/anki/commit/055d66397081067a5d4cc6f1e3b370168e907119
-    if not use_collection and hasattr(query_op, "without_collection"):
-        query_op = query_op.without_collection()
 
     query_op.run_in_background()

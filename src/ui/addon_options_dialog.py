@@ -902,7 +902,6 @@ class AddonOptionsDialog(QDialog):
             lambda: mcp_runtime.probe_server(server),
             on_success,
             on_failure,
-            use_collection=False,
         )
 
     def _update_mcp_buttons(self) -> None:

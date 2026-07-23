@@ -707,9 +707,7 @@ class NoteProcessor:
             )
 
         try:
-            run_async_in_background_with_sentry(
-                op, wrapped_on_success, on_failure, with_progress=False
-            )
+            run_async_in_background_with_sentry(op, wrapped_on_success, on_failure)
         except Exception as e:
             logger.removeHandler(log_handler)
             chat_usage_tracker.close_scope(usage_scope_id)

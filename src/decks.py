@@ -17,7 +17,7 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import cast
+from typing import Any, cast
 
 from anki.decks import DeckId, DeckTreeNode
 from aqt import mw
@@ -28,35 +28,35 @@ from .logger import logger
 cached_leaf_decks: dict[DeckId, str] = {}
 
 
-# Slow af even with just a handful of decks, so cached and run off the main thread initially in hooks
-# Theoretically probably a race condition
+def cache_leaf_decks_map(collection: Any) -> dict[DeckId, str]:
+    global cached_leaf_decks
+
+    if cached_leaf_decks:
+        return cached_leaf_decks
+
+    leaves: list[DeckTreeNode] = []
+    nodes = [collection.decks.deck_tree()]
+
+    while nodes:
+        node = nodes.pop()
+        if node.children:
+            nodes.extend(node.children)
+        else:
+            leaves.append(node)
+
+    cached_leaf_decks = {cast("DeckId", node.deck_id): node.name for node in leaves}
+    cached_leaf_decks[GLOBAL_DECK_ID] = GLOBAL_DECK_NAME
+    logger.debug("Cached leaf decks map")
+    logger.debug(cached_leaf_decks)
+    return cached_leaf_decks
 
 
 def deck_id_to_name_map() -> dict[DeckId, str]:
-    global cached_leaf_decks
-
+    if cached_leaf_decks:
+        return cached_leaf_decks
     if not mw or not mw.col:
         return {}
-
-    if not len(cached_leaf_decks):
-        leaves: list[DeckTreeNode] = []
-        nodes = [mw.col.decks.deck_tree()]
-
-        # Find the leaves of the deck tree
-        while nodes:
-            node = nodes.pop()
-            if node.children:
-                for child in node.children:
-                    nodes.append(child)
-            else:
-                leaves.append(node)
-
-        cached_leaf_decks = {cast("DeckId", node.deck_id): node.name for node in leaves}
-        cached_leaf_decks[GLOBAL_DECK_ID] = GLOBAL_DECK_NAME
-        logger.debug("Cached leaf decks map")
-        logger.debug(cached_leaf_decks)
-
-    return cached_leaf_decks
+    return cache_leaf_decks_map(mw.col)
 
 
 def deck_name_to_id_map() -> dict[str, DeckId]:

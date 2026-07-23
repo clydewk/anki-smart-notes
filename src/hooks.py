@@ -31,8 +31,9 @@ from aqt.addcards import AddCards
 from aqt.browser.sidebar.item import SidebarItemType
 
 from .chat_usage import chat_usage_tracker, format_token_count
+from .collection_ops import query_collection
 from .config import bump_usage_counter, config
-from .decks import deck_id_to_name_map
+from .decks import cache_leaf_decks_map
 from .logger import logger, setup_logger
 from .media_utils import extract_sound_file_name
 from .migrations import migrate_models
@@ -389,11 +390,10 @@ def on_browser_context(processor: NoteProcessor, browser: browser.Browser, menu:
 def on_start_actions() -> None:
     perform_update_check()
 
-    # Cache decks for autocomplete
-    async def cache_leaf_decks_map():
-        deck_id_to_name_map()
+    async def cache_decks() -> None:
+        await query_collection(cache_leaf_decks_map)
 
-    run_async_in_background(cache_leaf_decks_map)
+    run_async_in_background(cache_decks)
 
 
 def play_reviewer_audio_field(field_name: str) -> None:

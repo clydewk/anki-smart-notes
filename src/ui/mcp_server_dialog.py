@@ -431,7 +431,6 @@ class McpServerDialog(QDialog):
             lambda: mcp_runtime.probe_server(self.get_server()),
             on_success,
             on_failure,
-            use_collection=False,
         )
 
     def accept(self) -> None:
