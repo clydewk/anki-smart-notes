@@ -173,6 +173,7 @@ class EstimatedOpenAIRequest:
 
 
 COMMIT_CHUNK_SIZE = 50
+MAX_ACTIVE_NOTE_TASKS = 32
 
 
 class ListHandler(logging.Handler):
@@ -685,18 +686,6 @@ class NoteProcessor:
             async def worker(
                 snapshot: NoteSnapshot,
             ) -> tuple[NoteId, ProcessedNote | Exception]:
-                if cancel_event.is_set():
-                    return (
-                        snapshot.note_id,
-                        ProcessedNote(
-                            note_id=snapshot.note_id,
-                            original_values={},
-                            updates={},
-                            media=[],
-                            field_failures=[],
-                        ),
-                    )
-
                 try:
                     return (
                         snapshot.note_id,
@@ -709,16 +698,30 @@ class NoteProcessor:
                 except Exception as error:
                     return snapshot.note_id, error
 
-            active_tasks = {
-                asyncio.create_task(worker(snapshot)) for snapshot in snapshots
-            }
+            snapshots_to_schedule = iter(snapshots)
+            active_tasks: set[
+                asyncio.Task[tuple[NoteId, ProcessedNote | Exception]]
+            ] = set()
 
+            def schedule_more() -> None:
+                while (
+                    not cancel_event.is_set()
+                    and len(active_tasks) < MAX_ACTIVE_NOTE_TASKS
+                ):
+                    try:
+                        snapshot = next(snapshots_to_schedule)
+                    except StopIteration:
+                        return
+                    active_tasks.add(asyncio.create_task(worker(snapshot)))
+
+            schedule_more()
             while active_tasks:
-                done, active_tasks = await asyncio.wait(
+                done, pending = await asyncio.wait(
                     active_tasks,
                     timeout=0.1,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                active_tasks = set(pending)
 
                 for completed_task in done:
                     note_id, status = completed_task.result()
@@ -758,6 +761,8 @@ class NoteProcessor:
                             "Some tasks did not cancel cleanly within timeout"
                         )
                     break
+
+                schedule_more()
 
             await commit_chunk(update_buffer)
             run_on_main(lambda count=processed_count: update_progress(count, True))

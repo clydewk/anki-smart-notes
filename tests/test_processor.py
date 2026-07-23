@@ -912,6 +912,187 @@ async def test_process_note_returns_deferred_media_without_mutating_note(
     assert result.original_values == {"Front": "source", "Back": ""}
 
 
+@pytest.mark.asyncio
+async def test_batch_cancellation_stops_scheduling_new_notes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    import src.note_processor as note_processor
+    from src.note_processor import MAX_ACTIVE_NOTE_TASKS, NoteSnapshot
+
+    note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"Back": "{{Front}}"},
+        {},
+        allow_empty_fields=False,
+    )
+    processor.config.debug = False
+    setup_tracker(monkeypatch, tmp_path)
+
+    snapshots = [
+        NoteSnapshot(
+            note_id=note_id,
+            deck_id=1,
+            deck_name=None,
+            note_type=NOTE_TYPE_NAME,
+            field_order=("Front", "Back"),
+            fields={"Front": "source", "Back": ""},
+        )
+        for note_id in range(MAX_ACTIVE_NOTE_TASKS * 2)
+    ]
+    captured: dict[str, Any] = {}
+
+    class FakeProgressDialog:
+        instance: "FakeProgressDialog | None" = None
+
+        def __init__(self, label: str, max_val: int, on_cancel: Any) -> None:
+            del label, max_val
+            self.on_cancel = on_cancel
+            self.closed = False
+            FakeProgressDialog.instance = self
+
+        def show(self) -> None:
+            pass
+
+        def set_label(self, _: str) -> None:
+            pass
+
+        def disable_cancel(self) -> None:
+            pass
+
+        def set_maximum(self, _: int) -> None:
+            pass
+
+        def set_value(self, _: int) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def query(_: Any) -> list[NoteSnapshot]:
+        return snapshots
+
+    def capture_background(
+        operation: Any,
+        on_success: Any,
+        on_failure: Any,
+    ) -> None:
+        captured.update(
+            operation=operation,
+            on_success=on_success,
+            on_failure=on_failure,
+        )
+
+    started = 0
+
+    async def slow_process(*_: Any, **__: Any) -> Any:
+        nonlocal started
+        started += 1
+        if started == 1:
+            assert FakeProgressDialog.instance is not None
+            FakeProgressDialog.instance.on_cancel()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(note_processor, "mw", SimpleNamespace(col=object()))
+    monkeypatch.setattr(note_processor, "ProgressDialog", FakeProgressDialog)
+    monkeypatch.setattr(note_processor, "query_collection", query)
+    monkeypatch.setattr(note_processor, "run_on_main", lambda operation: operation())
+    monkeypatch.setattr(note_processor, "bump_usage_counter", lambda: None)
+    monkeypatch.setattr(
+        note_processor,
+        "run_async_in_background_with_sentry",
+        capture_background,
+    )
+    monkeypatch.setattr(
+        note_processor.provider_runtime, "get_metrics_summary", lambda: {}
+    )
+    monkeypatch.setattr(processor, "_process_note", slow_process)
+
+    processor.process_cards_with_progress([1], on_success=None)
+    stats = await captured["operation"]()
+
+    assert stats.was_cancelled
+    assert 1 <= started <= MAX_ACTIVE_NOTE_TASKS
+    assert started < len(snapshots)
+    assert not stats.updated
+    assert not stats.partial
+    assert not stats.failed
+    assert not stats.blocked
+    assert not stats.unchanged
+    assert not stats.conflicted
+
+    captured["on_success"](stats)
+    assert not processor.req_in_progress
+    assert FakeProgressDialog.instance is not None
+    assert FakeProgressDialog.instance.closed
+
+
+def test_process_card_failure_releases_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import src.note_processor as note_processor
+
+    note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"Back": "{{Front}}"},
+        {},
+        allow_empty_fields=False,
+    )
+    captured: dict[str, Any] = {}
+    failure_seen: list[Exception] = []
+
+    class FakeCard:
+        did = 1
+
+        def note(self) -> MockNote:
+            return note
+
+    def capture_background(
+        operation: Any,
+        on_success: Any,
+        on_failure: Any,
+    ) -> None:
+        captured.update(
+            operation=operation,
+            on_success=on_success,
+            on_failure=on_failure,
+        )
+
+    decks = SimpleNamespace(name=lambda _: None)
+    monkeypatch.setattr(
+        note_processor, "mw", SimpleNamespace(col=SimpleNamespace(decks=decks))
+    )
+    monkeypatch.setattr(
+        note_processor,
+        "run_async_in_background_with_sentry",
+        capture_background,
+    )
+    monkeypatch.setattr(processor, "_handle_failure", lambda _: None)
+
+    card: Any = FakeCard()
+    processor.process_card(
+        card,
+        show_progress=False,
+        on_failure=failure_seen.append,
+    )
+    assert processor.req_in_progress
+
+    error = RuntimeError("failed")
+    captured["on_failure"](error)
+
+    assert failure_seen == [error]
+    assert not processor.req_in_progress
+
+
 def test_estimated_generated_field_value_defaults_without_response_chars(
     monkeypatch,
     tmp_path,
