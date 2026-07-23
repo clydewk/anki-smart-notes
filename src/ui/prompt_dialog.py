@@ -67,7 +67,7 @@ from ..models import (
     overridable_image_options,
     overridable_tts_options,
 )
-from ..note_proccessor import NoteProcessor, snapshot_note
+from ..note_processor import NoteProcessor, snapshot_note
 from ..notes import get_note_types, get_random_note, get_valid_fields_for_prompt
 from ..prompts import (
     add_or_update_prompts,

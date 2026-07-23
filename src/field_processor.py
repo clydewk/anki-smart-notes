@@ -60,7 +60,7 @@ from .models import (
     normalize_built_in_tools_config,
 )
 from .nodes import FieldNode
-from .note_proccessor import PendingMedia, ResolvedField
+from .note_processor import PendingMedia, ResolvedField
 from .prompts import get_extras, interpolate_prompt_with_values
 from .tool_registry import ToolRegistry
 from .tts_provider import TTSProvider, tts_provider

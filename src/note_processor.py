@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -139,18 +140,16 @@ class CommitResult:
 
 @dataclass
 class BatchStatistics:
-    processed: list[NoteId]
+    updated: list[NoteId]
     partial: list[NoteId]
-    failed: list[NoteId]
-    blocked: list[NoteId]
-    no_updates: list[NoteId]
+    failed: dict[NoteId, str]
+    blocked: dict[NoteId, list[FieldFailureDetail]]
+    unchanged: list[NoteId]
     conflicted: list[NoteId]
     updated_fields: set[str]
-    error_details: dict[int, str]
-    field_error_details: dict[int, list[FieldFailureDetail]]
     start_time: float
     end_time: float
-    db_writes: int
+    commit_count: int
     transport_metrics: dict[str, dict[str, float]]
     logs: list[str]
     chat_usage_summary: ChatRunUsageSummary = EMPTY_CHAT_RUN_USAGE_SUMMARY
@@ -589,10 +588,10 @@ class NoteProcessor:
         bump_usage_counter()
         requested_card_ids = tuple(card_ids)
         total_notes = len(requested_card_ids)
-        cancellation_state = {"cancelled": False}
+        cancel_event = threading.Event()
 
         def on_cancel() -> None:
-            cancellation_state["cancelled"] = True
+            cancel_event.set()
             logger.info("Cancellation requested")
             progress.set_label("Cancelling... please wait for active tasks to finish.")
             progress.disable_cancel()
@@ -605,31 +604,38 @@ class NoteProcessor:
         progress.show()
         usage_scope_id = chat_usage_tracker.open_scope()
 
-        log_handler = ListHandler()
-        log_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(message)s")
-        )
-        logger.addHandler(log_handler)
+        log_handler = ListHandler() if self.config.debug else None
+        if log_handler:
+            log_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - %(message)s")
+            )
+            logger.addHandler(log_handler)
 
-        def wrapped_on_success(stats: BatchStatistics) -> None:
-            logger.removeHandler(log_handler)
+        def finish() -> None:
+            if log_handler:
+                logger.removeHandler(log_handler)
             progress.close()
             self._release_request()
+
+        def wrapped_on_success(stats: BatchStatistics) -> None:
+            finish()
             if on_success:
                 on_success(stats)
 
         def on_failure(error: Exception) -> None:
-            logger.removeHandler(log_handler)
             chat_usage_tracker.close_scope(usage_scope_id)
-            progress.close()
-            self._release_request()
+            finish()
             show_message_box(f"Error: {error}")
 
         def update_progress(processed_count: int, finished: bool = False) -> None:
             progress.set_value(processed_count)
             if finished:
-                logger.info("Finished processing all notes")
-            elif not cancellation_state["cancelled"]:
+                logger.info(
+                    "Batch processing cancelled"
+                    if cancel_event.is_set()
+                    else "Finished processing all notes"
+                )
+            elif not cancel_event.is_set():
                 progress.set_label(
                     f"✨ Generating... ({processed_count}/{total_notes})"
                 )
@@ -643,21 +649,19 @@ class NoteProcessor:
             total_notes = len(snapshots)
             run_on_main(lambda: progress.set_maximum(total_notes))
 
-            total_processed: list[NoteId] = []
-            total_partial: list[NoteId] = []
-            total_failed: list[NoteId] = []
-            total_blocked: list[NoteId] = []
-            total_no_updates: list[NoteId] = []
-            total_conflicted: list[NoteId] = []
-            all_updated_fields: set[str] = set()
-            error_details: dict[int, str] = {}
-            field_error_details: dict[int, list[FieldFailureDetail]] = {}
+            updated: list[NoteId] = []
+            partial: list[NoteId] = []
+            failed: dict[NoteId, str] = {}
+            blocked: dict[NoteId, list[FieldFailureDetail]] = {}
+            unchanged: list[NoteId] = []
+            conflicted: list[NoteId] = []
+            updated_fields: set[str] = set()
             update_buffer: list[ProcessedNote] = []
             processed_count = 0
-            db_writes = 0
+            commit_count = 0
 
             async def commit_chunk(results: list[ProcessedNote]) -> None:
-                nonlocal db_writes
+                nonlocal commit_count
                 if not results:
                     return
 
@@ -665,23 +669,23 @@ class NoteProcessor:
                     lambda collection: commit_processed_notes(collection, results)
                 )
                 if outcome.committed:
-                    db_writes += 1
+                    commit_count += 1
                 committed = set(outcome.committed)
-                total_conflicted.extend(outcome.conflicted)
+                conflicted.extend(outcome.conflicted)
 
                 for result in results:
                     if result.note_id not in committed:
                         continue
-                    all_updated_fields.update(result.updated_fields)
+                    updated_fields.update(result.updated_fields)
                     if result.field_failures:
-                        total_partial.append(result.note_id)
+                        partial.append(result.note_id)
                     else:
-                        total_processed.append(result.note_id)
+                        updated.append(result.note_id)
 
             async def worker(
                 snapshot: NoteSnapshot,
             ) -> tuple[NoteId, ProcessedNote | Exception]:
-                if cancellation_state["cancelled"]:
+                if cancel_event.is_set():
                     return (
                         snapshot.note_id,
                         ProcessedNote(
@@ -705,12 +709,43 @@ class NoteProcessor:
                 except Exception as error:
                     return snapshot.note_id, error
 
-            active_tasks = [
+            active_tasks = {
                 asyncio.create_task(worker(snapshot)) for snapshot in snapshots
-            ]
+            }
 
-            for completed_task in asyncio.as_completed(active_tasks):
-                if cancellation_state["cancelled"]:
+            while active_tasks:
+                done, active_tasks = await asyncio.wait(
+                    active_tasks,
+                    timeout=0.1,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for completed_task in done:
+                    note_id, status = completed_task.result()
+                    processed_count += 1
+
+                    if isinstance(status, Exception):
+                        failed[note_id] = describe_exception(status)
+                        logger.error(
+                            "Error processing note %s: %s",
+                            note_id,
+                            failed[note_id],
+                        )
+                    elif status.did_update:
+                        update_buffer.append(status)
+                    elif status.field_failures:
+                        blocked[note_id] = status.field_failures
+                    else:
+                        unchanged.append(note_id)
+
+                    if len(update_buffer) >= COMMIT_CHUNK_SIZE:
+                        chunk = update_buffer[:COMMIT_CHUNK_SIZE]
+                        del update_buffer[:COMMIT_CHUNK_SIZE]
+                        await commit_chunk(chunk)
+
+                    run_on_main(lambda count=processed_count: update_progress(count))
+
+                if cancel_event.is_set():
                     for active_task in active_tasks:
                         active_task.cancel()
                     try:
@@ -724,64 +759,31 @@ class NoteProcessor:
                         )
                     break
 
-                note_id, status = await completed_task
-                processed_count += 1
-
-                if isinstance(status, Exception):
-                    total_failed.append(note_id)
-                    error_details[note_id] = describe_exception(status)
-                    logger.error(
-                        "Error processing note %s: %s",
-                        note_id,
-                        describe_exception(status),
-                    )
-                else:
-                    if status.field_failures:
-                        field_error_details[note_id] = status.field_failures
-
-                    if status.did_update:
-                        update_buffer.append(status)
-                    elif status.field_failures:
-                        total_blocked.append(note_id)
-                    else:
-                        total_no_updates.append(note_id)
-
-                if len(update_buffer) >= COMMIT_CHUNK_SIZE:
-                    chunk = update_buffer[:COMMIT_CHUNK_SIZE]
-                    del update_buffer[:COMMIT_CHUNK_SIZE]
-                    await commit_chunk(chunk)
-
-                run_on_main(lambda count=processed_count: update_progress(count))
-
             await commit_chunk(update_buffer)
             run_on_main(lambda count=processed_count: update_progress(count, True))
 
             return BatchStatistics(
-                processed=total_processed,
-                partial=total_partial,
-                failed=total_failed,
-                blocked=total_blocked,
-                no_updates=total_no_updates,
-                conflicted=total_conflicted,
-                updated_fields=all_updated_fields,
-                error_details=error_details,
-                field_error_details=field_error_details,
+                updated=updated,
+                partial=partial,
+                failed=failed,
+                blocked=blocked,
+                unchanged=unchanged,
+                conflicted=conflicted,
+                updated_fields=updated_fields,
                 start_time=start_time,
                 end_time=time.time(),
-                db_writes=db_writes,
+                commit_count=commit_count,
                 transport_metrics=provider_runtime.get_metrics_summary(),
-                logs=list(log_handler.logs),
+                logs=list(log_handler.logs) if log_handler else [],
                 chat_usage_summary=chat_usage_tracker.close_scope(usage_scope_id),
-                was_cancelled=cancellation_state["cancelled"],
+                was_cancelled=cancel_event.is_set(),
             )
 
         try:
             run_async_in_background_with_sentry(op, wrapped_on_success, on_failure)
         except Exception:
-            logger.removeHandler(log_handler)
             chat_usage_tracker.close_scope(usage_scope_id)
-            progress.close()
-            self._release_request()
+            finish()
             raise
 
     def process_card(

@@ -20,7 +20,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 from .config import config
 from .field_processor import field_processor
 from .hooks import setup_hooks
-from .note_proccessor import NoteProcessor
+from .note_processor import NoteProcessor
 
 
 def main() -> None:

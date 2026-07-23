@@ -23,7 +23,7 @@ from typing import Optional
 from anki.cards import Card
 from aqt import QAction, QMenu, browser, editor, mw
 
-from ..note_proccessor import NoteProcessor
+from ..note_processor import NoteProcessor
 from .custom_prompt import CustomImagePrompt, CustomTextPrompt, CustomTTSPrompt
 
 

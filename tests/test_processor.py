@@ -48,7 +48,7 @@ class FakeFieldProcessor:
         usage_scope_id: str | None = None,
         **context: Any,
     ) -> Any:
-        from src.note_proccessor import ResolvedField
+        from src.note_processor import ResolvedField
         from src.prompts import config, interpolate_prompt_with_values
 
         del show_error_box, usage_scope_id, context
@@ -62,7 +62,7 @@ class FakeFieldProcessor:
 
 
 def make_snapshot(note: Any, deck_id: int = 1) -> Any:
-    from src.note_proccessor import snapshot_note
+    from src.note_processor import snapshot_note
 
     return snapshot_note(note, deck_id)
 
@@ -85,7 +85,7 @@ def setup_data(monkeypatch, note, prompts_map, options, allow_empty_fields):
     fake_ui_utils_module.show_message_box = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "src.ui.ui_utils", fake_ui_utils_module)
 
-    from src.note_proccessor import NoteProcessor
+    from src.note_processor import NoteProcessor
 
     extras = {
         field: {
@@ -133,7 +133,7 @@ def setup_data(monkeypatch, note, prompts_map, options, allow_empty_fields):
 
 def setup_tracker(monkeypatch, tmp_path: Path) -> ChatUsageTracker:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
-    monkeypatch.setattr("src.note_proccessor.chat_usage_tracker", tracker)
+    monkeypatch.setattr("src.note_processor.chat_usage_tracker", tracker)
     return tracker
 
 
@@ -613,7 +613,7 @@ async def test_process_note_reports_field_failures(monkeypatch):
         usage_scope_id: str | None = None,
         **context: Any,
     ) -> Any:
-        from src.note_proccessor import ResolvedField
+        from src.note_processor import ResolvedField
 
         del show_error_box, usage_scope_id, context
         if node.field == "f2":
@@ -815,7 +815,7 @@ class CommitCollection:
 
 
 def test_commit_processed_notes_applies_unchanged_result() -> None:
-    from src.note_proccessor import PendingMedia, ProcessedNote, commit_processed_notes
+    from src.note_processor import PendingMedia, ProcessedNote, commit_processed_notes
 
     note = CommitNote(1, {"Front": "source", "Back": "", "Extra": "edited"})
     collection = CommitCollection(note)
@@ -842,7 +842,7 @@ def test_commit_processed_notes_applies_unchanged_result() -> None:
 
 
 def test_commit_processed_notes_skips_conflicted_result() -> None:
-    from src.note_proccessor import PendingMedia, ProcessedNote, commit_processed_notes
+    from src.note_processor import PendingMedia, ProcessedNote, commit_processed_notes
 
     note = CommitNote(1, {"Front": "user edit", "Back": ""})
     collection = CommitCollection(note)
@@ -869,7 +869,7 @@ class BrokenCommitCollection(CommitCollection):
 
 
 def test_commit_processed_notes_propagates_collection_failure() -> None:
-    from src.note_proccessor import ProcessedNote, commit_processed_notes
+    from src.note_processor import ProcessedNote, commit_processed_notes
 
     collection = BrokenCommitCollection(CommitNote(1, {}))
     result = ProcessedNote(1, {}, {"Back": "generated"}, [], [])
@@ -882,7 +882,7 @@ def test_commit_processed_notes_propagates_collection_failure() -> None:
 async def test_process_note_returns_deferred_media_without_mutating_note(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.note_proccessor import PendingMedia, ResolvedField
+    from src.note_processor import PendingMedia, ResolvedField
 
     note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
     processor = setup_data(

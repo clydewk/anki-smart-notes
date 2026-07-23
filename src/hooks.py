@@ -37,7 +37,7 @@ from .decks import cache_leaf_decks_map
 from .logger import logger, setup_logger
 from .media_utils import extract_sound_file_name
 from .migrations import migrate_models
-from .note_proccessor import BatchStatistics, NoteProcessor
+from .note_processor import BatchStatistics, NoteProcessor
 from .notes import get_field_from_index, is_ai_field, is_card_fully_processed
 from .sentry import with_sentry
 from .tasks import run_async_in_background
@@ -180,15 +180,13 @@ def make_on_batch_success(
     browser: browser.Browser,  # type: ignore
 ) -> Callable[[BatchStatistics], None]:
     def wrapped_on_batch_success(stats: BatchStatistics):
-        processed = stats.processed
+        updated = stats.updated
         partial = stats.partial
-        errors = stats.failed
+        failed = stats.failed
         blocked = stats.blocked
-        no_updates = stats.no_updates
+        unchanged = stats.unchanged
         conflicted = stats.conflicted
         updated_fields = stats.updated_fields
-        error_details = stats.error_details
-        field_error_details = stats.field_error_details
         chat_usage_summary = stats.chat_usage_summary
 
         browser.on_all_or_selected_rows_changed()
@@ -198,13 +196,13 @@ def make_on_batch_success(
 
         debug_info = ""
         was_cancelled = stats.was_cancelled
-        updated_count = len(processed) + len(partial)
+        updated_count = len(updated) + len(partial)
         completed_count = (
-            len(processed)
+            len(updated)
             + len(partial)
-            + len(errors)
+            + len(failed)
             + len(blocked)
-            + len(no_updates)
+            + len(unchanged)
             + len(conflicted)
         )
 
@@ -218,13 +216,13 @@ def make_on_batch_success(
                 debug_parts.append("Status: Cancelled")
             debug_parts.append(f"Time Taken: {duration:.2f}s")
             debug_parts.append(f"Processing Speed: {notes_per_sec:.2f} notes/sec")
-            debug_parts.append(f"Database Writes: {stats.db_writes}")
+            debug_parts.append(f"Commit Chunks: {stats.commit_count}")
             debug_parts.append(f"Updated: {updated_count}")
-            debug_parts.append(f"Processed Cleanly: {len(processed)}")
+            debug_parts.append(f"Processed Cleanly: {len(updated)}")
             debug_parts.append(f"Processed With Field Failures: {len(partial)}")
-            debug_parts.append(f"Failed: {len(errors)}")
+            debug_parts.append(f"Failed: {len(failed)}")
             debug_parts.append(f"Blocked By Field Failures: {len(blocked)}")
-            debug_parts.append(f"No Updates: {len(no_updates)}")
+            debug_parts.append(f"No Updates: {len(unchanged)}")
             debug_parts.append(f"Conflicted: {len(conflicted)}")
             if chat_usage_summary.request_count:
                 debug_parts.append(
@@ -251,17 +249,16 @@ def make_on_batch_success(
                         f"timeouts={timeouts:.0f}"
                     )
 
-            if errors:
+            if failed:
                 debug_parts.append("\n--- Failures ---")
-                for note_id in errors:
-                    msg = error_details.get(note_id, "Unknown error")
-                    debug_parts.append(f"Note ID {note_id} failed: {msg}")
+                for note_id, message in failed.items():
+                    debug_parts.append(f"Note ID {note_id} failed: {message}")
 
-            if field_error_details:
+            if blocked:
                 debug_parts.append("\n--- Field Failures ---")
-                for note_id in sorted(field_error_details):
+                for note_id in sorted(blocked):
                     debug_parts.append(f"Note ID {note_id}:")
-                    for detail in field_error_details[note_id]:
+                    for detail in blocked[note_id]:
                         debug_parts.append(f"  - {detail.summary()}")
 
             if stats.logs:
@@ -272,9 +269,9 @@ def make_on_batch_success(
 
         if (
             not updated_count
-            and not len(no_updates)
+            and not len(unchanged)
             and not len(conflicted)
-            and (len(errors) or len(blocked))
+            and (len(failed) or len(blocked))
         ):
             show_message_box(
                 "No notes were updated. Check Debug Info for details.",
@@ -283,24 +280,24 @@ def make_on_batch_success(
             )
         else:
             parts = []
-            if len(processed):
-                parts.append(f"Updated {pluralize('note', len(processed))}")
+            if len(updated):
+                parts.append(f"Updated {pluralize('note', len(updated))}")
 
             if len(partial):
                 parts.append(
                     f"{pluralize('note', len(partial))} updated with field failures"
                 )
 
-            if len(errors):
-                parts.append(f"{pluralize('note', len(errors))} failed")
+            if len(failed):
+                parts.append(f"{pluralize('note', len(failed))} failed")
 
             if len(blocked):
                 parts.append(
                     f"{pluralize('note', len(blocked))} blocked by field failures"
                 )
 
-            if len(no_updates):
-                parts.append(f"{pluralize('note', len(no_updates))} had no updates")
+            if len(unchanged):
+                parts.append(f"{pluralize('note', len(unchanged))} had no updates")
 
             if len(conflicted):
                 parts.append(

@@ -66,7 +66,7 @@ from ..models import (
     SmartFieldType,
     normalize_built_in_tools_config,
 )
-from ..note_proccessor import NoteProcessor
+from ..note_processor import NoteProcessor
 from ..prompt_io import (
     ImportPreview,
     PromptImportError,

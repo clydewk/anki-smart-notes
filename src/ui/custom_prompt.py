@@ -43,7 +43,7 @@ from ..decks import deck_id_to_name_map
 from ..field_processor import field_processor
 from ..logger import logger
 from ..media_utils import get_media_path, write_media
-from ..note_proccessor import NoteSnapshot, snapshot_note
+from ..note_processor import NoteSnapshot, snapshot_note
 from ..notes import get_note_type, get_valid_fields_for_prompt
 from ..prompts import get_prompts_for_note
 from ..sentry import run_async_in_background_with_sentry
