@@ -39,9 +39,11 @@ from aqt import (
     QWidget,
 )
 
+from ..decks import deck_id_to_name_map
 from ..field_processor import field_processor
 from ..logger import logger
 from ..media_utils import get_media_path, write_media
+from ..note_proccessor import NoteSnapshot, snapshot_note
 from ..notes import get_note_type, get_valid_fields_for_prompt
 from ..prompts import get_prompts_for_note
 from ..sentry import run_async_in_background_with_sentry
@@ -90,6 +92,13 @@ class CustomPrompt(QDialog):
         self._on_success = on_success
 
         self._setup_ui()
+
+    def _snapshot(self) -> NoteSnapshot:
+        return snapshot_note(
+            self._note,
+            self._deck_id,
+            deck_id_to_name_map().get(self._deck_id),
+        )
 
     def on_generate(self) -> None:
         raise Exception("Not Implemented")
@@ -247,10 +256,16 @@ class CustomTextPrompt(CustomPrompt):
             self._loading = False
             self._update_ui_states()
 
+        snapshot = self._snapshot()
+
         async def generate_text():
             return await field_processor.get_chat_response(
-                note=self._note,
-                deck_id=self._deck_id,
+                note_id=snapshot.note_id,
+                note_type=snapshot.note_type,
+                deck_name=snapshot.deck_name,
+                field_order=snapshot.field_order,
+                values=snapshot.lower_values(),
+                deck_id=snapshot.deck_id,
                 prompt=prompt,
                 field_lower=self._field_upper.lower(),
                 temperature=self._chat_options.state.s["chat_temperature"],
@@ -304,9 +319,12 @@ class CustomImagePrompt(CustomPrompt):
             self._loading = False
             self._update_ui_states()
 
+        snapshot = self._snapshot()
+
         async def generate_image():
             return await field_processor.get_image_response(
-                note=self._note,
+                note_id=snapshot.note_id,
+                values=snapshot.lower_values(),
                 input_text=prompt,
                 model=self.image_options.state.s["image_model"],
                 provider=self.image_options.state.s["image_provider"],
@@ -371,10 +389,12 @@ class CustomTTSPrompt(CustomPrompt):
 
     def on_generate(self) -> None:
         prompt = self._prompt_window.toPlainText()
+        snapshot = self._snapshot()
 
         async def get_tts_response():
             return await field_processor.get_tts_response(
-                note=self._note,
+                note_id=snapshot.note_id,
+                values=snapshot.lower_values(),
                 input_text=prompt,
                 model=self.tts_options.state.s["tts_model"],
                 provider=self.tts_options.state.s["tts_provider"],

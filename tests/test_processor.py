@@ -20,6 +20,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -38,21 +39,36 @@ NOTE_TYPE_NAME = "note_type_1"
 
 
 class FakeFieldProcessor:
-    async def resolve(self, node, note, show_error_box=False, usage_scope_id=None):
-        from src.prompts import interpolate_prompt
+    async def resolve(
+        self,
+        node: Any,
+        *,
+        values: dict[str, str],
+        show_error_box: bool = False,
+        usage_scope_id: str | None = None,
+        **context: Any,
+    ) -> Any:
+        from src.note_proccessor import ResolvedField
+        from src.prompts import config, interpolate_prompt_with_values
 
-        del show_error_box, usage_scope_id
+        del show_error_box, usage_scope_id, context
 
-        interpolated = interpolate_prompt(node.input, note)
-        if not interpolated:
-            return None
+        interpolated = interpolate_prompt_with_values(
+            node.input,
+            values,
+            config.allow_empty_fields,
+        )
+        return ResolvedField(p(interpolated) if interpolated else None)
 
-        return p(interpolated)
+
+def make_snapshot(note: Any, deck_id: int = 1) -> Any:
+    from src.note_proccessor import snapshot_note
+
+    return snapshot_note(note, deck_id)
 
 
 def setup_data(monkeypatch, note, prompts_map, options, allow_empty_fields):
     import src.config
-    import src.dag
     import src.prompts
 
     fake_field_processor_module = types.ModuleType("src.field_processor")
@@ -92,12 +108,6 @@ def setup_data(monkeypatch, note, prompts_map, options, allow_empty_fields):
     c = MockConfig(prompts_map=prompts_map, allow_empty_fields=allow_empty_fields)
     f = FakeFieldProcessor()
     p = NoteProcessor(field_processor=f, config=c)
-
-    monkeypatch.setattr(
-        src.dag,
-        "get_fields",
-        lambda _: note.fields(),
-    )
 
     monkeypatch.setattr(src.config, "config", c)
     monkeypatch.setattr(src.prompts, "config", c)
@@ -450,12 +460,17 @@ async def test_processor_1(name, note, prompts_map, expected, options, monkeypat
         allow_empty_fields=allow_empty_fields,
     )
 
-    await p._process_note(
-        n, deck_id=1, overwrite_fields=overwrite_fields, target_field=target_field
+    result = await p._process_note(
+        make_snapshot(n),
+        overwrite_fields=overwrite_fields,
+        target_field=target_field,
     )
 
-    for k, v in expected.items():
-        assert n[k] == v, f"{name}: Field {k} is {n[k]}, expected {v}"
+    for field, expected_value in expected.items():
+        actual = result.updates.get(field, n[field])
+        assert actual == expected_value, (
+            f"{name}: Field {field} is {actual}, expected {expected_value}"
+        )
 
 
 """
@@ -521,14 +536,14 @@ async def test_cycle(note, prompts_map, expected, monkeypatch):
         ][note_type]["1"]["fields"],
     )
 
-    # Mock get_fields like in setup_data
-    monkeypatch.setattr(
-        src.dag,
-        "get_fields",
-        lambda _: n.fields(),
+    snapshot = make_snapshot(n)
+    dag = src.dag.generate_fields_dag(
+        note_type=snapshot.note_type,
+        field_order=snapshot.field_order,
+        values=snapshot.lower_values(),
+        deck_id=snapshot.deck_id,
+        overwrite_fields=True,
     )
-
-    dag = src.dag.generate_fields_dag(n, deck_id=1, overwrite_fields=True)
     cycle = src.dag.has_cycle(dag)
     assert cycle == expected
 
@@ -570,7 +585,9 @@ async def test_returns_if_updated(note, prompts_map, expected, monkeypatch):
     )
 
     result = await p._process_note(  # type: ignore
-        n, deck_id=1, overwrite_fields=False, target_field=None
+        make_snapshot(n),
+        overwrite_fields=False,
+        target_field=None,
     )
     assert result.did_update == expected
 
@@ -588,18 +605,33 @@ async def test_process_note_reports_field_failures(monkeypatch):
         allow_empty_fields=False,
     )
 
-    async def fail_resolve(node, note, show_error_box=False, usage_scope_id=None):
-        del show_error_box, usage_scope_id
+    async def fail_resolve(
+        node: Any,
+        *,
+        values: dict[str, str],
+        show_error_box: bool = False,
+        usage_scope_id: str | None = None,
+        **context: Any,
+    ) -> Any:
+        from src.note_proccessor import ResolvedField
+
+        del show_error_box, usage_scope_id, context
         if node.field == "f2":
             raise TimeoutError()
 
-        interpolated = src.prompts.interpolate_prompt(node.input, note)
-        return p(interpolated) if interpolated else None
+        interpolated = src.prompts.interpolate_prompt_with_values(
+            node.input,
+            values,
+            src.prompts.config.allow_empty_fields,
+        )
+        return ResolvedField(p(interpolated) if interpolated else None)
 
     processor.field_processor.resolve = fail_resolve
 
     result = await processor._process_note(  # type: ignore
-        note, deck_id=1, overwrite_fields=False, target_field=None
+        make_snapshot(note),
+        overwrite_fields=False,
+        target_field=None,
     )
 
     assert result.did_update is False
@@ -637,12 +669,11 @@ def test_openai_batch_preflight_recommends_fast_note_count(
         raw_usage={"input_tokens": 2_000, "output_tokens": 0},
     )
 
-    notes_with_decks = [
-        (MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "one", "f2": ""}), 1),
-        (MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "two", "f2": ""}), 1),
-        (MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "three", "f2": ""}), 1),
+    snapshots = [
+        make_snapshot(MockNote(note_type=NOTE_TYPE_NAME, data={"f1": value, "f2": ""}))
+        for value in ("one", "two", "three")
     ]
-    preflight = processor.estimate_openai_batch_preflight_for_notes(notes_with_decks)
+    preflight = processor.estimate_openai_batch_preflight_for_snapshots(snapshots)
 
     assert preflight is not None
     assert preflight.note_count == 3
@@ -670,7 +701,9 @@ def test_openai_batch_preflight_counts_chained_openai_fields(
     src.config.config.openai_daily_token_budget_enabled = True
     src.config.config.openai_daily_token_budget = 10_000
 
-    estimated_requests = processor.estimate_openai_requests_for_note(note, deck_id=1)
+    estimated_requests = processor.estimate_openai_requests_for_snapshot(
+        make_snapshot(note)
+    )
     assert len(estimated_requests) == 2
 
 
@@ -689,7 +722,14 @@ def test_estimated_generated_field_value_uses_visible_response_chars(
         allow_empty_fields=False,
     )
     tracker = setup_tracker(monkeypatch, tmp_path)
-    dag = generate_fields_dag(note, overwrite_fields=False, deck_id=1)
+    snapshot = make_snapshot(note)
+    dag = generate_fields_dag(
+        note_type=snapshot.note_type,
+        field_order=snapshot.field_order,
+        values=snapshot.lower_values(),
+        overwrite_fields=False,
+        deck_id=snapshot.deck_id,
+    )
     node = dag["f2"]
     prompt = "Summarize {{f1}}"
 
@@ -724,6 +764,53 @@ def test_estimated_generated_field_value_uses_visible_response_chars(
     )
 
 
+def test_snapshot_note_copies_fields() -> None:
+    note = MockNote(NOTE_TYPE_NAME, {"Front": "original", "Back": ""})
+
+    snapshot = make_snapshot(note, deck_id=7)
+    note["Front"] = "changed"
+
+    assert snapshot.note_id == note.id
+    assert snapshot.deck_id == 7
+    assert snapshot.note_type == NOTE_TYPE_NAME
+    assert snapshot.field_order == ("Front", "Back")
+    assert snapshot.fields == {"Front": "original", "Back": ""}
+
+
+@pytest.mark.asyncio
+async def test_process_note_returns_deferred_media_without_mutating_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.note_proccessor import PendingMedia, ResolvedField
+
+    note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"Back": "{{Front}}"},
+        {},
+        allow_empty_fields=False,
+    )
+    media = PendingMedia("note-back.mp3", b"audio")
+
+    async def resolve(node: Any, **kwargs: Any) -> Any:
+        assert "note" not in kwargs
+        assert kwargs["note_id"] == note.id
+        assert kwargs["note_type"] == NOTE_TYPE_NAME
+        assert kwargs["values"] == {"front": "source", "back": ""}
+        return ResolvedField("[sound:note-back.mp3]", media)
+
+    processor.field_processor.resolve = resolve
+    result = await processor._process_note(  # pyright: ignore[reportPrivateUsage]
+        make_snapshot(note)
+    )
+
+    assert note["Back"] == ""
+    assert result.updates == {"Back": "[sound:note-back.mp3]"}
+    assert result.media == [media]
+    assert result.original_values == {"Front": "source", "Back": ""}
+
+
 def test_estimated_generated_field_value_defaults_without_response_chars(
     monkeypatch,
     tmp_path,
@@ -739,7 +826,14 @@ def test_estimated_generated_field_value_defaults_without_response_chars(
         allow_empty_fields=False,
     )
     tracker = setup_tracker(monkeypatch, tmp_path)
-    dag = generate_fields_dag(note, overwrite_fields=False, deck_id=1)
+    snapshot = make_snapshot(note)
+    dag = generate_fields_dag(
+        note_type=snapshot.note_type,
+        field_order=snapshot.field_order,
+        values=snapshot.lower_values(),
+        overwrite_fields=False,
+        deck_id=snapshot.deck_id,
+    )
     node = dag["f2"]
     prompt = "Summarize {{f1}}"
 

@@ -20,14 +20,13 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 import json
 from types import SimpleNamespace
 from typing import Any, Optional, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from src.built_in_tools import BuiltInToolContext, BuiltInToolProvider
 from src.chat_provider import TextGenerationResult
 from src.config import Config
-from src.constants import GLOBAL_DECK_ID
 from src.field_processor import FieldProcessor
 from src.mcp_runtime import (
     McpServerInfo,
@@ -35,6 +34,7 @@ from src.mcp_runtime import (
     McpToolCallResult,
     McpToolSpec,
 )
+from src.nodes import FieldNode
 from src.tool_registry import ToolRegistry
 from tests.mocks import MockConfig
 
@@ -178,6 +178,16 @@ def test_config_cleanup_migrates_legacy_tools_settings(
     assert extras["chat_use_tools"] is True
 
 
+def use_collection(
+    monkeypatch: pytest.MonkeyPatch,
+    collection: FakeCollection,
+) -> None:
+    async def query(operation: Any) -> Any:
+        return operation(collection)
+
+    monkeypatch.setattr("src.built_in_tools.query_collection", query)
+
+
 @pytest.mark.asyncio
 async def test_built_in_search_notes_defaults_to_current_deck_and_excludes_current_note(
     monkeypatch: pytest.MonkeyPatch,
@@ -200,18 +210,15 @@ async def test_built_in_search_notes_defaults_to_current_deck_and_excludes_curre
         note_queries=[('deck:"*::Japanese"', [1, 2, 3])],
     )
 
-    monkeypatch.setattr(
-        "src.built_in_tools.deck_id_to_name_map",
-        lambda: {GLOBAL_DECK_ID: "All Decks", 10: "Japanese"},
-    )
-
+    use_collection(monkeypatch, collection)
     provider = BuiltInToolProvider(
         BuiltInToolContext(
             note_id=1,
             deck_id=10,
+            deck_name="Japanese",
             note_type="Basic",
+            note_type_fields=("Front", "Back", "Extra"),
             field_name="Back",
-            collection=collection,
         ),
         {"anki_search_notes": True, "anki_get_deck_overview": False},
     )
@@ -243,18 +250,15 @@ async def test_built_in_search_notes_honors_all_decks_scope_and_limit(
     ]
     collection = FakeCollection(notes=notes, note_queries=[("meaning", [2, 3, 4])])
 
-    monkeypatch.setattr(
-        "src.built_in_tools.deck_id_to_name_map",
-        lambda: {GLOBAL_DECK_ID: "All Decks", 10: "Japanese"},
-    )
-
+    use_collection(monkeypatch, collection)
     provider = BuiltInToolProvider(
         BuiltInToolContext(
             note_id=99,
             deck_id=10,
+            deck_name="Japanese",
             note_type="Basic",
+            note_type_fields=("Front", "Back"),
             field_name="Back",
-            collection=collection,
         ),
         {"anki_search_notes": True, "anki_get_deck_overview": False},
     )
@@ -304,18 +308,15 @@ async def test_built_in_search_notes_supports_field_filters_and_requested_fields
         note_queries=[('deck:"*::Chinese"', [2, 3])],
     )
 
-    monkeypatch.setattr(
-        "src.built_in_tools.deck_id_to_name_map",
-        lambda: {GLOBAL_DECK_ID: "All Decks", 10: "Chinese"},
-    )
-
+    use_collection(monkeypatch, collection)
     provider = BuiltInToolProvider(
         BuiltInToolContext(
             note_id=1,
             deck_id=10,
+            deck_name="Chinese",
             note_type="Chinese",
+            note_type_fields=("Simplified", "Pinyin", "Meaning", "Notes"),
             field_name="Notes",
-            collection=collection,
         ),
         {"anki_search_notes": True, "anki_get_deck_overview": False},
     )
@@ -381,18 +382,15 @@ async def test_built_in_search_notes_supports_exact_token_without_substring_fals
         note_queries=[('deck:"*::Chinese"', [2, 3, 4])],
     )
 
-    monkeypatch.setattr(
-        "src.built_in_tools.deck_id_to_name_map",
-        lambda: {GLOBAL_DECK_ID: "All Decks", 10: "Chinese"},
-    )
-
+    use_collection(monkeypatch, collection)
     provider = BuiltInToolProvider(
         BuiltInToolContext(
             note_id=1,
             deck_id=10,
+            deck_name="Chinese",
             note_type="Chinese",
+            note_type_fields=("Simplified", "Pinyin"),
             field_name="Notes",
-            collection=collection,
         ),
         {"anki_search_notes": True, "anki_get_deck_overview": False},
     )
@@ -440,18 +438,15 @@ async def test_built_in_search_notes_supports_or_field_filters(
         note_queries=[('deck:"*::Chinese"', [2, 3, 4])],
     )
 
-    monkeypatch.setattr(
-        "src.built_in_tools.deck_id_to_name_map",
-        lambda: {GLOBAL_DECK_ID: "All Decks", 10: "Chinese"},
-    )
-
+    use_collection(monkeypatch, collection)
     provider = BuiltInToolProvider(
         BuiltInToolContext(
             note_id=1,
             deck_id=10,
+            deck_name="Chinese",
             note_type="Chinese",
+            note_type_fields=("Simplified", "Pinyin"),
             field_name="Notes",
-            collection=collection,
         ),
         {"anki_search_notes": True, "anki_get_deck_overview": False},
     )
@@ -490,18 +485,15 @@ async def test_built_in_deck_overview_returns_current_deck_summary(
         card_queries=[('deck:"*::Japanese"', [11, 12, 13, 14])],
     )
 
-    monkeypatch.setattr(
-        "src.built_in_tools.deck_id_to_name_map",
-        lambda: {GLOBAL_DECK_ID: "All Decks", 10: "Japanese"},
-    )
-
+    use_collection(monkeypatch, collection)
     provider = BuiltInToolProvider(
         BuiltInToolContext(
             note_id=1,
             deck_id=10,
+            deck_name="Japanese",
             note_type="Basic",
+            note_type_fields=("Front", "Back"),
             field_name="Back",
-            collection=collection,
         ),
         {"anki_search_notes": False, "anki_get_deck_overview": True},
     )
@@ -524,11 +516,6 @@ async def test_tool_registry_merges_built_in_and_mcp_tools(
 ) -> None:
     notes = [FakeNote(2, "Basic", {"Front": "hello"})]
     collection = FakeCollection(notes=notes, note_queries=[("hello", [2])])
-
-    monkeypatch.setattr(
-        "src.built_in_tools.deck_id_to_name_map",
-        lambda: {GLOBAL_DECK_ID: "All Decks", 10: "Japanese"},
-    )
 
     async def fake_probe_server(server: dict[str, Any]) -> McpServerProbeResult:
         del server
@@ -556,13 +543,15 @@ async def test_tool_registry_merges_built_in_and_mcp_tools(
     monkeypatch.setattr("src.mcp_manager.mcp_runtime.probe_server", fake_probe_server)
     monkeypatch.setattr("src.mcp_manager.mcp_runtime.call_tool", fake_call_tool)
 
+    use_collection(monkeypatch, collection)
     registry = ToolRegistry(
         context=BuiltInToolContext(
             note_id=1,
             deck_id=10,
+            deck_name="Japanese",
             note_type="Basic",
+            note_type_fields=("Front", "Back"),
             field_name="Back",
-            collection=collection,
         ),
         built_in_tools={
             "anki_search_notes": True,
@@ -587,6 +576,82 @@ async def test_tool_registry_merges_built_in_and_mcp_tools(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_type", "extras", "method_name", "data", "expected_value"),
+    [
+        (
+            "tts",
+            {
+                "tts_strip_html": True,
+                "tts_provider": "openai",
+                "tts_model": "tts-1",
+                "tts_voice": "alloy",
+                "tts_style": None,
+            },
+            "get_tts_response",
+            b"audio",
+            "[sound:Basic-back-42.mp3]",
+        ),
+        (
+            "image",
+            {
+                "image_model": "gpt-image-1",
+                "image_provider": "openai",
+                "image_aspect_ratio": None,
+                "image_resolution": None,
+                "image_output_format": "webp",
+                "image_quality": 80,
+            },
+            "get_image_response",
+            b"image",
+            '<img src="Basic-back-42.webp"/>',
+        ),
+    ],
+)
+async def test_field_processor_defers_media_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    field_type: str,
+    extras: dict[str, Any],
+    method_name: str,
+    data: bytes,
+    expected_value: str,
+) -> None:
+    monkeypatch.setattr(
+        "src.field_processor.get_extras", lambda *args, **kwargs: extras
+    )
+    processor = FieldProcessor(MagicMock(), MagicMock(), MagicMock())
+    generate = AsyncMock(return_value=data)
+    monkeypatch.setattr(processor, method_name, generate)
+    node = FieldNode(
+        field="back",
+        field_upper="Back",
+        existing_value="",
+        out_nodes=[],
+        in_nodes=[],
+        manual=False,
+        overwrite=False,
+        deck_id=10,
+        input="{{Front}}",
+        field_type=cast("Any", field_type),
+    )
+
+    result = await processor.resolve(
+        node,
+        note_id=42,
+        note_type="Basic",
+        deck_name="Japanese",
+        field_order=("Front", "Back"),
+        values={"front": "hello", "back": ""},
+    )
+
+    assert result.value == expected_value
+    assert result.media is not None
+    assert result.media.filename in expected_value
+    assert result.media.data == data
+    generate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_field_processor_does_not_register_tools_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -600,10 +665,6 @@ async def test_field_processor_does_not_register_tools_when_disabled(
             captured.update(kwargs)
             return TextGenerationResult(text="ok", response_id=None, usage=None)
 
-    monkeypatch.setattr(
-        "src.field_processor.interpolate_prompt", lambda prompt, note: prompt
-    )
-    monkeypatch.setattr("src.field_processor.get_note_type", lambda note: "Basic")
     monkeypatch.setattr(
         "src.field_processor.config",
         MockConfig(
@@ -619,10 +680,12 @@ async def test_field_processor_does_not_register_tools_when_disabled(
     processor = FieldProcessor(
         cast("Any", FakeChatProvider()), MagicMock(), MagicMock()
     )
-    note = FakeNote(1, "Basic", {"Front": "hello"})
-
     result = await processor.get_chat_response(
-        note=note,
+        note_id=1,
+        note_type="Basic",
+        deck_name="Japanese",
+        field_order=("Front", "Back"),
+        values={"front": "hello", "back": ""},
         deck_id=10,
         prompt="Use {{Front}}",
         model="gpt-4o-mini",

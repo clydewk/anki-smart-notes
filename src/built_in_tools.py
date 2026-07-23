@@ -28,8 +28,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from .chat_provider import TextToolDefinition
+from .collection_ops import query_collection
 from .constants import GLOBAL_DECK_ID
-from .decks import deck_id_to_name_map, deck_name_to_id_map
 
 if TYPE_CHECKING:
     from .models import BuiltInToolId, BuiltInToolsConfig
@@ -61,9 +61,10 @@ class SearchFieldFilter:
 class BuiltInToolContext:
     note_id: int
     deck_id: int
+    deck_name: str | None
     note_type: str
+    note_type_fields: tuple[str, ...]
     field_name: str
-    collection: Any
 
 
 @dataclass(frozen=True)
@@ -298,40 +299,11 @@ class BuiltInToolProvider:
             raise Exception(f"Unknown built-in tool: {tool_name}")
         return await handler(arguments)
 
-    def _collection(self) -> Any:
-        if self._context.collection is None:
-            raise Exception("Anki collection is not available.")
-        return self._context.collection
-
     def _context_deck_name(self) -> str | None:
-        if self._context.deck_id == GLOBAL_DECK_ID:
-            return None
-        return deck_id_to_name_map().get(self._context.deck_id)
+        return self._context.deck_name
 
     def _current_note_type_fields(self) -> list[str]:
-        collection = self._collection()
-        models = getattr(collection, "models", None)
-        by_name = getattr(models, "by_name", None)
-        if not callable(by_name):
-            return []
-
-        model = by_name(self._context.note_type)
-        if not isinstance(model, dict):
-            return []
-
-        raw_fields = model.get("flds")
-        if not isinstance(raw_fields, list):
-            return []
-
-        ordered_fields = sorted(
-            (field for field in raw_fields if isinstance(field, dict)),
-            key=lambda field: cast("int", field.get("ord", 0)),
-        )
-        return [
-            cast("str", field["name"])
-            for field in ordered_fields
-            if isinstance(field.get("name"), str)
-        ]
+        return list(self._context.note_type_fields)
 
     def _anki_search_notes_definition(
         self, metadata: BuiltInToolMetadata
@@ -619,69 +591,72 @@ class BuiltInToolProvider:
             query_parts.append(field_filter_query)
 
         search_query = " ".join(part for part in query_parts if part).strip()
-        collection = self._collection()
-        note_ids = collection.find_notes(search_query) if search_query else []
 
-        results: list[dict[str, Any]] = []
-        total_matches = 0
-        for note_id in note_ids:
-            if exclude_current_note and note_id == self._context.note_id:
-                continue
+        def read(collection: Any) -> str:
+            note_ids = collection.find_notes(search_query) if search_query else []
+            results: list[dict[str, Any]] = []
+            total_matches = 0
 
-            note = collection.get_note(note_id)
-            did_match, matched_on = self._note_matches_filters(
-                note,
-                field_filters,
-                field_filters_mode,
-            )
-            if not did_match:
-                continue
+            for note_id in note_ids:
+                if exclude_current_note and note_id == self._context.note_id:
+                    continue
 
-            total_matches += 1
-            if len(results) >= limit:
-                continue
+                note = collection.get_note(note_id)
+                did_match, matched_on = self._note_matches_filters(
+                    note,
+                    field_filters,
+                    field_filters_mode,
+                )
+                if not did_match:
+                    continue
 
-            matched_fields = [match["field"] for match in matched_on]
-            fields = self._result_fields(
-                note,
-                requested_fields=fields_to_return,
-                matched_fields=matched_fields,
-            )
-            note_type = note.note_type()
-            note_type_name = note_type["name"] if note_type else "Unknown"
-            results.append(
+                total_matches += 1
+                if len(results) >= limit:
+                    continue
+
+                matched_fields = [match["field"] for match in matched_on]
+                fields = self._result_fields(
+                    note,
+                    requested_fields=fields_to_return,
+                    matched_fields=matched_fields,
+                )
+                note_type = note.note_type()
+                note_type_name = note_type["name"] if note_type else "Unknown"
+                results.append(
+                    {
+                        "note_id": note.id,
+                        "note_type": note_type_name,
+                        "matched_on": matched_on,
+                        "fields": fields,
+                    }
+                )
+
+            return json_output(
                 {
-                    "note_id": note.id,
-                    "note_type": note_type_name,
-                    "matched_on": matched_on,
-                    "fields": fields,
+                    "tool": "anki_search_notes",
+                    "text_query": text_query,
+                    "scope": effective_scope,
+                    "note_type": note_type_filter,
+                    "field_filters_mode": field_filters_mode,
+                    "field_filters": [
+                        {
+                            "field": field_filter.field,
+                            "value": field_filter.value,
+                            "match_mode": field_filter.match_mode,
+                        }
+                        for field_filter in field_filters
+                    ],
+                    "fields_to_return": fields_to_return,
+                    "exclude_current_note": exclude_current_note,
+                    "limit": limit,
+                    "match_count": total_matches,
+                    "current_note_type": self._context.note_type,
+                    "current_note_type_fields": self._current_note_type_fields(),
+                    "results": results,
                 }
             )
 
-        return json_output(
-            {
-                "tool": "anki_search_notes",
-                "text_query": text_query,
-                "scope": effective_scope,
-                "note_type": note_type_filter,
-                "field_filters_mode": field_filters_mode,
-                "field_filters": [
-                    {
-                        "field": field_filter.field,
-                        "value": field_filter.value,
-                        "match_mode": field_filter.match_mode,
-                    }
-                    for field_filter in field_filters
-                ],
-                "fields_to_return": fields_to_return,
-                "exclude_current_note": exclude_current_note,
-                "limit": limit,
-                "match_count": total_matches,
-                "current_note_type": self._context.note_type,
-                "current_note_type_fields": self._current_note_type_fields(),
-                "results": results,
-            }
-        )
+        return await query_collection(read)
 
     async def _handle_anki_get_deck_overview(self, arguments: dict[str, Any]) -> str:
         scope = self._resolve_deck_overview_scope(arguments)
@@ -690,36 +665,51 @@ class BuiltInToolProvider:
             raise Exception("deck_name must be a non-empty string when provided.")
 
         if deck_name:
-            deck_map = deck_name_to_id_map()
-            deck_id = deck_map.get(deck_name)
-            if deck_id is None:
-                raise Exception(f"Unknown deck: {deck_name}")
-            return self._deck_summary(deck_id, deck_name)
+
+            def read_named_deck(collection: Any) -> str:
+                deck_id = collection.decks.id_for_name(deck_name)
+                if deck_id is None:
+                    raise Exception(f"Unknown deck: {deck_name}")
+                return self._deck_summary(collection, deck_id, deck_name)
+
+            return await query_collection(read_named_deck)
 
         if scope == "all_decks" or self._context.deck_id == GLOBAL_DECK_ID:
-            decks = [
-                {"deck_id": int(deck_id), "deck_name": name}
-                for deck_id, name in deck_id_to_name_map().items()
-                if deck_id != GLOBAL_DECK_ID
-            ]
-            decks.sort(key=lambda deck: deck["deck_name"])
-            return json_output(
-                {
-                    "tool": "anki_get_deck_overview",
-                    "scope": "all_decks",
-                    "deck_count": len(decks),
-                    "decks": decks[:DECK_LIST_LIMIT],
-                }
-            )
+
+            def read_all_decks(collection: Any) -> str:
+                decks = [
+                    {"deck_id": int(deck.id), "deck_name": deck.name}
+                    for deck in collection.decks.all_names_and_ids()
+                ]
+                return json_output(
+                    {
+                        "tool": "anki_get_deck_overview",
+                        "scope": "all_decks",
+                        "deck_count": len(decks),
+                        "decks": decks[:DECK_LIST_LIMIT],
+                    }
+                )
+
+            return await query_collection(read_all_decks)
 
         deck_name = self._context_deck_name()
         if deck_name is None:
             raise Exception("Current deck is not available.")
 
-        return self._deck_summary(self._context.deck_id, deck_name)
+        return await query_collection(
+            lambda collection: self._deck_summary(
+                collection,
+                self._context.deck_id,
+                deck_name,
+            )
+        )
 
-    def _deck_summary(self, deck_id: int, deck_name: str) -> str:
-        collection = self._collection()
+    def _deck_summary(
+        self,
+        collection: Any,
+        deck_id: int,
+        deck_name: str,
+    ) -> str:
         deck_query = build_deck_search_query(deck_name)
         card_ids = collection.find_cards(deck_query)
         note_ids = collection.find_notes(deck_query)

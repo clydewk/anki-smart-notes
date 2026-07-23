@@ -246,9 +246,9 @@ def make_on_batch_success(
 
             if errors:
                 debug_parts.append("\n--- Failures ---")
-                for note in errors:
-                    msg = error_details.get(note.id, "Unknown error")
-                    debug_parts.append(f"Note ID {note.id} failed: {msg}")
+                for note_id in errors:
+                    msg = error_details.get(note_id, "Unknown error")
+                    debug_parts.append(f"Note ID {note_id} failed: {msg}")
 
             if field_error_details:
                 debug_parts.append("\n--- Field Failures ---")

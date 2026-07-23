@@ -17,16 +17,14 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import TYPE_CHECKING
 
-from anki.cards import Card, CardId
-from anki.decks import DeckId
-from anki.notes import Note, NoteId
 from aqt import mw
 from aqt.qt import QDialog, QLabel, QProgressBar, QPushButton, Qt, QVBoxLayout
 
@@ -38,9 +36,9 @@ from .chat_usage import (
     build_prompt_usage_signature,
     chat_usage_tracker,
 )
+from .collection_ops import query_collection
 from .config import Config, bump_usage_counter, key_or_config_val
 from .dag import generate_fields_dag
-from .field_processor import FieldProcessor
 from .logger import logger
 from .models import (
     DEFAULT_EXTRAS,
@@ -48,9 +46,13 @@ from .models import (
     ChatProviders,
     OpenAIReasoningEffort,
 )
-from .nodes import FieldNode
 from .notes import get_note_type
-from .prompts import get_extras, get_prompts_for_note, interpolate_prompt_with_values
+from .prompts import (
+    get_extras,
+    get_prompt_fields,
+    get_prompts_for_note,
+    interpolate_prompt_with_values,
+)
 from .provider_runtime import (
     ProviderHTTPError,
     format_provider_http_error_for_log,
@@ -59,6 +61,42 @@ from .provider_runtime import (
 from .sentry import run_async_in_background_with_sentry
 from .ui.ui_utils import show_message_box
 from .utils import run_on_main
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+    from typing import Any
+
+    from anki.cards import Card, CardId
+    from anki.decks import DeckId
+    from anki.notes import Note, NoteId
+
+    from .field_processor import FieldProcessor
+    from .nodes import FieldNode
+
+
+@dataclass(frozen=True)
+class PendingMedia:
+    filename: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class ResolvedField:
+    value: str | None
+    media: PendingMedia | None = None
+
+
+@dataclass(frozen=True)
+class NoteSnapshot:
+    note_id: NoteId
+    deck_id: DeckId
+    deck_name: str | None
+    note_type: str
+    field_order: tuple[str, ...]
+    fields: dict[str, str]
+
+    def lower_values(self) -> dict[str, str]:
+        return {field.lower(): value for field, value in self.fields.items()}
 
 
 @dataclass(frozen=True)
@@ -76,19 +114,29 @@ class FieldFailureDetail:
 
 
 @dataclass(frozen=True)
-class NoteProcessingResult:
-    did_update: bool
-    updated_fields: list[str]
+class ProcessedNote:
+    note_id: NoteId
+    original_values: dict[str, str]
+    updates: dict[str, str]
+    media: list[PendingMedia]
     field_failures: list[FieldFailureDetail]
+
+    @property
+    def did_update(self) -> bool:
+        return bool(self.updates or self.media)
+
+    @property
+    def updated_fields(self) -> list[str]:
+        return [field.lower() for field in self.updates]
 
 
 @dataclass
 class BatchStatistics:
-    processed: list[Note]
-    partial: list[Note]
-    failed: list[Note]
-    blocked: list[Note]
-    no_updates: list[Note]
+    processed: list[NoteId]
+    partial: list[NoteId]
+    failed: list[NoteId]
+    blocked: list[NoteId]
+    no_updates: list[NoteId]
     updated_fields: set[str]
     error_details: dict[int, str]
     field_error_details: dict[int, list[FieldFailureDetail]]
@@ -136,6 +184,36 @@ def describe_exception(error: BaseException) -> str:
     return f"{error_type}: {message}" if message else error_type
 
 
+def snapshot_note(
+    note: Note,
+    deck_id: DeckId,
+    deck_name: str | None = None,
+) -> NoteSnapshot:
+    note_type = get_note_type(note)
+    fields = {field: str(value or "") for field, value in note.items()}
+    return NoteSnapshot(
+        note_id=note.id,
+        deck_id=deck_id,
+        deck_name=deck_name,
+        note_type=note_type,
+        field_order=tuple(fields),
+        fields=fields,
+    )
+
+
+def snapshot_cards(collection: Any, card_ids: Sequence[CardId]) -> list[NoteSnapshot]:
+    cards = [collection.get_card(card_id) for card_id in card_ids]
+    unique_cards = {card.nid: card for card in cards}.values()
+    return [
+        snapshot_note(
+            collection.get_note(card.nid),
+            card.did,
+            collection.decks.name(card.did),
+        )
+        for card in unique_cards
+    ]
+
+
 class ProgressDialog(QDialog):
     def __init__(self, label: str, max_val: int, on_cancel: Callable[[], None]):
         super().__init__(mw)
@@ -165,6 +243,9 @@ class ProgressDialog(QDialog):
     def set_value(self, val: int) -> None:
         self.bar.setValue(val)
 
+    def set_maximum(self, maximum: int) -> None:
+        self.bar.setMaximum(maximum)
+
     def set_label(self, text: str) -> None:
         self.label.setText(text)
 
@@ -182,23 +263,21 @@ class NoteProcessor:
         self,
         card_ids: Sequence[CardId],
         overwrite_fields: bool = False,
-    ) -> Optional[OpenAIBatchPreflight]:
+    ) -> OpenAIBatchPreflight | None:
         if not mw or not mw.col or not self.config.openai_daily_token_budget_enabled:
             return None
 
-        cards = [mw.col.get_card(card_id) for card_id in card_ids]
-        cards = list({card.nid: card for card in cards}.values())
-        notes_with_decks = [(mw.col.get_note(card.nid), card.did) for card in cards]
-        return self.estimate_openai_batch_preflight_for_notes(
-            notes_with_decks,
+        snapshots = snapshot_cards(mw.col, card_ids)
+        return self.estimate_openai_batch_preflight_for_snapshots(
+            snapshots,
             overwrite_fields=overwrite_fields,
         )
 
-    def estimate_openai_batch_preflight_for_notes(
+    def estimate_openai_batch_preflight_for_snapshots(
         self,
-        notes_with_decks: Sequence[tuple[Note, DeckId]],
+        snapshots: Sequence[NoteSnapshot],
         overwrite_fields: bool = False,
-    ) -> Optional[OpenAIBatchPreflight]:
+    ) -> OpenAIBatchPreflight | None:
         if not self.config.openai_daily_token_budget_enabled:
             return None
 
@@ -211,10 +290,9 @@ class NoteProcessor:
         estimated_total_tokens = 0
         max_request_tokens_by_transport: dict[str, int] = {}
 
-        for note, deck_id in notes_with_decks:
-            estimated_requests = self.estimate_openai_requests_for_note(
-                note,
-                deck_id=deck_id,
+        for snapshot in snapshots:
+            estimated_requests = self.estimate_openai_requests_for_snapshot(
+                snapshot,
                 overwrite_fields=overwrite_fields,
             )
             note_total_tokens = sum(
@@ -259,18 +337,19 @@ class NoteProcessor:
             recommended_note_count=recommended_note_count,
         )
 
-    def estimate_openai_requests_for_note(
+    def estimate_openai_requests_for_snapshot(
         self,
-        note: Note,
+        snapshot: NoteSnapshot,
         *,
-        deck_id: DeckId,
         overwrite_fields: bool = False,
     ) -> list[EstimatedOpenAIRequest]:
-        note_type = get_note_type(note)
+        values = snapshot.lower_values()
         dag = generate_fields_dag(
-            note,
+            note_type=snapshot.note_type,
+            field_order=snapshot.field_order,
+            values=values,
             overwrite_fields=overwrite_fields,
-            deck_id=deck_id,
+            deck_id=snapshot.deck_id,
         )
         if not dag:
             return []
@@ -282,9 +361,7 @@ class NoteProcessor:
         ready_fields = [
             field for field, in_fields in pending_inputs.items() if not in_fields
         ]
-        simulated_values = {
-            field.lower(): str(value or "") for field, value in note.items()
-        }
+        simulated_values = values.copy()
         estimated_requests: list[EstimatedOpenAIRequest] = []
 
         while ready_fields:
@@ -299,7 +376,7 @@ class NoteProcessor:
                 )
                 if simulated_prompt is not None:
                     estimated_request = self.estimate_openai_request_for_node(
-                        note_type=note_type,
+                        note_type=snapshot.note_type,
                         node=node,
                         prompt=node.input,
                         interpolated_prompt=simulated_prompt,
@@ -308,7 +385,7 @@ class NoteProcessor:
                         estimated_requests.append(estimated_request)
 
                     simulated_values[node.field] = self.estimated_generated_field_value(
-                        note_type=note_type,
+                        note_type=snapshot.note_type,
                         node=node,
                         prompt=node.input,
                     )
@@ -338,7 +415,7 @@ class NoteProcessor:
         node: FieldNode,
         prompt: str,
         interpolated_prompt: str,
-    ) -> Optional[EstimatedOpenAIRequest]:
+    ) -> EstimatedOpenAIRequest | None:
         if node.field_type != "chat":
             return None
 
@@ -356,7 +433,7 @@ class NoteProcessor:
             return None
 
         chat_model: ChatModels = key_or_config_val(extras, "chat_model")
-        chat_reasoning_effort: Optional[OpenAIReasoningEffort] = key_or_config_val(
+        chat_reasoning_effort: OpenAIReasoningEffort | None = key_or_config_val(
             extras, "chat_reasoning_effort"
         )
         use_tools: bool = key_or_config_val(extras, "chat_use_tools")
@@ -413,7 +490,7 @@ class NoteProcessor:
         )
         chat_provider: ChatProviders = key_or_config_val(extras, "chat_provider")
         chat_model: ChatModels = key_or_config_val(extras, "chat_model")
-        chat_reasoning_effort: Optional[OpenAIReasoningEffort] = key_or_config_val(
+        chat_reasoning_effort: OpenAIReasoningEffort | None = key_or_config_val(
             extras, "chat_reasoning_effort"
         )
         use_tools: bool = key_or_config_val(extras, "chat_use_tools")
@@ -452,217 +529,176 @@ class NoteProcessor:
     def process_cards_with_progress(
         self,
         card_ids: Sequence[CardId],
-        on_success: Optional[Callable[[BatchStatistics], None]],
+        on_success: Callable[[BatchStatistics], None] | None,
         overwrite_fields: bool = False,
     ) -> None:
-        """Process notes in the background with a non-modal progress dialog."""
-
-        if not mw or not mw.col:
+        """Process detached note snapshots with a non-modal progress dialog."""
+        if not mw or not mw.col or not self._assert_preconditions():
             return
 
         bump_usage_counter()
-        cards = [mw.col.get_card(card_in) for card_in in card_ids]
-
-        # If a card appears multiple times in the same deck, process it just a single time
-        cards = list({card.nid: card for card in cards}.values())
-
-        note_ids = [card.nid for card in cards]
-        did_map = {card.nid: card.did for card in cards}
-
-        if not self._assert_preconditions():
-            return
-
-        logger.debug("Processing notes...")
-        logger.debug("Scheduling %d note workers", len(note_ids))
-
+        requested_card_ids = tuple(card_ids)
+        total_notes = len(requested_card_ids)
         cancellation_state = {"cancelled": False}
 
         def on_cancel() -> None:
             cancellation_state["cancelled"] = True
             logger.info("Cancellation requested")
-            if progress:
-                progress.set_label(
-                    "Cancelling... please wait for active tasks to finish."
-                )
-                progress.disable_cancel()
+            progress.set_label("Cancelling... please wait for active tasks to finish.")
+            progress.disable_cancel()
 
         progress = ProgressDialog(
-            f"✨Generating... (0/{len(note_ids)})", len(note_ids), on_cancel
+            f"✨ Generating... (0/{total_notes})",
+            total_notes,
+            on_cancel,
         )
         progress.show()
         usage_scope_id = chat_usage_tracker.open_scope()
 
-        # Capture logs
         log_handler = ListHandler()
         log_handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(message)s")
         )
         logger.addHandler(log_handler)
 
-        def wrapped_on_success(res: BatchStatistics) -> None:
+        def wrapped_on_success(stats: BatchStatistics) -> None:
             logger.removeHandler(log_handler)
-
-            if progress:
-                progress.close()
+            progress.close()
             self._release_request()
             if on_success:
-                on_success(res)
+                on_success(stats)
 
-        def on_failure(e: Exception) -> None:
+        def on_failure(error: Exception) -> None:
             logger.removeHandler(log_handler)
             chat_usage_tracker.close_scope(usage_scope_id)
-
-            if progress:
-                progress.close()
+            progress.close()
             self._release_request()
-            show_message_box(f"Error: {e}")
+            show_message_box(f"Error: {error}")
 
-        def on_update(
-            updated: list[Note], processed_count: int, finished: bool
+        def apply_results(
+            results: list[ProcessedNote], processed_count: int, finished: bool
         ) -> None:
             if not mw or not mw.col:
                 return
 
-            if updated:
-                mw.col.update_notes(updated)
+            notes: list[Note] = []
+            for result in results:
+                note = mw.col.get_note(result.note_id)
+                for pending_media in result.media:
+                    mw.col.media.write_data(
+                        pending_media.filename,
+                        pending_media.data,
+                    )
+                for field, value in result.updates.items():
+                    note[field] = value
+                notes.append(note)
 
-            if not finished:
-                if progress:
-                    progress.set_value(processed_count)
-                    if not cancellation_state["cancelled"]:
-                        progress.set_label(
-                            f"✨ Generating... ({processed_count}/{len(note_ids)})"
-                        )
-            else:
+            if notes:
+                mw.col.update_notes(notes)
+
+            progress.set_value(processed_count)
+            if finished:
                 logger.info("Finished processing all notes")
-                if progress:
-                    progress.set_value(len(note_ids))
+            elif not cancellation_state["cancelled"]:
+                progress.set_label(
+                    f"✨ Generating... ({processed_count}/{total_notes})"
+                )
 
-        async def op():
+        async def op() -> BatchStatistics:
+            nonlocal total_notes
             start_time = time.time()
+            snapshots = await query_collection(
+                lambda collection: snapshot_cards(collection, requested_card_ids)
+            )
+            total_notes = len(snapshots)
+            run_on_main(lambda: progress.set_maximum(total_notes))
 
-            total_processed = []
-            total_partial = []
-            total_failed = []
-            total_blocked = []
-            total_no_updates = []
+            total_processed: list[NoteId] = []
+            total_partial: list[NoteId] = []
+            total_failed: list[NoteId] = []
+            total_blocked: list[NoteId] = []
+            total_no_updates: list[NoteId] = []
             all_updated_fields: set[str] = set()
             error_details: dict[int, str] = {}
             field_error_details: dict[int, list[FieldFailureDetail]] = {}
-
-            update_buffer: list[Note] = []
+            update_buffer: list[ProcessedNote] = []
             processed_count = 0
             db_writes = 0
 
             async def worker(
-                nid: NoteId,
-            ) -> tuple[Optional[Note], Union[NoteProcessingResult, Exception]]:
+                snapshot: NoteSnapshot,
+            ) -> tuple[NoteId, ProcessedNote | Exception]:
                 if cancellation_state["cancelled"]:
                     return (
-                        None,
-                        NoteProcessingResult(
-                            did_update=False,
-                            updated_fields=[],
+                        snapshot.note_id,
+                        ProcessedNote(
+                            note_id=snapshot.note_id,
+                            original_values={},
+                            updates={},
+                            media=[],
                             field_failures=[],
                         ),
                     )
 
                 try:
-                    # Note: Accessing mw.col in background thread.
-                    # This avoids main-thread blocking but is technically unsafe in Anki.
-                    # However, since we only read here and write on main thread, it is generally stable.
-                    note = mw.col.get_note(nid)
-
-                    # Filter
-                    note_type = get_note_type(note)
-                    prompts = get_prompts_for_note(note_type, did_map[nid])
-                    if not prompts:
-                        return (
-                            note,
-                            NoteProcessingResult(
-                                did_update=False,
-                                updated_fields=[],
-                                field_failures=[],
-                            ),
-                        )
-
-                    result = await self._process_note(
-                        note,
-                        deck_id=did_map[nid],
-                        overwrite_fields=overwrite_fields,
-                        usage_scope_id=usage_scope_id,
+                    return (
+                        snapshot.note_id,
+                        await self._process_note(
+                            snapshot,
+                            overwrite_fields=overwrite_fields,
+                            usage_scope_id=usage_scope_id,
+                        ),
                     )
-                    return (note, result)
+                except Exception as error:
+                    return snapshot.note_id, error
 
-                except Exception as e:
-                    # Try to retrieve note just for reporting purposes
-                    try:
-                        n = mw.col.get_note(nid)
-                        return (n, e)
-                    except Exception:
-                        return (None, e)
-
-            active_tasks = [asyncio.create_task(worker(nid)) for nid in note_ids]
+            active_tasks = [
+                asyncio.create_task(worker(snapshot)) for snapshot in snapshots
+            ]
 
             for completed_task in asyncio.as_completed(active_tasks):
-                # If cancelled, force-cancel all active tasks instead of waiting
                 if cancellation_state["cancelled"]:
-                    if active_tasks:
-                        logger.info(f"Cancelling {len(active_tasks)} active tasks...")
-                        for active_task in active_tasks:
-                            active_task.cancel()
-                        # Wait for cancelled tasks to finish (with timeout)
-                        try:
-                            await asyncio.wait_for(
-                                asyncio.gather(*active_tasks, return_exceptions=True),
-                                timeout=5.0,  # Give tasks 5 seconds to clean up
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "Some tasks did not cancel cleanly within timeout"
-                            )
+                    for active_task in active_tasks:
+                        active_task.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*active_tasks, return_exceptions=True),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Some tasks did not cancel cleanly within timeout"
+                        )
                     break
+
+                note_id, status = await completed_task
                 processed_count += 1
-                try:
-                    note_obj, status = await completed_task
-                except asyncio.CancelledError:
-                    logger.debug("Task was cancelled")
-                    continue
-                except Exception as e:
-                    note_obj, status = (None, e)
 
                 if isinstance(status, Exception):
-                    if note_obj:
-                        total_failed.append(note_obj)
-                        error_details[note_obj.id] = describe_exception(status)
-                        logger.error(
-                            f"Error processing note {note_obj.id}: {describe_exception(status)}"
-                        )
-                    else:
-                        logger.error(
-                            f"Error processing note: {describe_exception(status)}"
-                        )
-
+                    total_failed.append(note_id)
+                    error_details[note_id] = describe_exception(status)
+                    logger.error(
+                        "Error processing note %s: %s",
+                        note_id,
+                        describe_exception(status),
+                    )
                 else:
-                    if note_obj is None:
-                        continue
-
                     if status.field_failures:
-                        field_error_details[note_obj.id] = status.field_failures
+                        field_error_details[note_id] = status.field_failures
 
                     if status.did_update:
-                        update_buffer.append(note_obj)
+                        update_buffer.append(status)
                         all_updated_fields.update(status.updated_fields)
                         if status.field_failures:
-                            total_partial.append(note_obj)
+                            total_partial.append(note_id)
                         else:
-                            total_processed.append(note_obj)
+                            total_processed.append(note_id)
                     elif status.field_failures:
-                        total_blocked.append(note_obj)
+                        total_blocked.append(note_id)
                     else:
-                        total_no_updates.append(note_obj)
+                        total_no_updates.append(note_id)
 
-                batch_to_update = []
+                batch_to_update: list[ProcessedNote] = []
                 if len(update_buffer) >= 100:
                     batch_to_update = update_buffer[:]
                     update_buffer.clear()
@@ -670,23 +706,17 @@ class NoteProcessor:
                 if batch_to_update:
                     db_writes += 1
                 run_on_main(
-                    lambda u=batch_to_update, p=processed_count: on_update(u, p, False)
+                    lambda results=batch_to_update,
+                    count=processed_count: apply_results(results, count, False)
                 )
 
-            # Final flush
             if update_buffer:
                 db_writes += 1
-                run_on_main(
-                    lambda u=update_buffer, p=processed_count: on_update(u, p, True)
+            run_on_main(
+                lambda results=update_buffer, count=processed_count: apply_results(
+                    results, count, True
                 )
-            else:
-                run_on_main(lambda u=[], p=processed_count: on_update(u, p, True))
-
-            end_time = time.time()
-            transport_metrics = provider_runtime.get_metrics_summary()
-
-            # Retrieve logs from the handler
-            logs = list(log_handler.logs)
+            )
 
             return BatchStatistics(
                 processed=total_processed,
@@ -698,23 +728,22 @@ class NoteProcessor:
                 error_details=error_details,
                 field_error_details=field_error_details,
                 start_time=start_time,
-                end_time=end_time,
+                end_time=time.time(),
                 db_writes=db_writes,
-                transport_metrics=transport_metrics,
-                logs=logs,
+                transport_metrics=provider_runtime.get_metrics_summary(),
+                logs=list(log_handler.logs),
                 chat_usage_summary=chat_usage_tracker.close_scope(usage_scope_id),
                 was_cancelled=cancellation_state["cancelled"],
             )
 
         try:
             run_async_in_background_with_sentry(op, wrapped_on_success, on_failure)
-        except Exception as e:
+        except Exception:
             logger.removeHandler(log_handler)
             chat_usage_tracker.close_scope(usage_scope_id)
-            if progress:
-                progress.close()
+            progress.close()
             self._release_request()
-            raise e
+            raise
 
     def process_card(
         self,
@@ -722,176 +751,161 @@ class NoteProcessor:
         show_progress: bool,
         overwrite_fields: bool = False,
         on_success: Callable[[bool], None] = lambda _: None,
-        on_failure: Optional[Callable[[Exception], None]] = None,
-        target_field: Optional[str] = None,
-        on_field_update: Optional[Callable[[], None]] = None,
-    ):
-        """Process a single note, filling in fields with prompts from the user"""
+        on_failure: Callable[[Exception], None] | None = None,
+        target_field: str | None = None,
+        on_field_update: Callable[[], None] | None = None,
+    ) -> None:
+        """Process one detached snapshot and apply its result on the main thread."""
         if not self._assert_preconditions():
             return
 
         note = card.note()
+        deck_name = mw.col.decks.name(card.did) if mw and mw.col else None
+        snapshot = snapshot_note(note, card.did, deck_name)
+        if show_progress and mw:
+            mw.progress.start(label="✨ Generating...", immediate=True)
 
-        def wrapped_on_success(updated: bool) -> None:
-            # Save the note if it was updated
-            if updated and mw and mw.col:
+        def wrapped_on_success(result: ProcessedNote) -> None:
+            for pending_media in result.media:
+                if mw and mw.col:
+                    mw.col.media.write_data(
+                        pending_media.filename,
+                        pending_media.data,
+                    )
+            for field, value in result.updates.items():
+                note[field] = value
+
+            if result.did_update and note.id and mw and mw.col:
                 mw.col.update_note(note)
+            if on_field_update and result.did_update:
+                on_field_update()
+            if show_progress and mw:
+                mw.progress.finish()
 
             self._release_request()
-            on_success(updated)
+            on_success(result.did_update)
 
-        def wrapped_failure(e: Exception) -> None:
-            self._handle_failure(e)
+        def wrapped_failure(error: Exception) -> None:
+            if show_progress and mw:
+                mw.progress.finish()
+            self._handle_failure(error)
             self._release_request()
             if on_failure:
-                on_failure(e)
+                on_failure(error)
 
-        # NOTE: for some reason i can't run bump_usage_counter in this hook without causing a
-        # an PyQT crash, so I'm running it in the on_success callback instead
         run_async_in_background_with_sentry(
             lambda: self._process_note(
-                note,
+                snapshot,
                 overwrite_fields=overwrite_fields,
-                deck_id=card.did,
                 target_field=target_field,
-                on_field_update=on_field_update,
-                show_progress=show_progress,
                 usage_scope_id=None,
             ),
-            lambda result: wrapped_on_success(result.did_update),
+            wrapped_on_success,
             wrapped_failure,
         )
 
-    # Note: one quirk is that if overwrite_fields = True AND there's a target field,
-    # it will regenerate any fields up until the target field. A bit weird but
-    # this combination of values doesn't really make sense anyways so it's probably fine.
-    # Would be better modeled with some mode switch or something.
     async def _process_note(
         self,
-        note: Note,
-        deck_id: DeckId,
+        snapshot: NoteSnapshot,
         overwrite_fields: bool = False,
-        target_field: Optional[str] = None,
-        on_field_update: Optional[Callable[[], None]] = None,
-        show_progress: bool = False,
-        usage_scope_id: Optional[str] = None,
-    ) -> NoteProcessingResult:
-        """Process a single note and return updated fields plus any field-level failures."""
-
-        note_type = get_note_type(note)
-        prompts_for_note = get_prompts_for_note(note_type, deck_id)
-
+        target_field: str | None = None,
+        usage_scope_id: str | None = None,
+    ) -> ProcessedNote:
+        """Generate field and media updates from a detached note snapshot."""
+        values = snapshot.lower_values()
+        prompts_for_note = get_prompts_for_note(
+            snapshot.note_type,
+            snapshot.deck_id,
+        )
         if not prompts_for_note:
             logger.debug("no prompts found for note type")
-            return NoteProcessingResult(
-                did_update=False,
-                updated_fields=[],
+            return ProcessedNote(
+                note_id=snapshot.note_id,
+                original_values={},
+                updates={},
+                media=[],
                 field_failures=[],
             )
 
-        # Topsort + parallel process the DAG
         dag = generate_fields_dag(
-            note,
+            note_type=snapshot.note_type,
+            field_order=snapshot.field_order,
+            values=values,
             target_field=target_field,
             overwrite_fields=overwrite_fields,
-            deck_id=deck_id,
+            deck_id=snapshot.deck_id,
         )
+        canonical_fields = {field.lower(): field for field in snapshot.field_order}
+        relevant_fields = set(dag)
+        for node in dag.values():
+            relevant_fields.update(get_prompt_fields(node.input))
 
-        did_update = False
-        updated_fields: list[str] = []
+        original_values = {
+            canonical_fields[field]: values.get(field, "")
+            for field in relevant_fields
+            if field in canonical_fields
+        }
+        updates: dict[str, str] = {}
+        media: list[PendingMedia] = []
         field_failures: list[FieldFailureDetail] = []
 
-        will_show_progress = show_progress and len(dag)
-        if will_show_progress:
-            run_on_main(
-                lambda: mw.progress.start(  # type: ignore
-                    label="✨ Generating...",
-                    min=0,
-                    max=len(dag),
-                    immediate=True,
+        while dag:
+            next_batch = [node for node in dag.values() if not node.in_nodes]
+            logger.debug("Processing next nodes: %s", [n.field for n in next_batch])
+            batch_tasks = {
+                node.field: self._process_node(
+                    node,
+                    snapshot,
+                    values,
+                    show_error_message_box=node.is_target,
+                    usage_scope_id=usage_scope_id,
                 )
+                for node in next_batch
+            }
+            responses = await asyncio.gather(
+                *batch_tasks.values(),
+                return_exceptions=True,
             )
 
-        try:
-            while len(dag):
-                next_batch: list[FieldNode] = [
-                    node for node in dag.values() if not node.in_nodes
-                ]
-                logger.debug(f"Processing next nodes: {[n.field for n in next_batch]}")
-                batch_tasks = {
-                    node.field: self._process_node(
-                        # Only show the error box for the target field
-                        node,
-                        note,
-                        show_error_message_box=node.is_target,
-                        usage_scope_id=usage_scope_id,
+            for field, response in zip(batch_tasks, responses):
+                node = dag[field]
+                if isinstance(response, BaseException):
+                    failure_detail = FieldFailureDetail(
+                        field=field,
+                        error=describe_exception(response),
+                        aborted_dependents=tuple(
+                            sorted(out_node.field for out_node in node.out_nodes)
+                        ),
                     )
-                    for node in next_batch
-                }
-
-                responses = await asyncio.gather(
-                    *batch_tasks.values(), return_exceptions=True
-                )
-
-                for field, response in zip(batch_tasks.keys(), responses):
-                    node = dag[field]
-
-                    # Handle field-level exceptions gracefully
-                    if isinstance(response, Exception):
-                        failure_detail = FieldFailureDetail(
-                            field=field,
-                            error=describe_exception(response),
-                            aborted_dependents=tuple(
-                                sorted(out_node.field for out_node in node.out_nodes)
-                            ),
-                        )
-                        field_failures.append(failure_detail)
-                        logger.warning(
-                            f"Field '{field}' failed: {failure_detail.summary()}. Continuing with other fields."
-                        )
-                        # Mark node as aborted so downstream fields are skipped
-                        node.abort = True
-                        # Remove from DAG and continue processing other fields
-                        for out_node in node.out_nodes:
-                            out_node.in_nodes.remove(node)
-                            # Mark downstream nodes as aborted since their dependency failed
-                            out_node.abort = True
-                        dag.pop(field)
-                        continue
-
-                    if response is not None:
-                        current_val = note[node.field_upper]
-                        if response != current_val:
-                            logger.debug(
-                                f"Updating field {field} with response: {response}"
-                            )
-                            note[node.field_upper] = response
-                        else:
-                            # Use trace instead of debug to reduce noise
-                            # logger.debug(f"Field {field} unchanged")
-                            pass
-
+                    field_failures.append(failure_detail)
+                    logger.warning(
+                        "Field '%s' failed: %s. Continuing with other fields.",
+                        field,
+                        failure_detail.summary(),
+                    )
+                    node.abort = True
                     for out_node in node.out_nodes:
                         out_node.in_nodes.remove(node)
-
-                    # New notes have ID 0 and don't exist in the DB yet, so can't be updated!
-                    if note.id and node.did_update:
-                        did_update = True
-                        updated_fields.append(node.field)
-                        # Note: we do NOT update DB here anymore. Caller must handle persistence.
-                        # This improves performance and safety in batch operations.
-
+                        out_node.abort = True
                     dag.pop(field)
-                    if on_field_update:
-                        run_on_main(on_field_update)
+                    continue
 
-        finally:
-            if will_show_progress:
-                run_on_main(lambda: mw.progress.finish())  # type: ignore
+                if response.value is not None:
+                    values[node.field] = response.value
+                if node.did_update and response.value is not None:
+                    updates[node.field_upper] = response.value
+                    if response.media:
+                        media.append(response.media)
 
-        return NoteProcessingResult(
-            did_update=did_update,
-            updated_fields=updated_fields,
+                for out_node in node.out_nodes:
+                    out_node.in_nodes.remove(node)
+                dag.pop(field)
+
+        return ProcessedNote(
+            note_id=snapshot.note_id,
+            original_values=original_values,
+            updates=updates,
+            media=media,
             field_failures=field_failures,
         )
 
@@ -939,39 +953,42 @@ class NoteProcessor:
     async def _process_node(
         self,
         node: FieldNode,
-        note: Note,
+        snapshot: NoteSnapshot,
+        values: dict[str, str],
         show_error_message_box: bool,
-        usage_scope_id: Optional[str] = None,
-    ) -> Optional[str]:
+        usage_scope_id: str | None = None,
+    ) -> ResolvedField:
         started_at = time.perf_counter()
         status = "completed"
 
         try:
             if node.abort:
-                return None
+                return ResolvedField(None)
 
-            value = note[node.field_upper]
-
+            value = values.get(node.field, "")
             if node.manual and not (node.is_target or node.generate_despite_manual):
                 if value:
-                    return value
+                    return ResolvedField(value)
                 node.abort = True
-                logger.debug(f"Skipping field {node.field}")
-                return None
+                logger.debug("Skipping field %s", node.field)
+                return ResolvedField(None)
 
             if value and not (node.is_target or node.overwrite):
-                return value
+                return ResolvedField(value)
 
-            new_value = await self.field_processor.resolve(
+            result = await self.field_processor.resolve(
                 node,
-                note,
+                note_id=snapshot.note_id,
+                note_type=snapshot.note_type,
+                deck_name=snapshot.deck_name,
+                field_order=snapshot.field_order,
+                values=values,
                 show_error_box=show_error_message_box,
                 usage_scope_id=usage_scope_id,
             )
-            if new_value:
+            if result.value:
                 node.did_update = True
-
-            return new_value
+            return result
         except Exception:
             status = "failed"
             raise

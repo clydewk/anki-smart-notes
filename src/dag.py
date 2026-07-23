@@ -18,6 +18,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import traceback
+from collections.abc import Mapping, Sequence
 from typing import Optional
 
 from anki.decks import DeckId
@@ -32,20 +33,17 @@ from .utils import get_fields
 
 
 def generate_fields_dag(
-    note: Note,
+    *,
+    note_type: str,
+    field_order: Sequence[str],
+    values: Mapping[str, str],
     overwrite_fields: bool,
     deck_id: DeckId,
     target_field: Optional[str] = None,
     override_prompts_map: Optional[PromptMap] = None,
 ) -> dict[str, FieldNode]:
-    """Generates a directed acyclic graph of prompts for a note, or a subset of that graph if a target_fields list is passed. Returns a mapping of field -> PromptNode"""
-    # - Generates all nodes
-    # - Connects them
-    # - Optionally trims them if it's target_field mode
-
+    """Build the prompt dependency graph from detached note data."""
     try:
-        note_type = get_note_type(note)
-
         prompts = get_prompts_for_note(
             note_type=note_type,
             to_lower=True,
@@ -58,10 +56,8 @@ def generate_fields_dag(
             return {}
 
         dag: dict[str, FieldNode] = {}
-        fields = get_fields(note_type)
 
-        # Have to iterate over fields to get the canonical capitalization lol
-        for field in fields:
+        for field in field_order:
             field_lower = field.lower()
             prompt = prompts.get(field_lower)
             if not prompt:
@@ -83,7 +79,7 @@ def generate_fields_dag(
                 field_upper=field,
                 out_nodes=[],
                 in_nodes=[],
-                existing_value=note[field],
+                existing_value=values.get(field_lower, ""),
                 overwrite=overwrite_fields
                 or extras.get("regenerate_when_batching", False),
                 manual=not should_generate_automatically,
@@ -172,7 +168,12 @@ def prompt_has_error(
         return "Cannot reference the target field in the prompt."
 
     dag = generate_fields_dag(
-        note, overwrite_fields=False, deck_id=deck_id, override_prompts_map=prompts_map
+        note_type=note_type,
+        field_order=get_fields(note_type),
+        values={field.lower(): note[field] for field in get_fields(note_type)},
+        overwrite_fields=False,
+        deck_id=deck_id,
+        override_prompts_map=prompts_map,
     )
 
     if has_cycle(dag):

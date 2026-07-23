@@ -17,12 +17,11 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Optional, Union
 
 from anki.decks import DeckId
-from anki.notes import Note
-from aqt import mw
 
 from .built_in_tools import BuiltInToolContext
 from .chat_provider import (
@@ -38,11 +37,11 @@ from .chat_usage import (
     chat_usage_tracker,
 )
 from .config import config, key_or_config_val
-from .constants import API_KEY_MISSING_MESSAGE
+from .constants import API_KEY_MISSING_MESSAGE, GLOBAL_DECK_ID
 from .image_provider import ImageProvider, image_provider
 from .logger import logger
 from .markdown import convert_markdown_to_html
-from .media_utils import convert_image_data, get_media_path
+from .media_utils import build_media_filename, convert_image_data
 from .models import (
     DEFAULT_EXTRAS,
     ChatModels,
@@ -61,8 +60,8 @@ from .models import (
     normalize_built_in_tools_config,
 )
 from .nodes import FieldNode
-from .notes import get_note_type
-from .prompts import get_extras, interpolate_prompt
+from .note_proccessor import PendingMedia, ResolvedField
+from .prompts import get_extras, interpolate_prompt_with_values
 from .tool_registry import ToolRegistry
 from .tts_provider import TTSProvider, tts_provider
 from .ui.ui_utils import show_message_box
@@ -89,15 +88,17 @@ class FieldProcessor:
     async def resolve(
         self,
         node: FieldNode,
-        note: Note,
+        *,
+        note_id: int,
+        note_type: str,
+        deck_name: str | None,
+        field_order: Sequence[str],
+        values: Mapping[str, str],
         show_error_box: bool = False,
         usage_scope_id: Optional[str] = None,
-    ) -> Optional[str]:
-        # Only show error box if we're running on the target node
-        input = node.input
+    ) -> ResolvedField:
+        input_text = node.input
         field_type: SmartFieldType = node.field_type
-        note_type = get_note_type(note)
-
         extras = (
             get_extras(
                 note_type=note_type,
@@ -109,63 +110,55 @@ class FieldProcessor:
         )
 
         if field_type == "tts":
-            if not mw or not mw.col:
-                return None
-            media = mw.col.media
-            if not media:
-                logger.error("No media")
-                return None
-
             should_strip_html: bool = key_or_config_val(extras, "tts_strip_html")
             tts_provider: TTSProviders = key_or_config_val(extras, "tts_provider")
             tts_model: TTSModels = key_or_config_val(extras, "tts_model")
-            tts_voice: Union[OpenAIVoices, ElevenVoices] = key_or_config_val(
+            voice: Union[OpenAIVoices, ElevenVoices] = key_or_config_val(
                 extras, "tts_voice"
             )
-            tts_style: Optional[str] = key_or_config_val(extras, "tts_style")
+            style: Optional[str] = key_or_config_val(extras, "tts_style")
 
-            # Prepend style instructions for Gemini TTS
-            input_text = input
-            if tts_style and tts_provider == "google" and "gemini" in tts_model:
-                input_text = f"{tts_style} {input}"
+            if style and tts_provider == "google" and "gemini" in tts_model:
+                input_text = f"{style} {input_text}"
 
-            # For OpenAI gpt-4o-mini-tts, pass style as instructions parameter
-            instructions: Optional[str] = None
-            if (
-                tts_style
-                and tts_provider == "openai"
-                and tts_model == "gpt-4o-mini-tts"
-            ):
-                instructions = tts_style
-
-            tts_response = await self.get_tts_response(
-                note=note,
+            instructions = (
+                style
+                if style and tts_provider == "openai" and tts_model == "gpt-4o-mini-tts"
+                else None
+            )
+            data = await self.get_tts_response(
+                note_id=note_id,
+                values=values,
                 input_text=input_text,
                 model=tts_model,
-                voice=tts_voice,
+                voice=voice,
                 provider=tts_provider,
                 strip_html=should_strip_html,
                 show_error_box=show_error_box,
                 instructions=instructions,
             )
+            if not data:
+                return ResolvedField(None)
 
-            if not tts_response:
-                return None
-
-            file_name = get_media_path(
-                note,
-                node.field,
-                "wav" if tts_provider == "google" and "gemini" in tts_model else "mp3",
+            extension = (
+                "wav" if tts_provider == "google" and "gemini" in tts_model else "mp3"
             )
-            path = media.write_data(file_name, tts_response)
+            filename = build_media_filename(
+                note_type,
+                note_id,
+                node.field,
+                extension,
+            )
+            return ResolvedField(
+                f"[sound:{filename}]",
+                PendingMedia(filename, data),
+            )
 
-            return f"[sound:{path}]"
-
-        elif field_type == "chat":
+        if field_type == "chat":
             chat_model: ChatModels = key_or_config_val(extras, "chat_model")
             chat_provider: ChatProviders = key_or_config_val(extras, "chat_provider")
-            chat_temperature: float = key_or_config_val(extras, "chat_temperature")
-            chat_reasoning_effort: Optional[OpenAIReasoningEffort] = key_or_config_val(
+            temperature: float = key_or_config_val(extras, "chat_temperature")
+            reasoning_effort: Optional[OpenAIReasoningEffort] = key_or_config_val(
                 extras, "chat_reasoning_effort"
             )
             should_convert: bool = key_or_config_val(extras, "chat_markdown_to_html")
@@ -177,22 +170,25 @@ class FieldProcessor:
                     field_lower=node.field,
                 ),
                 signature=build_prompt_usage_signature(
-                    prompt=input,
+                    prompt=input_text,
                     provider=str(chat_provider),
                     model=str(chat_model),
-                    reasoning_effort=chat_reasoning_effort,
+                    reasoning_effort=reasoning_effort,
                     use_tools=use_tools,
                 ),
             )
-
-            return await self.get_chat_response(
-                note=note,
+            value = await self.get_chat_response(
+                note_id=note_id,
+                note_type=note_type,
+                deck_name=deck_name,
+                field_order=field_order,
+                values=values,
                 deck_id=node.deck_id,
-                prompt=input,
+                prompt=input_text,
                 model=chat_model,
                 provider=chat_provider,
-                temperature=chat_temperature,
-                reasoning_effort=chat_reasoning_effort,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
                 field_lower=node.field,
                 should_convert_to_html=should_convert,
                 use_tools=use_tools,
@@ -200,53 +196,58 @@ class FieldProcessor:
                 prompt_usage_context=prompt_usage_context,
                 usage_scope_id=usage_scope_id,
             )
+            return ResolvedField(value)
 
-        elif field_type == "image":
-            if not mw or not mw.col:
-                return None
-
-            media = mw.col.media
-            if not media:
-                logger.error("No media")
-                return None
-
+        if field_type == "image":
             image_model: ImageModels = key_or_config_val(extras, "image_model")
             image_provider: ImageProviders = key_or_config_val(extras, "image_provider")
-            image_aspect_ratio: Optional[ImageAspectRatio] = key_or_config_val(
+            aspect_ratio: Optional[ImageAspectRatio] = key_or_config_val(
                 extras, "image_aspect_ratio"
             )
-            image_resolution: Optional[ImageResolution] = key_or_config_val(
+            resolution: Optional[ImageResolution] = key_or_config_val(
                 extras, "image_resolution"
             )
-            image_output_format: ImageOutputFormat = (
+            output_format: ImageOutputFormat = (
                 key_or_config_val(extras, "image_output_format") or "webp"
             )
-            image_quality: int = key_or_config_val(extras, "image_quality") or -1
-
-            image_response = await self.get_image_response(
-                note=note,
-                input_text=input,
+            quality: int = key_or_config_val(extras, "image_quality") or -1
+            data = await self.get_image_response(
+                note_id=note_id,
+                values=values,
+                input_text=input_text,
                 model=image_model,
                 provider=image_provider,
-                aspect_ratio=image_aspect_ratio,
-                resolution=image_resolution,
-                output_format=image_output_format,
-                quality=image_quality,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                output_format=output_format,
+                quality=quality,
                 show_error_box=show_error_box,
             )
-            if not image_response:
-                return None
+            if not data:
+                return ResolvedField(None)
 
-            ext = image_output_format if image_output_format != "jpeg" else "jpg"
-            file_name = get_media_path(note, node.field, ext)
-            path = media.write_data(file_name, image_response)
-            return f'<img src="{path}"/>'
-        else:
-            raise Exception(f"Unexpected note type {field_type}")
+            extension = output_format if output_format != "jpeg" else "jpg"
+            filename = build_media_filename(
+                note_type,
+                note_id,
+                node.field,
+                extension,
+            )
+            return ResolvedField(
+                f'<img src="{filename}"/>',
+                PendingMedia(filename, data),
+            )
+
+        raise Exception(f"Unexpected field type {field_type}")
 
     async def get_chat_response(
         self,
-        note: Note,
+        *,
+        note_id: int,
+        note_type: str,
+        deck_name: str | None,
+        field_order: Sequence[str],
+        values: Mapping[str, str],
         deck_id: DeckId,
         prompt: str,
         model: ChatModels,
@@ -260,26 +261,25 @@ class FieldProcessor:
         prompt_usage_context: Optional[PromptUsageContext] = None,
         usage_scope_id: Optional[str] = None,
     ) -> Optional[str]:
-        interpolated_prompt = interpolate_prompt(prompt, note)
-
-        if not interpolated_prompt:
+        interpolated_prompt = interpolate_prompt_with_values(
+            prompt,
+            values,
+            config.allow_empty_fields,
+        )
+        if not interpolated_prompt or not self._check_api_key(provider, show_error_box):
             return None
 
-        # Check for API key
-        if not self._check_api_key(provider, show_error_box):
-            return None
-
-        note_type = get_note_type(note)
         tools: Optional[list[TextToolDefinition]] = None
         tool_executor = None
         if use_tools:
             registry = ToolRegistry(
                 context=BuiltInToolContext(
-                    note_id=note.id,
+                    note_id=note_id,
                     deck_id=deck_id,
+                    deck_name=None if deck_id == GLOBAL_DECK_ID else deck_name,
                     note_type=note_type,
+                    note_type_fields=tuple(field_order),
                     field_name=field_lower,
-                    collection=mw.col if mw else None,
                 ),
                 built_in_tools=normalize_built_in_tools_config(config.built_in_tools),
                 mcp_servers=config.mcp_servers or [],
@@ -287,17 +287,14 @@ class FieldProcessor:
             tools, warnings = await registry.build_tool_registry()
             for warning in warnings:
                 logger.warning("Tools warning: %s", warning)
-
             if not tools:
                 raise Exception(
                     "Tools are enabled for this field, but no built-in tools or external MCP tools are available."
                 )
-
             tool_executor = registry.execute_tool_call
 
         cache_seed = f"{provider}:{model}:{note_type}:{deck_id}:{field_lower}:{prompt}"
         prompt_chars = len(interpolated_prompt)
-
         try:
             provider_result = await self.chat_provider.async_get_chat_response_result(
                 interpolated_prompt,
@@ -306,7 +303,7 @@ class FieldProcessor:
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 prompt_cache_key=prompt_cache_key_for_request(str(model), cache_seed),
-                note_id=note.id,
+                note_id=note_id,
                 tools=tools,
                 tool_executor=tool_executor,
                 prompt_usage_key=prompt_usage_context.prompt_key
@@ -343,12 +340,13 @@ class FieldProcessor:
             ),
             record_openai_daily_usage=False,
         )
-
         return response_text
 
     async def get_tts_response(
         self,
-        note: Note,
+        *,
+        note_id: int,
+        values: Mapping[str, str],
         input_text: str,
         model: TTSModels,
         provider: TTSProviders,
@@ -357,12 +355,12 @@ class FieldProcessor:
         show_error_box: bool = True,
         instructions: Optional[str] = None,
     ) -> Optional[bytes]:
-        interpolated_prompt = interpolate_prompt(input_text, note)
-
-        if not interpolated_prompt:
-            return None
-
-        if not self._check_api_key(provider, show_error_box):
+        interpolated_prompt = interpolate_prompt_with_values(
+            input_text,
+            values,
+            config.allow_empty_fields,
+        )
+        if not interpolated_prompt or not self._check_api_key(provider, show_error_box):
             return None
 
         return await self.tts_provider.async_get_tts_response(
@@ -370,14 +368,16 @@ class FieldProcessor:
             model=model,
             provider=provider,
             voice=voice,
-            note_id=note.id,
+            note_id=note_id,
             strip_html=strip_html,
             instructions=instructions,
         )
 
     async def get_image_response(
         self,
-        note: Note,
+        *,
+        note_id: int,
+        values: Mapping[str, str],
         input_text: str,
         model: ImageModels,
         provider: ImageProviders,
@@ -387,19 +387,19 @@ class FieldProcessor:
         quality: Optional[int] = None,
         show_error_box: bool = True,
     ) -> Optional[bytes]:
-        interpolated_prompt = interpolate_prompt(input_text, note)
-
-        if not interpolated_prompt:
-            return None
-
-        if not self._check_api_key(provider, show_error_box):
+        interpolated_prompt = interpolate_prompt_with_values(
+            input_text,
+            values,
+            config.allow_empty_fields,
+        )
+        if not interpolated_prompt or not self._check_api_key(provider, show_error_box):
             return None
 
         raw_bytes = await self.image_provider.async_get_image_response(
             prompt=interpolated_prompt,
             model=model,
             provider=provider,
-            note_id=note.id,
+            note_id=note_id,
             aspect_ratio=aspect_ratio,
             resolution=resolution,
             output_format=output_format,

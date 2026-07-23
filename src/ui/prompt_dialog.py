@@ -67,7 +67,7 @@ from ..models import (
     overridable_image_options,
     overridable_tts_options,
 )
-from ..note_proccessor import NoteProcessor
+from ..note_proccessor import NoteProcessor, snapshot_note
 from ..notes import get_note_types, get_random_note, get_valid_fields_for_prompt
 from ..prompts import (
     add_or_update_prompts,
@@ -878,6 +878,13 @@ class PromptDialog(QDialog):
         if not sample_note:
             show_message_box("Smart Notes: need at least one note of this note type!")
             return
+        selected_deck = self.state.s["selected_deck"]
+        snapshot = snapshot_note(
+            sample_note,
+            selected_deck,
+            deck_id_to_name_map().get(selected_deck),
+        )
+        values = snapshot.lower_values()
         new_prompts_map = self._create_new_prompts_map()
 
         error = prompt_has_error(
@@ -1029,8 +1036,12 @@ class PromptDialog(QDialog):
 
             def chat_fn():
                 return self.processor.field_processor.get_chat_response(
+                    note_id=snapshot.note_id,
+                    note_type=snapshot.note_type,
+                    deck_name=snapshot.deck_name,
+                    field_order=snapshot.field_order,
+                    values=values,
                     prompt=prompt,
-                    note=sample_note,
                     provider=chat_provider,
                     model=chat_model,
                     field_lower=self.state.s["selected_note_field"].lower(),
@@ -1058,8 +1069,9 @@ class PromptDialog(QDialog):
                     prompt_to_use = f"{style} {prompt}"
 
                 return self.processor.field_processor.get_tts_response(
+                    note_id=snapshot.note_id,
+                    values=values,
                     input_text=prompt_to_use,
-                    note=sample_note,
                     provider=tts_provider,
                     model=tts_model,
                     voice=tts_voice,
@@ -1079,8 +1091,9 @@ class PromptDialog(QDialog):
                 )
                 model = self.image_options.state.s["image_model"]
                 return self.processor.field_processor.get_image_response(
+                    note_id=snapshot.note_id,
+                    values=values,
                     input_text=prompt,
-                    note=sample_note,
                     model=model,
                     provider=provider,
                 )

@@ -65,8 +65,17 @@ def find_executable(name: str) -> Optional[str]:
     return None
 
 
+def build_media_filename(
+    note_type: str,
+    note_id: int,
+    field: str,
+    format: str,
+) -> str:
+    return f"{note_type}-{field}-{note_id}.{format}"
+
+
 def get_media_path(note: Note, field: str, format: str) -> str:
-    return f"{get_note_type(note)}-{field}-{note.id}.{format}"
+    return build_media_filename(get_note_type(note), note.id, field, format)
 
 
 def convert_image_data(data: bytes, format: str, quality: int = -1) -> bytes:
