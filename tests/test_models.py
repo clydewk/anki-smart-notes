@@ -154,10 +154,11 @@ def test_prompt_cache_key_is_stable() -> None:
     assert key1 == key2
 
 
-def openai_test_config() -> SimpleNamespace:
+def openai_test_config(*, fast_mode: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         openai_api_key="sk-test",
         openai_endpoint=None,
+        openai_fast_mode_enabled=fast_mode,
         custom_providers=[],
         openai_daily_token_budget_enabled=False,
         openai_daily_token_budget=1_000_000,
@@ -188,6 +189,7 @@ def custom_provider_test_config(
                 "streaming_mode": streaming_mode,
             }
         ],
+        openai_fast_mode_enabled=False,
         openai_daily_token_budget_enabled=False,
         openai_daily_token_budget=1_000_000,
     )
@@ -360,6 +362,42 @@ async def test_openai_payload_with_reasoning(
     assert captured["payload"]["store"] is False
     assert captured["payload"]["stream"] is True
     assert captured["payload"]["prompt_cache_key"] == "smart-notes:test"
+    assert "service_tier" not in captured["payload"]
+
+
+@pytest.mark.asyncio
+async def test_openai_fast_mode_sets_service_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = ChatProvider()
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        openai_test_config(fast_mode=True),
+    )
+
+    async def fake_stream_sse_json(**kwargs: Any):
+        captured["payload"] = kwargs["json_payload"]
+        yield response_created_event("resp_fast")
+        yield response_completed_event("resp_fast", text="hello")
+
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        fake_stream_sse_json,
+    )
+
+    result = await cp.generate_text(
+        TextGenerationRequest(
+            prompt="hi",
+            model="gpt-5.6-sol",
+            provider="openai",
+            temperature=0.5,
+            reasoning_effort="none",
+        )
+    )
+
+    assert result.text == "hello"
+    assert captured["payload"]["service_tier"] == "fast"
 
 
 @pytest.mark.asyncio

@@ -170,6 +170,7 @@ def test_config_cleanup_migrates_legacy_tools_settings(
     cfg.perform_extras_cleanup()
 
     assert config_data["chat_use_tools"] is True
+    assert config_data["openai_fast_mode_enabled"] is False
     assert config_data["built_in_tools"] == {
         "anki_search_notes": False,
         "anki_get_deck_overview": True,

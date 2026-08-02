@@ -165,6 +165,7 @@ class State(TypedDict):
     openai_endpoint: Optional[str]
     allow_empty_fields: bool
     debug: bool
+    openai_fast_mode_enabled: bool
     openai_daily_token_budget_enabled: bool
     openai_daily_token_budget: int
 
@@ -420,6 +421,18 @@ class AddonOptionsDialog(QDialog):
             form.addRow(f"<b>{label}:</b>", edit)
 
         add_key_field("🔑 OpenAI API Key", "openai_api_key", "sk-proj-...")
+
+        self.openai_fast_mode_checkbox = ReactiveCheckBox(
+            self.state, "openai_fast_mode_enabled"
+        )
+        form.addRow("Use OpenAI Fast mode:", self.openai_fast_mode_checkbox)
+        fast_mode_description = QLabel(
+            "Adds service_tier: fast to OpenAI text requests. OpenAI advertises up to 2.5× faster responses; premium per-token pricing applies."
+        )
+        fast_mode_description.setWordWrap(True)
+        fast_mode_description.setFont(font_small)
+        form.addRow(fast_mode_description)
+
         add_key_field("🔑 Anthropic API Key", "anthropic_api_key", "sk-ant-...")
         add_key_field("🔑 DeepSeek API Key", "deepseek_api_key", "sk-...")
         add_key_field("🔑 Google API Key (Gemini/TTS)", "google_api_key", "AIzaSy...")
@@ -1444,6 +1457,7 @@ class AddonOptionsDialog(QDialog):
             "generate_at_review": config.generate_at_review,
             "regenerate_notes_when_batching": config.regenerate_notes_when_batching,
             "openai_endpoint": config.openai_endpoint,
+            "openai_fast_mode_enabled": bool(config.openai_fast_mode_enabled),
             "openai_daily_token_budget_enabled": bool(
                 config.openai_daily_token_budget_enabled
             ),

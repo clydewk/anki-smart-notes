@@ -2368,6 +2368,11 @@ class ChatProvider:
             "tool_choice": "none",
         }
 
+        if request.provider == "openai" and bool(
+            getattr(config, "openai_fast_mode_enabled", False)
+        ):
+            payload["service_tier"] = "fast"
+
         if previous_response_id:
             payload["previous_response_id"] = previous_response_id
 

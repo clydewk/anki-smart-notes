@@ -76,6 +76,7 @@ class Config:
     allow_empty_fields: bool
     last_message_id: int
     debug: bool
+    openai_fast_mode_enabled: bool
     openai_daily_token_budget_enabled: bool
     openai_daily_token_budget: int
 
@@ -197,6 +198,9 @@ class Config:
                 if isinstance(legacy_chat_use_mcp, bool)
                 else False
             )
+
+        if not isinstance(self.__getattr__("openai_fast_mode_enabled"), bool):
+            self.openai_fast_mode_enabled = False
 
         if not isinstance(self.__getattr__("openai_daily_token_budget_enabled"), bool):
             self.openai_daily_token_budget_enabled = False
