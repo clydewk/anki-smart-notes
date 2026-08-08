@@ -47,6 +47,7 @@ class MockConfig:
     deepseek_api_key: str = ""
     google_api_key: str = ""
     elevenlabs_api_key: str = ""
+    fish_api_key: str = ""
     replicate_api_key: str = ""
     openai_fast_mode_enabled: bool = False
     openai_daily_token_budget_enabled: bool = False

@@ -60,6 +60,7 @@ class Config:
     deepseek_api_key: Optional[str]
     google_api_key: Optional[str]
     elevenlabs_api_key: Optional[str]
+    fish_api_key: Optional[str]
     replicate_api_key: Optional[str]
 
     custom_providers: list[CustomProvider]

@@ -4,6 +4,7 @@
   "deepseek_api_key": "",
   "google_api_key": "",
   "elevenlabs_api_key": "",
+  "fish_api_key": "",
   "replicate_api_key": "",
   "chat_provider": "openai",
   "chat_model": "gpt-5.6-sol",

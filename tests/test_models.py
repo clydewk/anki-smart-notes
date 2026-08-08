@@ -65,6 +65,15 @@ def test_google_tts_models_include_gemini_3_1_flash_preview() -> None:
     assert "gemini-3.1-flash-tts-preview" in get_args(models.GoogleModels)
 
 
+def test_fish_tts_models_match_api() -> None:
+    assert get_args(models.FishTTSModels) == (
+        "s2.1-pro-free",
+        "s2.1-pro",
+        "s2-pro",
+        "s1",
+    )
+
+
 def test_openai_image_models_include_gpt_image_2() -> None:
     assert "gpt-image-2" in get_args(models.OpenAIImageModels)
 
@@ -823,6 +832,51 @@ async def test_openai_tts_uses_http_endpoint(
     assert captured["url"].endswith("/v1/audio/speech")
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
     assert captured["payload"]["model"] == "tts-1"
+
+
+@pytest.mark.asyncio
+async def test_fish_tts_uses_model_header_and_reference_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = TTSProvider()
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        "src.tts_provider.config",
+        SimpleNamespace(
+            custom_providers=[],
+            fish_api_key="fish-test-key",
+        ),
+    )
+
+    async def fake_request_bytes(**kwargs: Any) -> bytes:
+        captured["url"] = kwargs["url"]
+        captured["headers"] = kwargs["headers"]
+        captured["payload"] = kwargs["json_payload"]
+        return b"fish-audio"
+
+    monkeypatch.setattr(
+        "src.tts_provider.provider_runtime.request_bytes",
+        fake_request_bytes,
+    )
+
+    data = await provider.async_get_tts_response(
+        input="hello",
+        model="s2.1-pro-free",
+        provider="fish",
+        voice="  voice-model-id  ",
+        strip_html=False,
+    )
+
+    assert data == b"fish-audio"
+    assert captured["url"] == "https://api.fish.audio/v1/tts"
+    assert captured["headers"]["Authorization"] == "Bearer fish-test-key"
+    assert captured["headers"]["model"] == "s2.1-pro-free"
+    assert captured["payload"] == {
+        "text": "hello",
+        "reference_id": "voice-model-id",
+        "format": "mp3",
+    }
 
 
 @pytest.mark.asyncio

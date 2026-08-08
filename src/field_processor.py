@@ -19,7 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional
 
 from anki.decks import DeckId
 
@@ -46,14 +46,12 @@ from .models import (
     DEFAULT_EXTRAS,
     ChatModels,
     ChatProviders,
-    ElevenVoices,
     ImageAspectRatio,
     ImageModels,
     ImageOutputFormat,
     ImageProviders,
     ImageResolution,
     OpenAIReasoningEffort,
-    OpenAIVoices,
     SmartFieldType,
     TTSModels,
     TTSProviders,
@@ -113,9 +111,7 @@ class FieldProcessor:
             should_strip_html: bool = key_or_config_val(extras, "tts_strip_html")
             tts_provider: TTSProviders = key_or_config_val(extras, "tts_provider")
             tts_model: TTSModels = key_or_config_val(extras, "tts_model")
-            voice: Union[OpenAIVoices, ElevenVoices] = key_or_config_val(
-                extras, "tts_voice"
-            )
+            voice: str = key_or_config_val(extras, "tts_voice")
             style: Optional[str] = key_or_config_val(extras, "tts_style")
 
             if style and tts_provider == "google" and "gemini" in tts_model:
@@ -442,6 +438,8 @@ class FieldProcessor:
             has_key = bool(config.google_api_key)
         elif provider == "elevenLabs":
             has_key = bool(config.elevenlabs_api_key)
+        elif provider == "fish":
+            has_key = bool(config.fish_api_key)
         elif provider == "replicate":
             has_key = bool(config.replicate_api_key)
 

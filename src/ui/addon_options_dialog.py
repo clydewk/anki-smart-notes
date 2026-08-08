@@ -175,6 +175,7 @@ class State(TypedDict):
     deepseek_api_key: Optional[str]
     google_api_key: Optional[str]
     elevenlabs_api_key: Optional[str]
+    fish_api_key: Optional[str]
     replicate_api_key: Optional[str]
 
     custom_providers: list[CustomProvider]
@@ -437,6 +438,7 @@ class AddonOptionsDialog(QDialog):
         add_key_field("🔑 DeepSeek API Key", "deepseek_api_key", "sk-...")
         add_key_field("🔑 Google API Key (Gemini/TTS)", "google_api_key", "AIzaSy...")
         add_key_field("🔑 ElevenLabs API Key (TTS)", "elevenlabs_api_key", "...")
+        add_key_field("🔑 Fish Audio API Key (TTS)", "fish_api_key", "...")
         add_key_field("🔑 Replicate API Key (Images)", "replicate_api_key", "r8_...")
 
         group_box = QGroupBox("API Configuration")
@@ -1451,6 +1453,7 @@ class AddonOptionsDialog(QDialog):
             "deepseek_api_key": config.deepseek_api_key,
             "google_api_key": config.google_api_key,
             "elevenlabs_api_key": config.elevenlabs_api_key,
+            "fish_api_key": config.fish_api_key,
             "replicate_api_key": config.replicate_api_key,
             "prompts_map": config.prompts_map,
             "selected_row": None,

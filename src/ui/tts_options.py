@@ -67,13 +67,22 @@ default_texts: dict[str, str] = {
 }
 
 price_tier_copy = {
+    "free": "Free",
     "low": "Low Cost",
     "standard": "Standard Cost",
     "high": "High Cost",
     "ultra-high": "Ultra High Cost",
 }
 
-PriceTiers = Literal["low", "standard", "high", "ultra-high"]
+PriceTiers = Literal["free", "low", "standard", "high", "ultra-high"]
+
+TTS_PROVIDER_LABELS = {
+    "google": "Google",
+    "azure": "Azure",
+    "openai": "OpenAI",
+    "elevenLabs": "ElevenLabs",
+    "fish": "Fish Audio",
+}
 
 
 class TTSMeta(TypedDict):
@@ -297,6 +306,27 @@ def get_azure_voices() -> list[TTSMeta]:
     return voices
 
 
+def get_fish_voices() -> list[TTSMeta]:
+    models: list[tuple[str, str, PriceTiers]] = [
+        ("s2.1-pro-free", "S2.1 Pro Free", "free"),
+        ("s2.1-pro", "S2.1 Pro", "standard"),
+        ("s2-pro", "S2 Pro", "standard"),
+        ("s1", "S1", "standard"),
+    ]
+    return [
+        {
+            "tts_provider": "fish",
+            "voice": "",
+            "model": model,
+            "friendly_voice": f"Custom voice ({label})",
+            "gender": ALL,
+            "language": ALL,
+            "price_tier": price_tier,
+        }
+        for model, label, price_tier in models
+    ]
+
+
 def get_gemini_voices() -> list[TTSMeta]:
     gemini_voice_names = [
         "Zephyr",
@@ -367,17 +397,28 @@ base_voices = (
     + get_eleven_voices()
     + get_azure_voices()
     + get_gemini_voices()
+    + get_fish_voices()
 )
 voices = base_voices.copy()
 
 languages: list[str] = [ALL] + sorted({voice["language"] for voice in voices} - {ALL})
-base_providers: list[AllTTSProviders] = [ALL, "google", "openai", "elevenLabs", "azure"]
+base_providers: list[AllTTSProviders] = [
+    ALL,
+    "google",
+    "openai",
+    "elevenLabs",
+    "fish",
+    "azure",
+]
 providers: list[AllTTSProviders] = base_providers.copy()
 
 
 def format_voice(voice: TTSMeta) -> str:
     language_display = "Multilingual" if voice["language"] == ALL else voice["language"]
-    return f"{voice['tts_provider'].capitalize()} - {language_display} - {voice['gender'].capitalize()} - {voice['friendly_voice']} ({price_tier_copy[voice['price_tier']]})"
+    provider_display = TTS_PROVIDER_LABELS.get(
+        voice["tts_provider"], voice["tts_provider"]
+    )
+    return f"{provider_display} - {language_display} - {voice['gender'].capitalize()} - {voice['friendly_voice']} ({price_tier_copy[voice['price_tier']]})"
 
 
 voice_search_cache: dict[tuple[str, str, str], list[str]] = {
@@ -551,6 +592,7 @@ class TTSOptions(QWidget):
         top_row_layout.addWidget(self.render_voices_list())
 
         layout.addWidget(self.selected_voice_label)
+        layout.addWidget(self.render_fish_voice())
         layout.addSpacerItem(QSpacerItem(0, 12))
         layout.addWidget(top_row)
         layout.addSpacerItem(QSpacerItem(0, 12))
@@ -568,6 +610,26 @@ class TTSOptions(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
 
+    def render_fish_voice(self) -> QWidget:
+        self.fish_voice_box = QGroupBox("🐟 Fish Audio Voice")
+        layout = default_form_layout()
+        self.fish_voice_box.setLayout(layout)
+
+        voice_id = ReactiveLineEdit(self.state, "tts_voice")
+        voice_id.setPlaceholderText("Fish Audio voice model ID")
+        voice_id.on_change.connect(
+            lambda value: self.state.update({"tts_voice": value, "voice": value})
+        )
+        layout.addRow("Voice model ID:", voice_id)
+
+        description = QLabel(
+            "Use the model ID of a voice from your Fish Audio account or library."
+        )
+        description.setWordWrap(True)
+        description.setFont(font_small)
+        layout.addRow(description)
+        return self.fish_voice_box
+
     def render_filters(self) -> QWidget:
         filters_box = QGroupBox("Filter Voice List")
         filters_layout = default_form_layout()
@@ -584,12 +646,7 @@ class TTSOptions(QWidget):
             self.state,
             "providers",
             "selected_provider",
-            render_map={
-                "google": "Google",
-                "azure": "Azure",
-                "openai": "OpenAI",
-                "elevenLabs": "ElevenLabs",
-            },
+            render_map=TTS_PROVIDER_LABELS,
         )
         provider.on_change.connect(self._on_provider_filter_change)
 
@@ -648,11 +705,16 @@ class TTSOptions(QWidget):
             selected_index = indexes[0]
             selected_voice = self.voices_models.get_data()[selected_index.row()]
             logger.debug(f"Selected voice: {selected_voice}")
+            current_provider = self.state.s["tts_provider"]
+            voice = selected_voice["voice"]
+            if selected_voice["tts_provider"] == "fish":
+                voice = self.state.s["tts_voice"] if current_provider == "fish" else ""
+
             self.state.update(
                 {
-                    "voice": selected_voice["voice"],
+                    "voice": voice,
                     "tts_provider": selected_voice["tts_provider"],
-                    "tts_voice": selected_voice["voice"],
+                    "tts_voice": voice,
                     "tts_model": selected_voice["model"],
                 }
             )
@@ -662,6 +724,7 @@ class TTSOptions(QWidget):
 
     def update_ui(self) -> None:
         self.update_list_ui()
+        self.fish_voice_box.setVisible(self.state.s["tts_provider"] == "fish")
         self.test_button.setEnabled(self.state.s["test_enabled"])
 
     def update_list_ui(self) -> None:
@@ -670,7 +733,7 @@ class TTSOptions(QWidget):
         voice = self.state.s.get("tts_voice")
         provider = self.state.s.get("tts_provider")
         model = self.state.s.get("tts_model")
-        if not (voice and provider):
+        if not provider or (provider != "fish" and not voice):
             return
 
         selection_model = self.voices_list.selectionModel()
@@ -681,9 +744,9 @@ class TTSOptions(QWidget):
             (
                 v
                 for v in voices
-                if v["voice"] == voice
-                and v["tts_provider"] == provider
+                if v["tts_provider"] == provider
                 and v["model"] == model
+                and (provider == "fish" or v["voice"] == voice)
             ),
             None,
         )

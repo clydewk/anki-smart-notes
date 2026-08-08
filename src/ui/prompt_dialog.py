@@ -95,6 +95,7 @@ PROVIDER_API_KEY_ATTRS: dict[str, str] = {
     "deepseek": "deepseek_api_key",
     "google": "google_api_key",
     "elevenLabs": "elevenlabs_api_key",
+    "fish": "fish_api_key",
     "replicate": "replicate_api_key",
 }
 

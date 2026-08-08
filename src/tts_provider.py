@@ -73,6 +73,8 @@ class TTSProvider:
             return await self._get_openai_tts(text, model, voice, instructions)
         if provider == "elevenLabs":
             return await self._get_elevenlabs_tts(text, model, voice)
+        if provider == "fish":
+            return await self._get_fish_tts(text, model, voice)
         if provider == "google":
             if "gemini" in model:
                 return await self._get_google_gemini_tts(text, model, voice)
@@ -164,6 +166,31 @@ class TTSProvider:
                 "model_id": model,
             },
             provider="elevenLabs",
+            model=model,
+        )
+
+    async def _get_fish_tts(self, text: str, model: str, voice: str) -> bytes:
+        api_key = config.fish_api_key
+        if not api_key:
+            raise Exception("Fish Audio API key not found.")
+
+        reference_id = voice.strip()
+        if not reference_id:
+            raise Exception("Fish Audio voice model ID not found.")
+
+        return await self._execute_request(
+            url="https://api.fish.audio/v1/tts",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "model": model,
+            },
+            json_payload={
+                "text": text,
+                "reference_id": reference_id,
+                "format": "mp3",
+            },
+            provider="fish",
             model=model,
         )
 

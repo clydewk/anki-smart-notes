@@ -23,7 +23,7 @@ from typing import Any, Literal, Optional, TypedDict, Union, cast
 
 # Providers
 
-TTSProviders = Literal["openai", "elevenLabs", "google", "azure"]
+TTSProviders = Literal["openai", "elevenLabs", "google", "azure", "fish"]
 ChatProviders = Literal["openai", "anthropic", "deepseek", "google"]
 
 # Reasoning Efforts
@@ -243,6 +243,7 @@ def openai_chat_models_for_display(
 
 OpenAITTSModels = Literal["tts-1", "tts-1-hd", "gpt-4o-mini-tts"]
 ElevenTTSModels = Literal["eleven_multilingual_v2"]
+FishTTSModels = Literal["s2.1-pro-free", "s2.1-pro", "s2-pro", "s1"]
 GoogleModels = Literal[
     "standard",
     "wavenet",
@@ -252,7 +253,9 @@ GoogleModels = Literal[
     "gemini-2.5-pro-preview-tts",
 ]
 AzureModels = Literal["standard", "neural"]
-TTSModels = Union[OpenAITTSModels, ElevenTTSModels, GoogleModels, AzureModels]
+TTSModels = Union[
+    OpenAITTSModels, ElevenTTSModels, FishTTSModels, GoogleModels, AzureModels
+]
 
 # TTS Voices
 
