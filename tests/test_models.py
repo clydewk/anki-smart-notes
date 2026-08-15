@@ -74,6 +74,56 @@ def test_fish_tts_models_match_api() -> None:
     )
 
 
+def test_normalize_field_extras_migrates_only_active_legacy_tts_override() -> None:
+    legacy = {
+        "use_custom_model": True,
+        "tts_provider": "fish",
+        "tts_model": "s2.1-pro-free",
+        "tts_voice": "voice-id",
+    }
+    normalized = models.normalize_field_extras(legacy)
+    assert normalized["tts_voice_pool"] == [
+        {
+            "provider": "fish",
+            "model": "s2.1-pro-free",
+            "voice": "voice-id",
+            "language": None,
+            "enabled": True,
+        }
+    ]
+
+    legacy["use_custom_model"] = False
+    assert models.normalize_field_extras(legacy)["tts_voice_pool"] is None
+    assert (
+        models.normalize_field_extras({"tts_voice_pool": None})["tts_voice_pool"]
+        is None
+    )
+
+
+def test_normalize_tts_voice_pool_skips_invalid_entries() -> None:
+    assert models.normalize_tts_voice_pool(
+        [
+            {
+                "provider": "openai",
+                "model": "tts-1",
+                "voice": "alloy",
+                "language": " en-US ",
+                "enabled": False,
+            },
+            {"provider": "fish", "model": "s2.1-pro-free", "voice": ""},
+            "bad",
+        ]
+    ) == [
+        {
+            "provider": "openai",
+            "model": "tts-1",
+            "voice": "alloy",
+            "language": "en-US",
+            "enabled": False,
+        }
+    ]
+
+
 def test_openai_image_models_include_gpt_image_2() -> None:
     assert "gpt-image-2" in get_args(models.OpenAIImageModels)
 

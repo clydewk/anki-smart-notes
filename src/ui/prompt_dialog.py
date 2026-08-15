@@ -63,6 +63,9 @@ from ..models import (
     OverrideableTTSOptionsDict,
     PromptMap,
     SmartFieldType,
+    TTSModels,
+    TTSProviders,
+    TTSVoiceTarget,
     overridable_chat_options,
     overridable_image_options,
     overridable_tts_options,
@@ -77,6 +80,7 @@ from ..prompts import (
     interpolate_prompt,
 )
 from ..sentry import run_async_in_background_with_sentry
+from ..tts_routing import select_tts_target
 from ..tts_utils import play_audio
 from ..utils import get_fields, none_defaulting, to_lowercase_dict
 from .chat_options import ChatOptions
@@ -85,6 +89,7 @@ from .image_options import ImageOptions
 from .reactive_check_box import ReactiveCheckBox
 from .reactive_combo_box import ReactiveComboBox
 from .reactive_edit_text import ReactiveEditText
+from .reactive_line_edit import ReactiveLineEdit
 from .state_manager import StateManager
 from .tts_options import TTSOptions
 from .ui_utils import default_form_layout, font_bold, font_small, show_message_box
@@ -132,6 +137,7 @@ class State(TypedDict):
     decks: list[DeckId]
     regenerate_when_batching: bool
     tts_style: str
+    tts_language: str
     chat_use_tools: bool
 
 
@@ -144,6 +150,7 @@ class PartialState(TypedDict):
     selected_note_type: str
     selected_deck: DeckId
     tts_style: str
+    tts_language: str
 
 
 class PromptDialog(QDialog):
@@ -229,6 +236,7 @@ class PromptDialog(QDialog):
             "tts_source_fields": default_note_state["tts_source_fields"],
             "selected_tts_source_field": selected_tts_source_field,
             "tts_style": extras.get("tts_style") or "",
+            "tts_language": extras.get("tts_language") or "",
             # target fields
             "note_fields": target_fields,
             "selected_note_field": selected_target_field,
@@ -331,6 +339,16 @@ class PromptDialog(QDialog):
             self.tts_source_combo_box.setToolTip("The field that will be spoken.")
             form_layout.addRow("Source Field:", self.tts_source_combo_box)
 
+            self.tts_language_box = ReactiveLineEdit(self.state, "tts_language")
+            self.tts_language_box.setPlaceholderText("e.g. ja, en-US, Japanese")
+            self.tts_language_box.setToolTip(
+                "Optional language tag or name used to route this field to matching voices. Blank uses any enabled voice."
+            )
+            self.tts_language_box.on_change.connect(
+                lambda text: self.state.update({"tts_language": text})
+            )
+            form_layout.addRow("Language (optional):", self.tts_language_box)
+
         self.field_combo_box = ReactiveComboBox(
             self.state, "note_fields", "selected_note_field"
         )
@@ -346,7 +364,7 @@ class PromptDialog(QDialog):
 
         # Style Instructions for Gemini TTS
         if self.state.s["type"] == "tts":
-            style_label = QLabel("Style Instructions (Gemini Only):")
+            style_label = QLabel("Style Instructions (OpenAI/Gemini):")
             style_label.setFont(font_bold)
             self.tts_style_box = ReactiveEditText(self.state, "tts_style")
             self.tts_style_box.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -569,11 +587,8 @@ class PromptDialog(QDialog):
             if extras and use_custom_model:
                 self.tts_options = TTSOptions(
                     {
-                        "tts_provider": extras.get("tts_provider"),
-                        "tts_voice": extras.get("tts_voice"),
-                        "tts_model": extras.get("tts_model"),
+                        "tts_voice_pool": extras.get("tts_voice_pool"),
                         "tts_strip_html": extras.get("tts_strip_html"),
-                        "tts_style": extras.get("tts_style"),
                     }
                 )
             self.tts_options.state.state_changed.connect(self.on_state_update)
@@ -628,18 +643,20 @@ class PromptDialog(QDialog):
             prompts=self.prompts_map,
             fallback_to_global_deck=True,
         )
-        self.state.update(
-            {
-                "regenerate_when_batching": extras.get(
-                    "regenerate_when_batching", False
-                )
-                if extras
-                else False,
-                "chat_use_tools": key_or_config_val(extras, "chat_use_tools")
-                if self.state.s["type"] == "chat"
-                else False,
-            }
-        )
+        updates: dict[str, Any] = {
+            "regenerate_when_batching": extras.get("regenerate_when_batching", False)
+            if extras
+            else False,
+            "chat_use_tools": key_or_config_val(extras, "chat_use_tools")
+            if self.state.s["type"] == "chat"
+            else False,
+        }
+        if self.state.s["type"] == "tts":
+            updates["tts_style"] = (extras.get("tts_style") or "") if extras else ""
+            updates["tts_language"] = (
+                (extras.get("tts_language") or "") if extras else ""
+            )
+        self.state.update(updates)
 
     def on_state_update(self):
         self.model_options.setEnabled(self.state.s["use_custom_model"])
@@ -681,6 +698,7 @@ class PromptDialog(QDialog):
             "tts_source_fields": source_fields,
             "selected_tts_source_field": source_field,
             "tts_style": "",
+            "tts_language": "",
         }
 
     def _on_new_card_type_selected(self, note_type: str) -> None:
@@ -912,27 +930,27 @@ class PromptDialog(QDialog):
             else config.chat_model
         ) or config.chat_model
 
-        tts_provider = (
-            self.tts_options.state.s["tts_provider"]
-            if use_custom_model
-            else config.tts_provider
-        ) or config.tts_provider
-        tts_voice = (
-            self.tts_options.state.s["tts_voice"]
-            if use_custom_model
-            else config.tts_voice
-        ) or config.tts_voice
-        tts_model = (
-            self.tts_options.state.s["tts_model"]
-            if use_custom_model
-            else config.tts_model
-        ) or config.tts_model
+        tts_target: Optional[TTSVoiceTarget] = None
+        tts_provider: Optional[TTSProviders] = None
+        tts_model: Optional[TTSModels] = None
+        tts_voice = ""
+        if self.state.s["type"] == "tts":
+            try:
+                tts_target = self.get_effective_tts_target(
+                    f"{snapshot.note_id}:{self.state.s['selected_note_field'].lower()}"
+                )
+            except ValueError as error:
+                show_message_box(str(error))
+                return
+            tts_provider = cast("TTSProviders", tts_target["provider"])
+            tts_model = cast("TTSModels", tts_target["model"])
+            tts_voice = tts_target["voice"]
 
         if self.state.s["type"] == "chat":
             if not self._ensure_api_key(chat_provider):
                 return
         elif self.state.s["type"] == "tts":
-            if not self._ensure_api_key(tts_provider):
+            if tts_provider is None or not self._ensure_api_key(tts_provider):
                 return
         else:
             image_provider = (
@@ -962,7 +980,7 @@ class PromptDialog(QDialog):
             self.state["is_loading_prompt"] = False
             field_type = self.state.s["type"]
             if field_type == "tts":
-                msg = f"Ran with fields: \n{stringified_vals}.\n Voice: {tts_provider} - {tts_voice}\n\n"
+                msg = f"Ran with fields: \n{stringified_vals}.\n Voice: {tts_provider} - {tts_voice} ({tts_model})\n\n"
                 if arg is not None and isinstance(arg, bytes):
                     play_audio(arg)
                 else:
@@ -1063,11 +1081,18 @@ class PromptDialog(QDialog):
         elif self.state.s["type"] == "tts":
 
             def tts_fn():
-                # Manually inject style for test
+                assert tts_provider is not None and tts_model is not None
                 prompt_to_use = prompt
                 style = self.state.s.get("tts_style")
                 if style and "gemini" in tts_model and tts_provider == "google":
                     prompt_to_use = f"{style} {prompt}"
+                instructions = (
+                    style
+                    if style
+                    and tts_provider == "openai"
+                    and tts_model == "gpt-4o-mini-tts"
+                    else None
+                )
 
                 return self.processor.field_processor.get_tts_response(
                     note_id=snapshot.note_id,
@@ -1079,6 +1104,7 @@ class PromptDialog(QDialog):
                     strip_html=none_defaulting(
                         self.tts_options.state.s, "tts_strip_html", True
                     ),
+                    instructions=instructions,
                 )
 
             run_async_in_background_with_sentry(tts_fn, on_success, on_failure)
@@ -1100,6 +1126,18 @@ class PromptDialog(QDialog):
                 )
 
             run_async_in_background_with_sentry(img_fn, on_success, on_failure)
+
+    def get_effective_tts_target(self, selection_key: str) -> TTSVoiceTarget:
+        pool = (
+            self.tts_options.state.s["tts_voice_pool"]
+            if self.state.s["use_custom_model"]
+            else config.tts_voice_pool
+        )
+        return select_tts_target(
+            pool,
+            language=self.state.s["tts_language"],
+            selection_key=selection_key,
+        )
 
     def _ensure_api_key(self, provider: str) -> bool:
         # Check custom providers first
@@ -1187,6 +1225,13 @@ class PromptDialog(QDialog):
         if not prompt:
             return
 
+        if self.state.s["type"] == "tts":
+            try:
+                self.get_effective_tts_target("validation")
+            except ValueError as error:
+                show_message_box(str(error))
+                return
+
         new_prompts_map = self._create_new_prompts_map()
         logger.debug("Created new prompts map")
         logger.debug(new_prompts_map)
@@ -1221,12 +1266,10 @@ class PromptDialog(QDialog):
     def _create_new_prompts_map(self) -> PromptMap:
         s = self.state.s
 
-        # Inject style into the tts_options that gets passed down
         tts_options = cast(
             "OverrideableTTSOptionsDict",
             {k: self.tts_options.state.s[k] for k in overridable_tts_options},
         )
-        tts_options["tts_style"] = s.get("tts_style")
 
         return add_or_update_prompts(
             prompts_map=self.prompts_map,
@@ -1238,6 +1281,8 @@ class PromptDialog(QDialog):
             is_custom_model=s["use_custom_model"],
             type=s["type"],
             tts_options=tts_options,
+            tts_style=s.get("tts_style"),
+            tts_language=s.get("tts_language"),
             chat_options={
                 k: self.chat_options.state.s[k] for k in overridable_chat_options
             },

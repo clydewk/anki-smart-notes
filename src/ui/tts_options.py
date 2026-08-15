@@ -24,6 +24,7 @@ from aqt import (
     QAbstractListModel,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QItemSelection,
     QItemSelectionModel,
     QLabel,
@@ -33,6 +34,8 @@ from aqt import (
     QSizePolicy,
     QSpacerItem,
     Qt,
+    QTableWidget,
+    QTableWidgetItem,
     QTimer,
     QVBoxLayout,
     QWidget,
@@ -44,7 +47,9 @@ from ..models import (
     OverrideableTTSOptionsDict,
     TTSModels,
     TTSProviders,
-    overridable_tts_options,
+    TTSVoiceTarget,
+    make_tts_voice_target,
+    normalize_tts_voice_pool,
 )
 from ..sentry import run_async_in_background_with_sentry
 from ..tts_provider import TTSProvider
@@ -107,12 +112,12 @@ class TTSState(TypedDict):
     models: list[str]
     selected_filter_model: str
 
-    voice: str
+    # Current catalog selection. Persisted TTS configuration is the pool below.
+    catalog_provider: TTSProviders
+    catalog_voice: str
+    catalog_model: TTSModels
 
-    # These are the actual values read from and written to config
-    tts_provider: TTSProviders
-    tts_voice: str
-    tts_model: TTSModels
+    tts_voice_pool: list[TTSVoiceTarget]
     tts_strip_html: bool
 
     test_text: str
@@ -457,7 +462,7 @@ class SelectedVoiceLabel(QLabel):
         self.update_text(meta)
 
     def update_text(self, meta: TTSMeta):
-        self.setText(f" Current voice: {format_voice(meta)}")
+        self.setText(f" Selected voice: {format_voice(meta)}")
         self.setFont(font_small)
 
 
@@ -591,7 +596,19 @@ class TTSOptions(QWidget):
         top_row_layout.addWidget(self.render_filters())
         top_row_layout.addWidget(self.render_voices_list())
 
-        layout.addWidget(self.selected_voice_label)
+        layout.addWidget(self.render_voice_pool())
+        layout.addSpacerItem(QSpacerItem(0, 12))
+
+        selected_row = QWidget()
+        selected_row_layout = QHBoxLayout()
+        selected_row_layout.setContentsMargins(0, 0, 0, 0)
+        selected_row.setLayout(selected_row_layout)
+        selected_row_layout.addWidget(self.selected_voice_label)
+        selected_row_layout.addStretch()
+        self.add_voice_button = QPushButton("Add to Pool")
+        self.add_voice_button.clicked.connect(self.add_selected_voice)
+        selected_row_layout.addWidget(self.add_voice_button)
+        layout.addWidget(selected_row)
         layout.addWidget(self.render_fish_voice())
         layout.addSpacerItem(QSpacerItem(0, 12))
         layout.addWidget(top_row)
@@ -610,15 +627,49 @@ class TTSOptions(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
 
+    def render_voice_pool(self) -> QWidget:
+        box = QGroupBox("🎙️ Active Voice Pool")
+        layout = QVBoxLayout()
+        box.setLayout(layout)
+
+        description = QLabel(
+            "Each note deterministically uses one enabled voice. Language is optional; blank voices are eligible for every language."
+        )
+        description.setWordWrap(True)
+        description.setFont(font_small)
+        layout.addWidget(description)
+
+        self.pool_table = QTableWidget(0, 5)
+        self.pool_table.setHorizontalHeaderLabels(
+            ["Active", "Voice", "Provider", "Model", "Language"]
+        )
+        header = self.pool_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.pool_table.verticalHeader().setVisible(False)
+        self.pool_table.itemChanged.connect(self.pool_item_changed)
+        layout.addWidget(self.pool_table)
+
+        controls = QHBoxLayout()
+        controls.addStretch()
+        remove_button = QPushButton("Remove Selected")
+        remove_button.clicked.connect(self.remove_selected_voice)
+        controls.addWidget(remove_button)
+        layout.addLayout(controls)
+        return box
+
     def render_fish_voice(self) -> QWidget:
         self.fish_voice_box = QGroupBox("🐟 Fish Audio Voice")
         layout = default_form_layout()
         self.fish_voice_box.setLayout(layout)
 
-        voice_id = ReactiveLineEdit(self.state, "tts_voice")
+        voice_id = ReactiveLineEdit(self.state, "catalog_voice")
         voice_id.setPlaceholderText("Fish Audio voice model ID")
         voice_id.on_change.connect(
-            lambda value: self.state.update({"tts_voice": value, "voice": value})
+            lambda value: self.state.update({"catalog_voice": value})
         )
         layout.addRow("Voice model ID:", voice_id)
 
@@ -705,17 +756,18 @@ class TTSOptions(QWidget):
             selected_index = indexes[0]
             selected_voice = self.voices_models.get_data()[selected_index.row()]
             logger.debug(f"Selected voice: {selected_voice}")
-            current_provider = self.state.s["tts_provider"]
+            current_provider = self.state.s["catalog_provider"]
             voice = selected_voice["voice"]
             if selected_voice["tts_provider"] == "fish":
-                voice = self.state.s["tts_voice"] if current_provider == "fish" else ""
+                voice = (
+                    self.state.s["catalog_voice"] if current_provider == "fish" else ""
+                )
 
             self.state.update(
                 {
-                    "voice": voice,
-                    "tts_provider": selected_voice["tts_provider"],
-                    "tts_voice": voice,
-                    "tts_model": selected_voice["model"],
+                    "catalog_provider": selected_voice["tts_provider"],
+                    "catalog_voice": voice,
+                    "catalog_model": selected_voice["model"],
                 }
             )
             # TODO: do I need to call this?
@@ -724,15 +776,23 @@ class TTSOptions(QWidget):
 
     def update_ui(self) -> None:
         self.update_list_ui()
-        self.fish_voice_box.setVisible(self.state.s["tts_provider"] == "fish")
-        self.test_button.setEnabled(self.state.s["test_enabled"])
+        self.render_pool_rows()
+        is_fish = self.state.s["catalog_provider"] == "fish"
+        self.fish_voice_box.setVisible(is_fish)
+        has_selection = bool(
+            self.state.s["catalog_provider"]
+            and self.state.s["catalog_model"]
+            and self.state.s["catalog_voice"]
+        )
+        self.add_voice_button.setEnabled(has_selection)
+        self.test_button.setEnabled(self.state.s["test_enabled"] and has_selection)
 
     def update_list_ui(self) -> None:
         """Handle updating the list and preserving selection"""
         # Store the selection state
-        voice = self.state.s.get("tts_voice")
-        provider = self.state.s.get("tts_provider")
-        model = self.state.s.get("tts_model")
+        voice = self.state.s.get("catalog_voice")
+        provider = self.state.s.get("catalog_provider")
+        model = self.state.s.get("catalog_model")
         if not provider or (provider != "fish" and not voice):
             return
 
@@ -771,11 +831,105 @@ class TTSOptions(QWidget):
                 QItemSelectionModel.SelectionFlag.Select,
             )
 
+    def render_pool_rows(self) -> None:
+        selected_row = self.pool_table.currentRow()
+        self.pool_table.blockSignals(True)
+        pool = self.state.s["tts_voice_pool"]
+        self.pool_table.setRowCount(len(pool))
+        for row, target in enumerate(pool):
+            active = QTableWidgetItem()
+            active.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            active.setCheckState(
+                Qt.CheckState.Checked if target["enabled"] else Qt.CheckState.Unchecked
+            )
+            self.pool_table.setItem(row, 0, active)
+
+            values = [
+                target["voice"],
+                TTS_PROVIDER_LABELS.get(target["provider"], target["provider"]),
+                target["model"],
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.pool_table.setItem(row, column, item)
+
+            language = QTableWidgetItem(target.get("language") or "")
+            language.setToolTip(
+                "Optional language tag or name, e.g. ja, en-US, Japanese"
+            )
+            self.pool_table.setItem(row, 4, language)
+        if pool and selected_row >= 0:
+            self.pool_table.selectRow(min(selected_row, len(pool) - 1))
+        self.pool_table.blockSignals(False)
+
+    def pool_item_changed(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        pool = self.state.s["tts_voice_pool"]
+        if row < 0 or row >= len(pool):
+            return
+        target = pool[row].copy()
+        if item.column() == 0:
+            target["enabled"] = item.checkState() == Qt.CheckState.Checked
+        elif item.column() == 4:
+            target["language"] = item.text().strip() or None
+        else:
+            return
+        pool[row] = cast("TTSVoiceTarget", target)
+        self.state.update({"tts_voice_pool": pool})
+
+    def add_selected_voice(self) -> None:
+        provider = self.state.s["catalog_provider"]
+        model = self.state.s["catalog_model"]
+        voice = self.state.s["catalog_voice"].strip()
+        if not voice:
+            return
+
+        meta = next(
+            (
+                item
+                for item in voices
+                if item["tts_provider"] == provider
+                and item["model"] == model
+                and (provider == "fish" or item["voice"] == voice)
+            ),
+            None,
+        )
+        language: Optional[str] = None
+        if meta and meta["language"] != ALL:
+            if provider in ("google", "azure") and len(voice.split("-")) >= 2:
+                language = "-".join(voice.split("-")[:2])
+            else:
+                language = meta["language"]
+
+        target = make_tts_voice_target(provider, model, voice, language=language)
+        if not target:
+            return
+        pool = self.state.s["tts_voice_pool"]
+        if target in pool:
+            show_message_box("That voice is already in the active pool.")
+            return
+        pool.append(target)
+        self.state.update({"tts_voice_pool": pool})
+        self.pool_table.selectRow(len(pool) - 1)
+
         if provider == "elevenLabs" and not config.did_show_premium_tts_dialog:
             show_message_box(
-                "Heads up: you've selected a premium voice. These voices are extremely high quality and can exhaust a small plan extremely quickly!"
+                "Heads up: ElevenLabs voices are premium and can exhaust a small plan quickly."
             )
             config.did_show_premium_tts_dialog = True
+
+    def remove_selected_voice(self) -> None:
+        row = self.pool_table.currentRow()
+        pool = self.state.s["tts_voice_pool"]
+        if row < 0 or row >= len(pool):
+            return
+        pool.pop(row)
+        self.state.update({"tts_voice_pool": pool})
 
     def render_test_voice(self) -> QWidget:
         self.test_voice_box = QGroupBox("🔈Test Voice")
@@ -806,9 +960,9 @@ class TTSOptions(QWidget):
             play_audio(audio)
             self.state.update({"test_enabled": True})
 
-        provider = self.state.s["tts_provider"]
-        voice = self.state.s["tts_voice"]
-        model = self.state.s["tts_model"]
+        provider = self.state.s["catalog_provider"]
+        voice = self.state.s["catalog_voice"]
+        model = self.state.s["catalog_model"]
         if not (provider and voice and model):
             return
 
@@ -894,21 +1048,35 @@ class TTSOptions(QWidget):
     def get_initial_state(
         self, tts_options: Optional[OverrideableTTSOptionsDict]
     ) -> TTSState:
-        ret = {
+        pool = normalize_tts_voice_pool(
+            key_or_config_val(tts_options, "tts_voice_pool")
+        )
+        selected_target = next(
+            (target for target in pool if target["enabled"]), pool[0] if pool else None
+        )
+        return {
             "providers": providers,
             "selected_provider": ALL,
-            "voice": config.tts_voice,
             "genders": [ALL, "Male", "Female"],
             "selected_gender": ALL,
             "languages": languages,
             "selected_language": ALL,
             "models": [ALL] + sorted({v["model"] for v in voices}),
             "selected_filter_model": ALL,
+            "catalog_provider": cast(
+                "TTSProviders",
+                selected_target["provider"] if selected_target else config.tts_provider,
+            ),
+            "catalog_voice": selected_target["voice"]
+            if selected_target
+            else config.tts_voice,
+            "catalog_model": cast(
+                "TTSModels",
+                selected_target["model"] if selected_target else config.tts_model,
+            ),
+            "tts_voice_pool": pool,
+            "tts_strip_html": key_or_config_val(tts_options, "tts_strip_html"),
             "test_text": default_texts[ALL],
             "test_enabled": True,
             "search_text": "",
         }
-
-        for k in overridable_tts_options:
-            ret[k] = key_or_config_val(tts_options, k)
-        return cast("TTSState", ret)

@@ -279,6 +279,15 @@ OpenAIVoices = Literal[
 
 ElevenVoices = Literal["male-1", "male-2", "female-1", "female-2"]
 
+
+class TTSVoiceTarget(TypedDict):
+    provider: str
+    model: str
+    voice: str
+    language: Optional[str]
+    enabled: bool
+
+
 SmartFieldType = Literal["chat", "tts", "image"]
 
 # Image Models
@@ -314,11 +323,14 @@ class FieldExtras(TypedDict):
     chat_use_tools: Optional[bool]
 
     # TTS
+    tts_voice_pool: Optional[list[TTSVoiceTarget]]
+    tts_language: Optional[str]
+    tts_strip_html: Optional[bool]
+    tts_style: Optional[str]
+    # Legacy single-voice settings retained for import/migration compatibility.
     tts_provider: Optional[TTSProviders]
     tts_model: Optional[TTSModels]
     tts_voice: Optional[str]
-    tts_strip_html: Optional[bool]
-    tts_style: Optional[str]
 
     # Images
     image_provider: Optional[ImageProviders]
@@ -342,12 +354,15 @@ DEFAULT_EXTRAS: FieldExtras = {
     "chat_temperature": None,
     "chat_reasoning_effort": None,
     "chat_use_tools": None,
-    # Overridable TTS Options
+    # TTS Options
+    "tts_voice_pool": None,
+    "tts_language": None,
+    "tts_strip_html": None,
+    "tts_style": None,
+    # Legacy single-voice settings.
     "tts_model": None,
     "tts_provider": None,
     "tts_voice": None,
-    "tts_strip_html": None,
-    "tts_style": None,
     # Overridable Image Options
     "image_provider": None,
     "image_model": None,
@@ -447,6 +462,53 @@ def normalize_built_in_tools_config(
     return cast("BuiltInToolsConfig", normalized)
 
 
+def make_tts_voice_target(
+    provider: object,
+    model: object,
+    voice: object,
+    *,
+    language: Optional[str] = None,
+    enabled: bool = True,
+) -> Optional[TTSVoiceTarget]:
+    if not all(
+        isinstance(value, str) and value.strip() for value in (provider, model, voice)
+    ):
+        return None
+    return {
+        "provider": cast("str", provider).strip(),
+        "model": cast("str", model).strip(),
+        "voice": cast("str", voice).strip(),
+        "language": language.strip()
+        if isinstance(language, str) and language.strip()
+        else None,
+        "enabled": enabled,
+    }
+
+
+def normalize_tts_voice_pool(value: object) -> list[TTSVoiceTarget]:
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[TTSVoiceTarget] = []
+    for raw_target in value:
+        if not isinstance(raw_target, dict):
+            continue
+        target = make_tts_voice_target(
+            raw_target.get("provider"),
+            raw_target.get("model"),
+            raw_target.get("voice"),
+            language=raw_target.get("language")
+            if isinstance(raw_target.get("language"), str)
+            else None,
+            enabled=raw_target.get("enabled", True)
+            if isinstance(raw_target.get("enabled", True), bool)
+            else True,
+        )
+        if target:
+            normalized.append(target)
+    return normalized
+
+
 def normalize_field_extras(
     extras: Optional[Union[dict[str, Any], FieldExtras]],
 ) -> FieldExtras:
@@ -463,23 +525,34 @@ def normalize_field_extras(
         if key in raw_extras:
             normalized[key] = raw_extras[key]
 
+    if raw_extras.get("tts_voice_pool") is not None:
+        normalized["tts_voice_pool"] = normalize_tts_voice_pool(
+            raw_extras["tts_voice_pool"]
+        )
+    elif (
+        raw_extras.get("use_custom_model")
+        and raw_extras.get("tts_provider")
+        and raw_extras.get("tts_model")
+        and raw_extras.get("tts_voice")
+    ):
+        legacy_target = make_tts_voice_target(
+            raw_extras["tts_provider"],
+            raw_extras["tts_model"],
+            raw_extras["tts_voice"],
+        )
+        normalized["tts_voice_pool"] = [legacy_target] if legacy_target else None
+
     return normalized
 
 
 OverridableTTSOptions = Union[
-    Literal["tts_model"],
-    Literal["tts_provider"],
-    Literal["tts_voice"],
+    Literal["tts_voice_pool"],
     Literal["tts_strip_html"],
-    Literal["tts_style"],
 ]
 
 overridable_tts_options: list[OverridableTTSOptions] = [
-    "tts_model",
-    "tts_provider",
-    "tts_voice",
+    "tts_voice_pool",
     "tts_strip_html",
-    "tts_style",
 ]
 
 
@@ -505,11 +578,8 @@ class ProviderSettings(TypedDict):
 
 
 class OverrideableTTSOptionsDict(TypedDict):
-    tts_model: Optional[TTSModels]
-    tts_provider: Optional[TTSProviders]
-    tts_voice: Optional[str]
+    tts_voice_pool: Optional[list[TTSVoiceTarget]]
     tts_strip_html: Optional[bool]
-    tts_style: Optional[str]
 
 
 OverridableImageOptions = Union[

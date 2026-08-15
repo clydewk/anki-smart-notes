@@ -180,6 +180,8 @@ def add_or_update_prompts(
     is_custom_model: bool,
     type: SmartFieldType,
     tts_options: OverrideableTTSOptionsDict,
+    tts_style: Optional[str],
+    tts_language: Optional[str],
     chat_options: dict[OverridableChatOptions, Any],
     image_options: dict[OverridableImageOptions, Any],
     chat_use_tools: Optional[bool],
@@ -221,6 +223,8 @@ def add_or_update_prompts(
     extras["automatic"] = is_automatic
     extras["use_custom_model"] = is_custom_model
     extras["chat_use_tools"] = chat_use_tools if type == "chat" else None
+    extras["tts_style"] = tts_style if type == "tts" else None
+    extras["tts_language"] = tts_language if type == "tts" else None
 
     # If we're doing custom settings, write out extra config
     if is_custom_model:
@@ -240,18 +244,17 @@ def add_or_update_prompts(
 
     # Otherwise need to delete any custom config if it's not being used
     else:
-        # Special handling for tts_style which is always per-field
-        if tts_options.get("tts_style") is not None:
-            extras["tts_style"] = tts_options["tts_style"]
-
         for k in (
             overridable_chat_options
             + overridable_tts_options
             + overridable_image_options
         ):
-            if k == "tts_style":
-                continue
             extras[k] = None
+
+    if type == "tts":
+        extras["tts_provider"] = None
+        extras["tts_model"] = None
+        extras["tts_voice"] = None
 
     # Regenerate field during batch processing if requested
     extras["regenerate_when_batching"] = regenerate_when_batching

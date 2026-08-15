@@ -17,7 +17,7 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import pytest
 
@@ -25,8 +25,8 @@ from tests.mocks import MockConfig, MockNote
 
 if TYPE_CHECKING:
     from src.models import (
-        OverridableChatOptionsDict,
-        OverridableImageOptionsDict,
+        OverridableChatOptions,
+        OverridableImageOptions,
         OverrideableTTSOptionsDict,
         PromptMap,
     )
@@ -159,18 +159,83 @@ def test_add_or_update_prompts_persists_chat_use_tools() -> None:
         tts_options=cast(
             "OverrideableTTSOptionsDict",
             {
-                "tts_model": None,
-                "tts_provider": None,
-                "tts_voice": None,
+                "tts_voice_pool": None,
                 "tts_strip_html": None,
-                "tts_style": None,
             },
         ),
-        chat_options=cast("OverridableChatOptionsDict", {}),
-        image_options=cast("OverridableImageOptionsDict", {}),
+        tts_style=None,
+        tts_language=None,
+        chat_options=cast("dict[OverridableChatOptions, Any]", {}),
+        image_options=cast("dict[OverridableImageOptions, Any]", {}),
         chat_use_tools=True,
         regenerate_when_batching=False,
     )
 
     extras = updated["note_types"]["Basic"]["1"]["extras"]["Back"]
     assert extras["chat_use_tools"] is True
+
+
+def test_tts_language_is_independent_of_voice_pool_override() -> None:
+    from src.prompts import add_or_update_prompts
+
+    pool = [
+        {
+            "provider": "fish",
+            "model": "s2.1-pro-free",
+            "voice": "voice-id",
+            "language": "ja",
+            "enabled": True,
+        }
+    ]
+    updated = add_or_update_prompts(
+        prompts_map=cast("PromptMap", {"note_types": {}}),
+        note_type="Basic",
+        deck_id=1,
+        field="Audio",
+        prompt="{{Front}}",
+        is_automatic=True,
+        is_custom_model=False,
+        type="tts",
+        tts_options=cast(
+            "OverrideableTTSOptionsDict",
+            {"tts_voice_pool": pool, "tts_strip_html": True},
+        ),
+        tts_style="Warm",
+        tts_language="Japanese",
+        chat_options=cast("dict[OverridableChatOptions, Any]", {}),
+        image_options=cast("dict[OverridableImageOptions, Any]", {}),
+        chat_use_tools=None,
+        regenerate_when_batching=False,
+    )
+
+    extras = updated["note_types"]["Basic"]["1"]["extras"]["Audio"]
+    assert extras["tts_language"] == "Japanese"
+    assert extras["tts_style"] == "Warm"
+    assert extras["tts_voice_pool"] is None
+    assert extras["tts_provider"] is None
+    assert extras["tts_model"] is None
+    assert extras["tts_voice"] is None
+
+    overridden = add_or_update_prompts(
+        prompts_map=cast("PromptMap", {"note_types": {}}),
+        note_type="Basic",
+        deck_id=1,
+        field="Audio",
+        prompt="{{Front}}",
+        is_automatic=True,
+        is_custom_model=True,
+        type="tts",
+        tts_options=cast(
+            "OverrideableTTSOptionsDict",
+            {"tts_voice_pool": pool, "tts_strip_html": True},
+        ),
+        tts_style=None,
+        tts_language="Japanese",
+        chat_options=cast("dict[OverridableChatOptions, Any]", {}),
+        image_options=cast("dict[OverridableImageOptions, Any]", {}),
+        chat_use_tools=None,
+        regenerate_when_batching=False,
+    )
+    override_extras = overridden["note_types"]["Basic"]["1"]["extras"]["Audio"]
+    assert override_extras["tts_voice_pool"] == pool
+    assert override_extras["tts_strip_html"] is True

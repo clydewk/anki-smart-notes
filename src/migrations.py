@@ -23,7 +23,12 @@ from typing import Literal, TypedDict, Union
 from .config import config
 from .constants import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER
 from .logger import logger
-from .models import is_available_openai_chat_model, provider_model_map
+from .models import (
+    TTSVoiceTarget,
+    is_available_openai_chat_model,
+    normalize_tts_voice_pool,
+    provider_model_map,
+)
 
 ModelType = Literal["chat", "tts"]
 
@@ -58,6 +63,18 @@ migration_map: dict[str, Union[dict[str, str], TTSMigrations]] = {
 }
 
 
+def migrate_tts_voice_pool(
+    pool: object,
+    model_migrations: dict[str, str],
+    voice_migrations: dict[str, str],
+) -> list[TTSVoiceTarget]:
+    migrated = normalize_tts_voice_pool(pool)
+    for target in migrated:
+        target["model"] = model_migrations.get(target["model"], target["model"])
+        target["voice"] = voice_migrations.get(target["voice"], target["voice"])
+    return migrated
+
+
 def migrate_models() -> None:
     logger.info("Migrating models...")
 
@@ -86,6 +103,12 @@ def migrate_models() -> None:
         if config.tts_voice == old_voice:
             logger.debug(f"TTS voice migration: {old_voice} -> {new_voice}")
             config.tts_voice = new_voice  # type: ignore
+
+    config.tts_voice_pool = migrate_tts_voice_pool(
+        config.tts_voice_pool,
+        tts_model_migration_map,
+        tts_voice_migration_map,
+    )
 
     # Set defaults for chat
     valid_models = {
@@ -136,6 +159,13 @@ def migrate_models() -> None:
                         f"Custom TTS voice migration: {tts_voice} -> {new_voice}"
                     )
                     extras["tts_voice"] = new_voice  # type: ignore
+
+                if extras.get("tts_voice_pool") is not None:
+                    extras["tts_voice_pool"] = migrate_tts_voice_pool(  # type: ignore
+                        extras["tts_voice_pool"],
+                        tts_model_migration_map,
+                        tts_voice_migration_map,
+                    )
 
     config.prompts_map = prompts_map
     logger.info("Models migration completed.")

@@ -45,8 +45,11 @@ from .models import (
     ProviderSettings,
     TTSModels,
     TTSProviders,
+    TTSVoiceTarget,
+    make_tts_voice_target,
     normalize_built_in_tools_config,
     normalize_field_extras,
+    normalize_tts_voice_pool,
 )
 from .ui.rate_dialog import RateDialog
 from .utils import USES_BEFORE_RATE_DIALOG, get_file_path
@@ -90,10 +93,12 @@ class Config:
     chat_use_tools: bool
 
     # TTS
+    tts_voice_pool: list[TTSVoiceTarget]
+    tts_strip_html: bool
+    # Legacy single-voice settings retained for migration compatibility.
     tts_provider: TTSProviders
     tts_voice: str
     tts_model: TTSModels
-    tts_strip_html: bool
 
     # Images
     image_provider: ImageProviders
@@ -108,6 +113,7 @@ class Config:
     did_show_rate_dialog: bool
     did_show_premium_tts_dialog: bool
     did_deck_filter_migration: bool
+    did_migrate_tts_voice_pool: bool
     did_cleanup_config_defaults: bool
     did_click_rate_link: bool
 
@@ -121,6 +127,7 @@ class Config:
     def setup_config(self) -> None:
         try:
             self.perform_deck_filter_migration()
+            self.perform_tts_voice_pool_migration()
             self.perform_extras_cleanup()
 
         except Exception as e:
@@ -185,6 +192,34 @@ class Config:
 
         self.did_deck_filter_migration = True
 
+    def perform_tts_voice_pool_migration(self) -> None:
+        if self.did_migrate_tts_voice_pool:
+            return
+
+        self._backup_config()
+        legacy_target = make_tts_voice_target(
+            self.tts_provider, self.tts_model, self.tts_voice
+        )
+        self.tts_voice_pool = [legacy_target] if legacy_target else []
+
+        prompts_map = deepcopy(self.prompts_map)
+        for decks_map in prompts_map["note_types"].values():
+            for fields_and_extras in decks_map.values():
+                for extras in fields_and_extras["extras"].values():
+                    if extras.get("tts_voice_pool") is not None or not extras.get(
+                        "use_custom_model"
+                    ):
+                        continue
+                    target = make_tts_voice_target(
+                        extras.get("tts_provider"),
+                        extras.get("tts_model"),
+                        extras.get("tts_voice"),
+                    )
+                    if target:
+                        extras["tts_voice_pool"] = [target]  # type: ignore
+        self.prompts_map = prompts_map
+        self.did_migrate_tts_voice_pool = True
+
     def perform_extras_cleanup(self) -> None:
         """Add new extras"""
         if not self.did_cleanup_config_defaults:
@@ -208,6 +243,14 @@ class Config:
 
         if not isinstance(self.__getattr__("openai_daily_token_budget"), int):
             self.openai_daily_token_budget = 1_000_000
+
+        pool = normalize_tts_voice_pool(self.__getattr__("tts_voice_pool"))
+        if not pool:
+            legacy_target = make_tts_voice_target(
+                self.tts_provider, self.tts_model, self.tts_voice
+            )
+            pool = [legacy_target] if legacy_target else []
+        self.tts_voice_pool = pool
 
         self.built_in_tools = normalize_built_in_tools_config(
             cast("Optional[dict[str, Any]]", self.built_in_tools)

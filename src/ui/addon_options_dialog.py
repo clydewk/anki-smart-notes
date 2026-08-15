@@ -75,6 +75,7 @@ from ..prompt_io import (
 )
 from ..prompts import get_all_prompts, get_extras, get_prompts_for_note, remove_prompt
 from ..sentry import run_async_in_background_with_sentry
+from ..tts_routing import eligible_tts_targets
 from ..utils import get_fields, get_version
 from .chat_options import ChatOptions
 from .custom_provider_dialog import CustomProviderDialog
@@ -1393,24 +1394,10 @@ class AddonOptionsDialog(QDialog):
                 show_message_box("Invalid OpenAI Host", "Please provide a valid URL.")
             return False
 
-        if (
-            self.tts_options.state.s["tts_provider"] == "elevenLabs"
-            and config.tts_provider != "elevenLabs"
-        ):
+        if not eligible_tts_targets(self.tts_options.state.s["tts_voice_pool"]):
             if not silent:
-                did_click_ok = show_message_box(
-                    "Are you sure you want to set your default voice provider to a premium model?",
-                    show_cancel=True,
-                )
-                if not did_click_ok:
-                    return False
-            # If silent (auto-save), we skip the check/dialog to avoid interruption?
-            # Or we strictly don't save if check fails?
-            # For now let's allow saving in silent mode without dialog to avoid annoyance,
-            # assuming user knows what they are doing if they selected it.
-            # OR better: only show dialog if it wasn't already ElevenLabs.
-            # But here we are checking against `config.tts_provider`.
-            pass
+                show_message_box("Enable at least one voice in the default TTS pool.")
+            return False
 
         valid_config_attrs = config.__annotations__.keys()
 

@@ -248,9 +248,16 @@ def commit_processed_notes(
             conflicted.append(result.note_id)
             continue
 
-        for pending_media in result.media:
-            collection.media.write_data(pending_media.filename, pending_media.data)
+        written_media = {
+            pending_media.filename: collection.media.write_data(
+                pending_media.filename,
+                pending_media.data,
+            )
+            for pending_media in result.media
+        }
         for field, value in result.updates.items():
+            for requested_filename, written_filename in written_media.items():
+                value = value.replace(requested_filename, written_filename)
             note[field] = value
 
         notes.append(note)

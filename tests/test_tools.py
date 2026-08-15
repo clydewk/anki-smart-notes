@@ -179,6 +179,75 @@ def test_config_cleanup_migrates_legacy_tools_settings(
     assert extras["chat_use_tools"] is True
 
 
+def test_config_migrates_legacy_tts_voice_to_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_data: dict[str, Any] = {
+        "did_migrate_tts_voice_pool": False,
+        "tts_provider": "fish",
+        "tts_model": "s2.1-pro-free",
+        "tts_voice": "global-voice",
+        "prompts_map": {
+            "note_types": {
+                "Basic": {
+                    "1": {
+                        "fields": {"Audio": "{{Front}}"},
+                        "extras": {
+                            "Audio": {
+                                "use_custom_model": True,
+                                "tts_provider": "openai",
+                                "tts_model": "tts-1",
+                                "tts_voice": "alloy",
+                            }
+                        },
+                    }
+                }
+            }
+        },
+    }
+
+    class FakeAddonManager:
+        def getConfig(self, name: str) -> dict[str, Any]:
+            del name
+            return config_data
+
+        def writeConfig(self, name: str, value: dict[str, Any]) -> None:
+            del name
+            new_value = dict(value)
+            config_data.clear()
+            config_data.update(new_value)
+
+    monkeypatch.setattr(
+        "src.config.mw",
+        SimpleNamespace(addonManager=FakeAddonManager()),
+    )
+    monkeypatch.setattr(Config, "_backup_config", lambda self: None)
+
+    Config().perform_tts_voice_pool_migration()
+
+    assert config_data["tts_voice_pool"] == [
+        {
+            "provider": "fish",
+            "model": "s2.1-pro-free",
+            "voice": "global-voice",
+            "language": None,
+            "enabled": True,
+        }
+    ]
+    assert config_data["prompts_map"]["note_types"]["Basic"]["1"]["extras"]["Audio"][
+        "tts_voice_pool"
+    ] == [
+        {
+            "provider": "openai",
+            "model": "tts-1",
+            "voice": "alloy",
+            "language": None,
+            "enabled": True,
+        }
+    ]
+    assert config_data["did_migrate_tts_voice_pool"] is True
+
+
 def use_collection(
     monkeypatch: pytest.MonkeyPatch,
     collection: FakeCollection,
@@ -584,9 +653,16 @@ async def test_tool_registry_merges_built_in_and_mcp_tools(
             "tts",
             {
                 "tts_strip_html": True,
-                "tts_provider": "openai",
-                "tts_model": "tts-1",
-                "tts_voice": "alloy",
+                "tts_voice_pool": [
+                    {
+                        "provider": "openai",
+                        "model": "tts-1",
+                        "voice": "alloy",
+                        "language": None,
+                        "enabled": True,
+                    }
+                ],
+                "tts_language": None,
                 "tts_style": None,
             },
             "get_tts_response",

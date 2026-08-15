@@ -170,3 +170,40 @@ def test_migrate_tts_voice_custom_prompts(mock_config, mock_logger):
         ]
         == "new_voice_id"
     )
+
+
+def test_migrate_tts_voice_pool_global_and_custom(mock_config, mock_logger):
+    from src.migrations import migrate_models, migration_map
+
+    migration_map["tts"]["models"]["old-model"] = "new-model"  # type: ignore
+    migration_map["tts"]["voices"]["old-pool-voice"] = "new-pool-voice"  # type: ignore
+    target = {
+        "provider": "fish",
+        "model": "old-model",
+        "voice": "old-pool-voice",
+        "language": "ja",
+        "enabled": True,
+    }
+    mock_config.tts_voice_pool = [target]
+    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
+        "tts_voice_pool"
+    ] = [target]
+
+    migrate_models()
+
+    expected = [
+        {
+            "provider": "fish",
+            "model": "new-model",
+            "voice": "new-pool-voice",
+            "language": "ja",
+            "enabled": True,
+        }
+    ]
+    assert mock_config.tts_voice_pool == expected
+    assert (
+        mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
+            "tts_voice_pool"
+        ]
+        == expected
+    )

@@ -22,7 +22,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 # existing patterns in the codebase (making heavy use of inheritance, using StateManager in an adhoc-way, etc)
 
 from collections.abc import Callable
-from typing import Optional, TypedDict
+from typing import TYPE_CHECKING, Optional, TypedDict, cast
 
 from anki.decks import DeckId
 from anki.notes import Note
@@ -47,6 +47,7 @@ from ..note_processor import NoteSnapshot, snapshot_note
 from ..notes import get_note_type, get_valid_fields_for_prompt
 from ..prompts import get_prompts_for_note
 from ..sentry import run_async_in_background_with_sentry
+from ..tts_routing import select_tts_target, tts_audio_extension
 from ..tts_utils import play_audio
 from .chat_options import ChatOptions
 from .image_displayer import ImageDisplayer
@@ -55,6 +56,9 @@ from .reactive_combo_box import ReactiveComboBox
 from .state_manager import StateManager
 from .tts_options import TTSOptions
 from .ui_utils import font_small, show_message_box
+
+if TYPE_CHECKING:
+    from ..models import TTSModels, TTSProviders
 
 
 class CustomPrompt(QDialog):
@@ -358,6 +362,7 @@ class TTSPromptState(TypedDict):
 
 class CustomTTSPrompt(CustomPrompt):
     audio: Optional[bytes] = None
+    audio_extension = "mp3"
 
     def __init__(
         self,
@@ -390,15 +395,25 @@ class CustomTTSPrompt(CustomPrompt):
     def on_generate(self) -> None:
         prompt = self._prompt_window.toPlainText()
         snapshot = self._snapshot()
+        try:
+            target = select_tts_target(
+                self.tts_options.state.s["tts_voice_pool"],
+                language=None,
+                selection_key=f"{snapshot.note_id}:{self._field_upper.lower()}",
+            )
+        except ValueError as error:
+            show_message_box(str(error))
+            return
+        self.audio_extension = tts_audio_extension(target)
 
         async def get_tts_response():
             return await field_processor.get_tts_response(
                 note_id=snapshot.note_id,
                 values=snapshot.lower_values(),
                 input_text=prompt,
-                model=self.tts_options.state.s["tts_model"],
-                provider=self.tts_options.state.s["tts_provider"],
-                voice=self.tts_options.state.s["tts_voice"],
+                model=cast("TTSModels", target["model"]),
+                provider=cast("TTSProviders", target["provider"]),
+                voice=target["voice"],
                 strip_html=True,
             )
 
@@ -432,7 +447,7 @@ class CustomTTSPrompt(CustomPrompt):
     def render_to_text(self) -> Optional[str]:
         if not self.audio:
             return None
-        file_name = get_media_path(self._note, self._field_upper, "mp3")
+        file_name = get_media_path(self._note, self._field_upper, self.audio_extension)
         path = write_media(file_name, self.audio)
         return f"[sound: {path}]"
 

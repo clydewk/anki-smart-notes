@@ -32,6 +32,7 @@ class MockConfig:
     chat_reasoning_effort: Any = None
     chat_markdown_to_html: bool = False
     chat_use_tools: bool = False
+    tts_voice_pool: Any = None
     tts_provider: str = "openai"
     tts_voice: str = "alloy"
     tts_model: str = "tts-1"
@@ -59,6 +60,7 @@ class MockConfig:
     auth_token: str = ""
     uuid: str = "test-uuid-12345"
     debug: bool = True
+    did_migrate_tts_voice_pool: bool = True
 
     def __getattr__(self, name: str) -> Any:
         return object.__getattribute__(self, name)

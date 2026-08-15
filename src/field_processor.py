@@ -19,7 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, cast
 
 from anki.decks import DeckId
 
@@ -55,6 +55,7 @@ from .models import (
     SmartFieldType,
     TTSModels,
     TTSProviders,
+    TTSVoiceTarget,
     normalize_built_in_tools_config,
 )
 from .nodes import FieldNode
@@ -62,6 +63,7 @@ from .note_processor import PendingMedia, ResolvedField
 from .prompts import get_extras, interpolate_prompt_with_values
 from .tool_registry import ToolRegistry
 from .tts_provider import TTSProvider, tts_provider
+from .tts_routing import select_tts_target, tts_audio_extension
 from .ui.ui_utils import show_message_box
 from .utils import run_on_main
 
@@ -109,10 +111,15 @@ class FieldProcessor:
 
         if field_type == "tts":
             should_strip_html: bool = key_or_config_val(extras, "tts_strip_html")
-            tts_provider: TTSProviders = key_or_config_val(extras, "tts_provider")
-            tts_model: TTSModels = key_or_config_val(extras, "tts_model")
-            voice: str = key_or_config_val(extras, "tts_voice")
-            style: Optional[str] = key_or_config_val(extras, "tts_style")
+            pool: list[TTSVoiceTarget] = key_or_config_val(extras, "tts_voice_pool")
+            target = select_tts_target(
+                pool,
+                language=extras.get("tts_language"),
+                selection_key=f"{note_id}:{node.field.lower()}",
+            )
+            tts_provider = cast("TTSProviders", target["provider"])
+            tts_model = cast("TTSModels", target["model"])
+            style = extras.get("tts_style")
 
             if style and tts_provider == "google" and "gemini" in tts_model:
                 input_text = f"{style} {input_text}"
@@ -127,7 +134,7 @@ class FieldProcessor:
                 values=values,
                 input_text=input_text,
                 model=tts_model,
-                voice=voice,
+                voice=target["voice"],
                 provider=tts_provider,
                 strip_html=should_strip_html,
                 show_error_box=show_error_box,
@@ -136,9 +143,7 @@ class FieldProcessor:
             if not data:
                 return ResolvedField(None)
 
-            extension = (
-                "wav" if tts_provider == "google" and "gemini" in tts_model else "mp3"
-            )
+            extension = tts_audio_extension(target)
             filename = build_media_filename(
                 note_type,
                 note_id,

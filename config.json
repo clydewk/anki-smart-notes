@@ -11,6 +11,15 @@
   "chat_temperature": 1,
   "chat_reasoning_effort": null,
   "chat_use_tools": false,
+  "tts_voice_pool": [
+    {
+      "provider": "google",
+      "model": "standard",
+      "voice": "en-US-Casual-K",
+      "language": null,
+      "enabled": true
+    }
+  ],
   "tts_provider": "google",
   "tts_voice": "en-US-Casual-K",
   "tts_model": "standard",
@@ -45,6 +54,7 @@
   "did_show_chained_error_dialog": false,
   "did_show_premium_tts_dialog": false,
   "did_deck_filter_migration": false,
+  "did_migrate_tts_voice_pool": false,
   "chat_markdown_to_html": true,
   "tts_strip_html": true,
   "did_click_rate_link": false,

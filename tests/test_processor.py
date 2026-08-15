@@ -20,7 +20,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 import sys
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -790,18 +790,23 @@ class CommitNote:
 
 
 class CommitMedia:
-    def __init__(self) -> None:
+    def __init__(self, written_names: Optional[dict[str, str]] = None) -> None:
         self.writes: list[tuple[str, bytes]] = []
+        self.written_names = written_names or {}
 
     def write_data(self, filename: str, data: bytes) -> str:
         self.writes.append((filename, data))
-        return filename
+        return self.written_names.get(filename, filename)
 
 
 class CommitCollection:
-    def __init__(self, note: CommitNote) -> None:
+    def __init__(
+        self,
+        note: CommitNote,
+        written_names: Optional[dict[str, str]] = None,
+    ) -> None:
         self.note = note
-        self.media = CommitMedia()
+        self.media = CommitMedia(written_names)
         self.updated_notes: list[CommitNote] = []
         self.changes = object()
 
@@ -839,6 +844,39 @@ def test_commit_processed_notes_applies_unchanged_result() -> None:
     }
     assert collection.media.writes == [("generated.mp3", b"audio")]
     assert collection.updated_notes == [note]
+
+
+def test_commit_processed_notes_uses_written_media_filenames() -> None:
+    from src.note_processor import PendingMedia, ProcessedNote, commit_processed_notes
+
+    note = CommitNote(1, {"Audio": "", "Image": ""})
+    collection = CommitCollection(
+        note,
+        {
+            "Animecards-audio.wav": "animecards-audio.wav",
+            "Animecards-image.webp": "Animecards-image-1.webp",
+        },
+    )
+    result = ProcessedNote(
+        note_id=1,
+        original_values={"Audio": "", "Image": ""},
+        updates={
+            "Audio": "[sound:Animecards-audio.wav]",
+            "Image": '<img src="Animecards-image.webp"/>',
+        },
+        media=[
+            PendingMedia("Animecards-audio.wav", b"audio"),
+            PendingMedia("Animecards-image.webp", b"image"),
+        ],
+        field_failures=[],
+    )
+
+    commit_processed_notes(collection, [result])
+
+    assert note.fields == {
+        "Audio": "[sound:animecards-audio.wav]",
+        "Image": '<img src="Animecards-image-1.webp"/>',
+    }
 
 
 def test_commit_processed_notes_skips_conflicted_result() -> None:
