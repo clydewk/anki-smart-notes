@@ -43,6 +43,7 @@ class MockConfig:
     image_resolution: Any = None
     image_output_format: Any = None
     image_quality: Any = None
+    image_generation_quality: Any = None
     openai_api_key: str = "test-openai-key"
     anthropic_api_key: str = ""
     deepseek_api_key: str = ""

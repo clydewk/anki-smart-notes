@@ -24,11 +24,13 @@ from aqt import QGroupBox, QLabel, QVBoxLayout, QWidget
 from ..config import config, key_or_config_val
 from ..models import (
     ImageAspectRatio,
+    ImageGenerationQuality,
     ImageModels,
     ImageOutputFormat,
     ImageProviders,
     ImageResolution,
     OverridableImageOptionsDict,
+    image_generation_qualities,
 )
 from .reactive_combo_box import ReactiveComboBox
 from .reactive_spin_box import ReactiveSpinBox
@@ -48,6 +50,8 @@ class State(TypedDict):
     image_output_format: ImageOutputFormat
     image_output_formats: list[ImageOutputFormat]
     image_quality: int
+    image_generation_quality: ImageGenerationQuality
+    image_generation_qualities: list[ImageGenerationQuality]
 
 
 provider_labels = {
@@ -57,11 +61,13 @@ provider_labels = {
 }
 
 model_labels = {
+    "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
+    "gpt-image-2.5-flare": "GPT Image 2.5 Flare",
     "flux-schnell": "Flux Schnell (1x Image Cost)",
     "flux-dev": "Flux Dev (8x Image Cost)",
     "gemini-3-pro-image-preview": "Google Gemini 3 Pro (Image Preview)",
     "gpt-image-2": "GPT Image 2",
-    "gpt-image-1.5": "GPT Image 1.5 (SOTA)",
+    "gpt-image-1.5": "GPT Image 1.5",
     "gpt-image-1": "GPT Image 1",
     "gpt-image-1-mini": "GPT Image 1 Mini (Cost Effective)",
     "dall-e-3": "DALL·E 3 (Deprecated)",
@@ -71,6 +77,8 @@ provider_models: dict[ImageProviders, list[ImageModels]] = {
     "replicate": ["flux-schnell", "flux-dev"],
     "google": ["gemini-3-pro-image-preview"],
     "openai": [
+        "gpt-image-2.5-flare",
+        "gpt-image-2.5-sunburst",
         "gpt-image-2",
         "gpt-image-1.5",
         "gpt-image-1",
@@ -140,11 +148,17 @@ class ImageOptions(QWidget):
                 "image_output_format": format,
                 "image_output_formats": output_formats,
                 "image_quality": int(quality),
+                "image_generation_quality": key_or_config_val(
+                    image_options or {}, "image_generation_quality"
+                )
+                or "auto",
+                "image_generation_qualities": image_generation_qualities(model),
             }
         )
 
         self._setup_ui()
         self._on_format_change(format)
+        self._on_model_change(model)
 
     def refresh_custom_providers(self) -> None:
         # Reset to base state
@@ -232,6 +246,21 @@ class ImageOptions(QWidget):
             model_labels,
         )
         self.model_picker.setMaximumWidth(300)
+        self.model_picker.on_change.connect(self._on_model_change)
+        self.generation_quality_picker = ReactiveComboBox(
+            self.state,
+            "image_generation_qualities",
+            "image_generation_quality",
+            {
+                "auto": "Auto",
+                "low": "Low",
+                "medium": "Medium",
+                "high": "High",
+                "xhigh": "Extra High",
+                "max": "Maximum",
+            },
+        )
+        self.generation_quality_label = QLabel("Rendering Quality:")
 
         self.ratio_picker = ReactiveComboBox(
             self.state,
@@ -260,7 +289,7 @@ class ImageOptions(QWidget):
         self.quality_spinner.setRange(1, 100)
         self.quality_spinner.setSuffix("%")
 
-        self.quality_label = QLabel("Quality:")
+        self.quality_label = QLabel("Compression Quality:")
 
         box = QGroupBox("🖼️ Image Model Settings")
         layout = QVBoxLayout()
@@ -270,6 +299,7 @@ class ImageOptions(QWidget):
 
         box_layout.addRow("Provider:", self.provider_picker)
         box_layout.addRow("Model:", self.model_picker)
+        box_layout.addRow(self.generation_quality_label, self.generation_quality_picker)
         box_layout.addRow("Aspect Ratio:", self.ratio_picker)
         box_layout.addRow("Resolution:", self.resolution_picker)
         box_layout.addRow("Output Format:", self.format_picker)
@@ -286,6 +316,19 @@ class ImageOptions(QWidget):
         current_model = self.state.s["image_model"]
         if current_model not in models:
             self.state.update({"image_model": models[0]})
+        self._on_model_change(self.state.s["image_model"])
+
+    def _on_model_change(self, model: str) -> None:
+        qualities = image_generation_qualities(model)
+        quality = self.state.s["image_generation_quality"]
+        self.state.update(
+            {
+                "image_generation_qualities": qualities,
+                "image_generation_quality": quality if quality in qualities else "auto",
+            }
+        )
+        self.generation_quality_picker.setVisible(len(qualities) > 1)
+        self.generation_quality_label.setVisible(len(qualities) > 1)
 
     def _on_format_change(self, format: str) -> None:
         # Show quality only for lossy formats

@@ -8,6 +8,7 @@
   "replicate_api_key": "",
   "chat_provider": "openai",
   "chat_model": "gpt-5.6-sol",
+  "image_generation_quality": "auto",
   "chat_temperature": 1,
   "chat_reasoning_effort": null,
   "chat_use_tools": false,

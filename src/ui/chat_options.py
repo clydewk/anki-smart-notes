@@ -396,6 +396,10 @@ class ChatOptions(QWidget):
             self.state.update({"chat_reasoning_effort": new_effort})
             self._update_provider_settings(provider, reasoning_effort=new_effort)
 
+        self.temperature.setEnabled(
+            self.state.s.get("chat_reasoning_effort") in {None, "none"}
+        )
+
     def _on_reasoning_effort_change(self, effort: Optional[str]) -> None:
         self.state.update({"chat_reasoning_effort": effort})  # type: ignore
         self._update_provider_settings(

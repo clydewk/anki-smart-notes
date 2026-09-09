@@ -47,6 +47,7 @@ from .models import (
     ChatModels,
     ChatProviders,
     ImageAspectRatio,
+    ImageGenerationQuality,
     ImageModels,
     ImageOutputFormat,
     ImageProviders,
@@ -222,6 +223,9 @@ class FieldProcessor:
                 resolution=resolution,
                 output_format=output_format,
                 quality=quality,
+                generation_quality=key_or_config_val(
+                    extras, "image_generation_quality"
+                ),
                 show_error_box=show_error_box,
             )
             if not data:
@@ -386,6 +390,7 @@ class FieldProcessor:
         resolution: Optional[ImageResolution] = None,
         output_format: Optional[str] = None,
         quality: Optional[int] = None,
+        generation_quality: Optional[ImageGenerationQuality] = None,
         show_error_box: bool = True,
     ) -> Optional[bytes]:
         interpolated_prompt = interpolate_prompt_with_values(
@@ -405,6 +410,7 @@ class FieldProcessor:
             resolution=resolution,
             output_format=output_format,
             quality=quality,
+            generation_quality=generation_quality,
         )
 
         if not raw_bytes:

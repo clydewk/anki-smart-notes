@@ -33,6 +33,7 @@ from .models import (
     ChatProviders,
     CustomProvider,
     ImageAspectRatio,
+    ImageGenerationQuality,
     ImageModels,
     ImageOutputFormat,
     ImageProviders,
@@ -107,6 +108,7 @@ class Config:
     image_resolution: Optional[ImageResolution]
     image_output_format: Optional[ImageOutputFormat]
     image_quality: Optional[int]
+    image_generation_quality: Optional[ImageGenerationQuality]
 
     # Dialogs / Migrations
     did_show_chained_error_dialog: bool

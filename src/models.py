@@ -67,6 +67,9 @@ class OpenAIChatModelSpec:
 
 OPENAI_CHAT_MODEL_CATALOG: tuple[OpenAIChatModelSpec, ...] = (
     OpenAIChatModelSpec(
+        "gpt-6-astra", "GPT-6 Astra", ("low", "medium", "high", "xhigh", "max")
+    ),
+    OpenAIChatModelSpec(
         "gpt-5.6-sol", "GPT-5.6 Sol", OPENAI_REASONING_EFFORTS_WITH_MAX
     ),
     OpenAIChatModelSpec(
@@ -295,6 +298,8 @@ SmartFieldType = Literal["chat", "tts", "image"]
 ReplicateImageModels = Literal["flux-dev", "flux-schnell"]
 GoogleImageModels = Literal["gemini-3-pro-image-preview"]
 OpenAIImageModels = Literal[
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
     "gpt-image-2",
     "gpt-image-1.5",
     "gpt-image-1",
@@ -307,6 +312,15 @@ ImageProviders = Literal["replicate", "google", "openai"]
 ImageAspectRatio = Literal["1:1", "16:9", "4:3", "3:4", "9:16"]
 ImageResolution = Literal["1024x1024", "2048x2048", "4096x4096"]  # Simplified
 ImageOutputFormat = Literal["webp", "png", "jpeg", "avif"]
+ImageGenerationQuality = Literal["auto", "low", "medium", "high", "xhigh", "max"]
+
+
+def image_generation_qualities(model: str) -> list[ImageGenerationQuality]:
+    if model.startswith("gpt-image-2.5-"):
+        return ["auto", "low", "medium", "high", "xhigh", "max"]
+    if model.startswith("gpt-image-"):
+        return ["auto", "low", "medium", "high"]
+    return ["auto"]
 
 
 class FieldExtras(TypedDict):
@@ -339,6 +353,7 @@ class FieldExtras(TypedDict):
     image_resolution: Optional[ImageResolution]
     image_output_format: Optional[ImageOutputFormat]
     image_quality: Optional[int]  # 0-100, -1 for default/lossless if format supports it
+    image_generation_quality: Optional[ImageGenerationQuality]
     regenerate_when_batching: bool
 
 
@@ -370,6 +385,7 @@ DEFAULT_EXTRAS: FieldExtras = {
     "image_resolution": None,
     "image_output_format": None,
     "image_quality": None,
+    "image_generation_quality": None,
     "regenerate_when_batching": False,
 }
 
@@ -589,6 +605,7 @@ OverridableImageOptions = Union[
     Literal["image_resolution"],
     Literal["image_output_format"],
     Literal["image_quality"],
+    Literal["image_generation_quality"],
 ]
 
 overridable_image_options: list[OverridableImageOptions] = [
@@ -598,6 +615,7 @@ overridable_image_options: list[OverridableImageOptions] = [
     "image_resolution",
     "image_output_format",
     "image_quality",
+    "image_generation_quality",
 ]
 
 
@@ -608,3 +626,4 @@ class OverridableImageOptionsDict(TypedDict):
     image_resolution: Optional[ImageResolution]
     image_output_format: Optional[ImageOutputFormat]
     image_quality: Optional[int]
+    image_generation_quality: Optional[ImageGenerationQuality]

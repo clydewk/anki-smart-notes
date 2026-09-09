@@ -626,6 +626,11 @@ class PromptDialog(QDialog):
                             "image_provider": extras.get("image_provider"),
                             "image_aspect_ratio": extras.get("image_aspect_ratio"),
                             "image_resolution": extras.get("image_resolution"),
+                            "image_generation_quality": extras.get(
+                                "image_generation_quality"
+                            ),
+                            "image_output_format": extras.get("image_output_format"),
+                            "image_quality": extras.get("image_quality"),
                         },
                     )
                 )
@@ -1111,18 +1116,34 @@ class PromptDialog(QDialog):
         else:
 
             def img_fn():
+                image_settings = (
+                    self.image_options.state.s
+                    if self.state.s["use_custom_model"]
+                    else None
+                )
                 provider = (
                     self.image_options.state.s["image_provider"]
                     if self.state.s["use_custom_model"]
                     else config.image_provider
                 )
-                model = self.image_options.state.s["image_model"]
+                model = key_or_config_val(image_settings, "image_model")
                 return self.processor.field_processor.get_image_response(
                     note_id=snapshot.note_id,
                     values=values,
                     input_text=prompt,
                     model=model,
                     provider=provider,
+                    aspect_ratio=key_or_config_val(
+                        image_settings, "image_aspect_ratio"
+                    ),
+                    resolution=key_or_config_val(image_settings, "image_resolution"),
+                    output_format=key_or_config_val(
+                        image_settings, "image_output_format"
+                    ),
+                    quality=key_or_config_val(image_settings, "image_quality"),
+                    generation_quality=key_or_config_val(
+                        image_settings, "image_generation_quality"
+                    ),
                 )
 
             run_async_in_background_with_sentry(img_fn, on_success, on_failure)

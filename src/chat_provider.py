@@ -24,6 +24,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
+from urllib.parse import urlparse
 
 from .chat_usage import OpenAITurnPermit, chat_usage_tracker
 from .config import config
@@ -260,7 +261,7 @@ def payload_length_metrics(payload: str | list[dict[str, Any]]) -> tuple[int, in
 
 def is_reasoning_model(model: str) -> bool:
     lowered = model.lower()
-    return lowered.startswith(("o", "gpt-5"))
+    return lowered.startswith(("o", "gpt-5")) or lowered == "gpt-6-astra"
 
 
 def responses_timeouts(
@@ -1644,7 +1645,11 @@ class ChatProvider:
             "messages": [{"role": "user", "content": request.prompt}],
         }
 
-        if request.reasoning_effort and request.reasoning_effort != "none":
+        if request.model.lower() == "gpt-6-astra":
+            payload["reasoning_effort"] = choose_reasoning_effort(
+                request.model, request.reasoning_effort
+            )
+        elif request.reasoning_effort and request.reasoning_effort != "none":
             payload["reasoning_effort"] = request.reasoning_effort
         else:
             payload["temperature"] = request.temperature
@@ -1852,7 +1857,13 @@ class ChatProvider:
             payload["tools"] = self._chat_tools_payload(request.tools)
             payload["tool_choice"] = "auto"
 
-        if request.reasoning_effort and request.reasoning_effort != "none":
+        if request.model.lower() == "gpt-6-astra":
+            if request.tools:
+                raise ValueError("GPT-6 Astra tool calling requires the Responses API.")
+            payload["reasoning_effort"] = choose_reasoning_effort(
+                request.model, request.reasoning_effort
+            )
+        elif request.reasoning_effort and request.reasoning_effort != "none":
             payload["reasoning_effort"] = request.reasoning_effort
         else:
             payload["temperature"] = request.temperature
@@ -2368,17 +2379,32 @@ class ChatProvider:
             "tool_choice": "none",
         }
 
-        if request.provider == "openai" and bool(
-            getattr(config, "openai_fast_mode_enabled", False)
+        if (
+            request.provider == "openai"
+            and bool(getattr(config, "openai_fast_mode_enabled", False))
+            and not (
+                request.model.lower() == "gpt-6-astra"
+                and urlparse(config.openai_endpoint or OPENAI_BASE_URL).hostname
+                == "eu.api.openai.com"
+            )
         ):
             payload["service_tier"] = "fast"
 
         if previous_response_id:
             payload["previous_response_id"] = previous_response_id
 
-        if request.reasoning_effort:
+        if request.model.lower() == "gpt-6-astra":
+            payload["reasoning"] = {
+                "effort": choose_reasoning_effort(
+                    request.model, request.reasoning_effort
+                )
+            }
+        elif request.reasoning_effort:
             payload["reasoning"] = {"effort": request.reasoning_effort}
-        if request.reasoning_effort in {None, "none"}:
+        if request.model.lower() != "gpt-6-astra" and request.reasoning_effort in {
+            None,
+            "none",
+        }:
             payload["temperature"] = request.temperature
 
         if request.tools and allow_tools:

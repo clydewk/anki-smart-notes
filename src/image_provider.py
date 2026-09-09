@@ -28,6 +28,7 @@ from .chat_provider import build_v1_endpoint
 from .config import config
 from .constants import GOOGLE_IMAGE_BASE_URL, MAX_RETRIES
 from .logger import logger
+from .models import image_generation_qualities
 from .provider_runtime import (
     RequestTimeouts,
     provider_runtime,
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from .models import (
         CustomProvider,
         ImageAspectRatio,
+        ImageGenerationQuality,
         ImageModels,
         ImageProviders,
         ImageResolution,
@@ -62,6 +64,7 @@ class ImageProvider:
         resolution: ImageResolution | None = None,
         output_format: str | None = None,
         quality: int | None = None,
+        generation_quality: ImageGenerationQuality | None = None,
     ) -> bytes:
         del note_id
 
@@ -76,6 +79,7 @@ class ImageProvider:
                 resolution=resolution,
                 output_format=output_format,
                 provider_config=custom_provider,
+                generation_quality=generation_quality,
             )
 
         if model in MODEL_MAP:
@@ -107,6 +111,7 @@ class ImageProvider:
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
                 output_format=output_format,
+                generation_quality=generation_quality,
             )
         raise ValueError(f"Unknown image provider: {provider}")
 
@@ -132,7 +137,9 @@ class ImageProvider:
             model=model,
             timeouts=RequestTimeouts(
                 connect_timeout_sec=10.0,
-                sock_read_timeout_sec=60.0,
+                sock_read_timeout_sec=180.0
+                if model.startswith("gpt-image-2.5-")
+                else 60.0,
             ),
             max_retries=MAX_RETRIES,
         )
@@ -365,6 +372,7 @@ class ImageProvider:
         resolution: ImageResolution | None = None,
         output_format: str | None = None,
         provider_config: CustomProvider | None = None,
+        generation_quality: ImageGenerationQuality | None = None,
     ) -> bytes:
         headers = {"Content-Type": "application/json"}
         provider_name = "openai"
@@ -386,9 +394,17 @@ class ImageProvider:
             "model": model,
             "prompt": prompt,
             "n": 1,
-            "response_format": "b64_json",
             "size": self._openai_image_size(model, aspect_ratio, resolution),
         }
+        if model.startswith("gpt-image-"):
+            if generation_quality:
+                if generation_quality not in image_generation_qualities(model):
+                    raise ValueError(
+                        f"{model} does not support {generation_quality} image quality."
+                    )
+                payload["quality"] = generation_quality
+        else:
+            payload["response_format"] = "b64_json"
         if output_format in {"png", "jpeg", "webp"}:
             payload["output_format"] = output_format
         elif output_format == "jpg":
@@ -428,7 +444,7 @@ class ImageProvider:
         aspect_ratio: ImageAspectRatio | None,
         resolution: ImageResolution | None,
     ) -> str:
-        if model == "gpt-image-2":
+        if model == "gpt-image-2" or model.startswith("gpt-image-2.5-"):
             return self._openai_image_2_size(aspect_ratio, resolution)
 
         if "gpt-image" in model:

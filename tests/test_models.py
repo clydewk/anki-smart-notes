@@ -32,6 +32,7 @@ from src.chat_provider import (
     ChatProvider,
     TextGenerationRequest,
     TextToolDefinition,
+    choose_reasoning_effort,
     filter_openai_text_models,
     prompt_cache_key_for_request,
 )
@@ -44,12 +45,17 @@ from src.tts_provider import TTSProvider
 def test_curated_openai_chat_models_are_ordered_and_labeled() -> None:
     assert DEFAULT_CHAT_MODEL == "gpt-5.6-sol"
     assert models.openai_chat_models == [
+        "gpt-6-astra",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
         "gpt-5.5",
     ]
     assert models.provider_model_map["openai"] == models.openai_chat_models
+    assert models.openai_model_label("gpt-6-astra") == "GPT-6 Astra"
+    assert filter_openai_text_models(["gpt-6-astra", "gpt-image-2.5-flare"]) == [
+        "gpt-6-astra"
+    ]
     assert models.openai_model_label("gpt-5.6-sol") == "GPT-5.6 Sol"
     assert models.openai_model_label("gpt-5.6-terra") == "GPT-5.6 Terra"
     assert models.openai_model_label("gpt-5.6-luna") == "GPT-5.6 Luna"
@@ -182,6 +188,7 @@ def test_openai_chat_models_for_display_merges_available_models() -> None:
     available_models = ["gpt-5.5-pro", "gpt-5.4-mini", "gpt-3.5-turbo"]
 
     assert models.openai_chat_models_for_display(available_models) == [
+        "gpt-6-astra",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -191,6 +198,7 @@ def test_openai_chat_models_for_display_merges_available_models() -> None:
         available_models,
         include_available=True,
     ) == [
+        "gpt-6-astra",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -373,8 +381,21 @@ def make_stream_sse_json(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "effort", "expected"),
+    [
+        ("gpt-5.6-sol", "max", "max"),
+        ("gpt-6-astra", None, "low"),
+        ("gpt-6-astra", "none", "low"),
+        ("gpt-6-astra", "minimal", "low"),
+        ("gpt-6-astra", "max", "max"),
+    ],
+)
 async def test_openai_payload_with_reasoning(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    effort: Optional[models.OpenAIReasoningEffort],
+    expected: str,
 ) -> None:
     cp = ChatProvider()
     captured: dict[str, Any] = {}
@@ -405,10 +426,10 @@ async def test_openai_payload_with_reasoning(
     result = await cp.generate_text(
         TextGenerationRequest(
             prompt="hi",
-            model="gpt-5.6-sol",
+            model=model,
             provider="openai",
             temperature=0.5,
-            reasoning_effort="max",
+            reasoning_effort=effort,
             prompt_cache_key="smart-notes:test",
         )
     )
@@ -416,8 +437,10 @@ async def test_openai_payload_with_reasoning(
     assert result.text == "hello"
     assert captured["url"] == "https://api.openai.com/v1/responses"
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
-    assert captured["payload"]["model"] == "gpt-5.6-sol"
-    assert captured["payload"]["reasoning"] == {"effort": "max"}
+    assert captured["payload"]["model"] == model
+    assert captured["payload"]["reasoning"] == {"effort": expected}
+    assert "temperature" not in captured["payload"]
+    assert choose_reasoning_effort(model, effort) == expected
     assert captured["payload"]["store"] is False
     assert captured["payload"]["stream"] is True
     assert captured["payload"]["prompt_cache_key"] == "smart-notes:test"
@@ -425,14 +448,27 @@ async def test_openai_payload_with_reasoning(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "endpoint", "fast"),
+    [
+        ("gpt-5.6-sol", None, True),
+        ("gpt-6-astra", None, True),
+        ("gpt-6-astra", "https://eu.api.openai.com/v1", False),
+    ],
+)
 async def test_openai_fast_mode_sets_service_tier(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    endpoint: Optional[str],
+    fast: bool,
 ) -> None:
     cp = ChatProvider()
     captured: dict[str, Any] = {}
+    test_config = openai_test_config(fast_mode=True)
+    test_config.openai_endpoint = endpoint
     monkeypatch.setattr(
         "src.chat_provider.config",
-        openai_test_config(fast_mode=True),
+        test_config,
     )
 
     async def fake_stream_sse_json(**kwargs: Any):
@@ -448,7 +484,7 @@ async def test_openai_fast_mode_sets_service_tier(
     result = await cp.generate_text(
         TextGenerationRequest(
             prompt="hi",
-            model="gpt-5.6-sol",
+            model=model,
             provider="openai",
             temperature=0.5,
             reasoning_effort="none",
@@ -456,7 +492,7 @@ async def test_openai_fast_mode_sets_service_tier(
     )
 
     assert result.text == "hello"
-    assert captured["payload"]["service_tier"] == "fast"
+    assert captured["payload"].get("service_tier") == ("fast" if fast else None)
 
 
 @pytest.mark.asyncio
@@ -1059,8 +1095,12 @@ async def test_openai_image_uses_http_endpoint(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model", ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"]
+)
 async def test_openai_image_2_uses_supported_high_resolution_size(
     monkeypatch: pytest.MonkeyPatch,
+    model: models.ImageModels,
 ) -> None:
     provider = ImageProvider()
     captured: dict[str, Any] = {}
@@ -1095,21 +1135,28 @@ async def test_openai_image_2_uses_supported_high_resolution_size(
 
     data = await provider.async_get_image_response(
         prompt="cat",
-        model="gpt-image-2",
+        model=model,
         provider="openai",
         note_id=1,
         aspect_ratio="16:9",
         resolution="4096x4096",
+        generation_quality="max" if model.startswith("gpt-image-2.5-") else "high",
     )
 
     assert data == b"image-bytes"
-    assert captured["payload"]["model"] == "gpt-image-2"
+    assert captured["payload"]["model"] == model
+    assert captured["payload"]["quality"] == (
+        "max" if model.startswith("gpt-image-2.5-") else "high"
+    )
+    assert "response_format" not in captured["payload"]
     assert captured["payload"]["size"] == "3840x2160"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-5.4", "gpt-6-astra"])
 async def test_openai_responses_tool_loop_executes_tool_calls(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
 ) -> None:
     cp = ChatProvider()
     payloads: list[dict[str, Any]] = []
@@ -1192,7 +1239,7 @@ async def test_openai_responses_tool_loop_executes_tool_calls(
     result = await cp.generate_text(
         TextGenerationRequest(
             prompt="hi",
-            model="gpt-5.4",
+            model=model,
             provider="openai",
             temperature=0.5,
             reasoning_effort=None,
@@ -1209,6 +1256,10 @@ async def test_openai_responses_tool_loop_executes_tool_calls(
 
     assert result.text == "tool-backed answer"
     assert result.usage == {"input_tokens": 2, "output_tokens": 3}
+    if model == "gpt-6-astra":
+        for payload in payloads:
+            assert payload["reasoning"] == {"effort": "low"}
+            assert "temperature" not in payload
     assert request_calls == 0
     assert payloads[0]["tools"][0]["name"] == "mcp_test_echo"
     assert payloads[0]["store"] is True
