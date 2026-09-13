@@ -22,7 +22,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 import re
 from collections.abc import Mapping
 from copy import deepcopy
-from typing import Any, Optional, Union, cast
+from typing import Any, cast
 
 from anki.decks import DeckId
 from anki.notes import Note
@@ -54,9 +54,9 @@ def get_prompts_for_note(
     note_type: str,
     deck_id: DeckId,
     to_lower: bool = False,
-    override_prompts_map: Optional[PromptMap] = None,
+    override_prompts_map: PromptMap | None = None,
     fallback_to_global_deck: bool = True,
-) -> Optional[dict[str, str]]:
+) -> dict[str, str] | None:
     all_prompts = get_all_prompts(to_lower, override_prompts_map)
     prompts_for_note_type = all_prompts.get(note_type, {})
     deck_prompts = deepcopy(prompts_for_note_type.get(deck_id, {}))
@@ -76,9 +76,9 @@ def get_extras(
     note_type: str,
     field: str,
     deck_id: DeckId,
-    prompts: Optional[PromptMap] = None,
+    prompts: PromptMap | None = None,
     fallback_to_global_deck: bool = True,
-) -> Optional[FieldExtras]:
+) -> FieldExtras | None:
     # Lowercase the field names
     deck_extras = to_lowercase_dict(
         (prompts or config.prompts_map)["note_types"]  # type: ignore
@@ -103,7 +103,7 @@ def get_extras(
 
 
 def get_all_prompts(
-    to_lower: bool = False, override_prompts_map: Optional[PromptMap] = None
+    to_lower: bool = False, override_prompts_map: PromptMap | None = None
 ) -> dict[str, dict[DeckId, dict[str, str]]]:
     """Gets the prompts map. Maps note_type -> deck -> {field -> prompt}"""
     prompts_map = {
@@ -142,7 +142,7 @@ def interpolate_prompt_with_values(
     prompt: str,
     values: Mapping[str, str],
     allow_empty: bool,
-) -> Optional[str]:
+) -> str | None:
     """Interpolates a prompt from a lowercased field-value mapping."""
     fields = get_prompt_fields(prompt)
     if not fields:
@@ -153,15 +153,14 @@ def interpolate_prompt_with_values(
     resolved_values = [values.get(field, "") for field in fields]
 
     if any(resolved_values) and (allow_empty or all(resolved_values)):
-        for field, value in zip(fields, resolved_values):
+        for field, value in zip(fields, resolved_values, strict=True):
             prompt = prompt.replace("{{" + field + "}}", value)
         return prompt
 
-    logger.debug("Prompt has empty fields")
     return None
 
 
-def interpolate_prompt(prompt: str, note: Note) -> Optional[str]:
+def interpolate_prompt(prompt: str, note: Note) -> str | None:
     """Interpolates a prompt. Returns none if all source field are empty, or if some are empty and we're not allowing empty fields."""
     return interpolate_prompt_with_values(
         prompt,
@@ -180,16 +179,14 @@ def add_or_update_prompts(
     is_custom_model: bool,
     type: SmartFieldType,
     tts_options: OverrideableTTSOptionsDict,
-    tts_style: Optional[str],
-    tts_language: Optional[str],
+    tts_style: str | None,
+    tts_language: str | None,
     chat_options: dict[OverridableChatOptions, Any],
     image_options: dict[OverridableImageOptions, Any],
-    chat_use_tools: Optional[bool],
+    chat_use_tools: bool | None,
     regenerate_when_batching: bool,
 ) -> PromptMap:
     new_prompts_map = deepcopy(prompts_map)
-
-    logger.debug(f"Trying to set prompt for {note_type}, {field}, {prompt}")
 
     # If note type does not exist, add
     if not new_prompts_map["note_types"].get(note_type):
@@ -228,11 +225,11 @@ def add_or_update_prompts(
 
     # If we're doing custom settings, write out extra config
     if is_custom_model:
-        overrideable_options: Union[
-            OverridableChatOptionsDict,
-            OverridableImageOptionsDict,
-            OverrideableTTSOptionsDict,
-        ] = {  # type: ignore
+        overrideable_options: (
+            OverridableChatOptionsDict
+            | OverridableImageOptionsDict
+            | OverrideableTTSOptionsDict
+        ) = {  # type: ignore
             "chat": chat_options,
             "tts": tts_options,
             "image": image_options,
@@ -269,7 +266,9 @@ def remove_prompt(
 ) -> PromptMap:
     removed_map = deepcopy(prompts_map)
 
-    logger.debug(f"Removing {note_type}, {field}, {deck_id_to_name_map()[deck_id]}")
+    logger.debug(
+        f"Removing {note_type}, {field}, {deck_id_to_name_map().get(deck_id, str(deck_id))}"
+    )
 
     removed_map["note_types"][note_type][str(deck_id)]["fields"].pop(field)
     removed_map["note_types"][note_type][str(deck_id)]["extras"].pop(field)

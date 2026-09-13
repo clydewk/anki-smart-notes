@@ -17,13 +17,25 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Any, Optional, TypedDict
+from copy import deepcopy
+from typing import Any, TypedDict
 
-from aqt import QGroupBox, QLabel, QSpacerItem, QWidget
+from aqt import (
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+from aqt.qt import QShowEvent
 
 from ..chat_provider import chat_provider
 from ..config import config, key_or_config_val
+from ..logger import redact_text
 from ..models import (
+    RETIRED_PROVIDER_MODELS,
     ChatModels,
     ChatProviders,
     OpenAIReasoningEffort,
@@ -32,10 +44,13 @@ from ..models import (
     openai_chat_models_for_display,
     openai_model_label,
     openai_reasoning_efforts_for_model,
+    openai_supports_chat_tools,
+    openai_supports_temperature,
     overridable_chat_options,
     provider_model_map,
 )
 from ..sentry import run_async_in_background_with_sentry
+from ..settings import widget_settings, with_widget_settings
 from .reactive_check_box import ReactiveCheckBox
 from .reactive_combo_box import ReactiveComboBox
 from .reactive_spin_box import ReactiveDoubleSpinBox
@@ -48,8 +63,8 @@ class ChatOptionsState(TypedDict):
     chat_providers: list[str]
     chat_models: list[ChatModels]
     chat_model: ChatModels
-    chat_temperature: int
-    chat_reasoning_effort: Optional[OpenAIReasoningEffort]
+    chat_temperature: float
+    chat_reasoning_effort: OpenAIReasoningEffort | None
     chat_reasoning_efforts: list[OpenAIReasoningEffort]
     chat_markdown_to_html: bool
     chat_use_tools: bool
@@ -58,11 +73,12 @@ class ChatOptionsState(TypedDict):
 
 
 models_map: dict[str, str] = {
-    "claude-opus-4-1": "Claude Opus 4.1",
-    "claude-sonnet-4-0": "Claude Sonnet 4.0",
-    "claude-3-5-haiku-latest": "Claude 3.5 Haiku",
-    "deepseek-v3": "DeepSeek V3",
-    "gemini-3-pro-preview": "Gemini 3 Pro",
+    "claude-opus-4-8": "Claude Opus 4.8",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
+    "deepseek-v4-flash": "DeepSeek V4 Flash",
+    "deepseek-v4-pro": "DeepSeek V4 Pro",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
     "gemini-3-flash-preview": "Gemini 3 Flash",
 }
 
@@ -79,7 +95,7 @@ providers_map = {
 all_chat_providers: list[ChatProviders] = ["openai", "anthropic", "deepseek", "google"]
 
 reasoning_efforts_map: dict[str, str] = {
-    "none": "None (Use Temperature)",
+    "none": "None",
     "minimal": "Minimal",
     "low": "Low",
     "medium": "Medium",
@@ -94,7 +110,7 @@ class ChatOptions(QWidget):
 
     def __init__(
         self,
-        chat_options: Optional[OverridableChatOptionsDict] = None,
+        chat_options: OverridableChatOptionsDict | None = None,
         show_text_processing: bool = True,
         show_tools_toggle: bool = True,
     ):
@@ -105,7 +121,9 @@ class ChatOptions(QWidget):
         self._show_text_processing = show_text_processing
         self._show_tools_toggle = show_tools_toggle
         self._openai_refresh_inflight = False
+        self._available_openai_models: list[str] | None = None
         self.setup_ui()
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
     def setup_ui(self) -> None:
         self.chat_provider = ReactiveComboBox(
@@ -122,12 +140,16 @@ class ChatOptions(QWidget):
         self.chat_model = ReactiveComboBox(
             self.state, "chat_models", "chat_model", models_map, editable=is_custom
         )
-        self.chat_model.setMinimumWidth(350)
+        self.chat_model.setMinimumWidth(0)
+        self.chat_model.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.chat_model.on_change.connect(self._on_model_change)
 
         self.show_available_models = ReactiveCheckBox(
             self.state, "show_available_openai_models"
         )
+        self.show_available_models.setText("Show discovered OpenAI models")
         self.show_available_models.on_change.connect(
             self._on_show_available_openai_models_change
         )
@@ -140,72 +162,96 @@ class ChatOptions(QWidget):
         )
         self.reasoning_effort.on_change.connect(self._on_reasoning_effort_change)
 
-        chat_box = QGroupBox("✨ Language Model")
+        chat_box = QGroupBox("Language model")
         chat_form = default_form_layout()
         chat_box.setLayout(chat_form)
         chat_form.addRow("Provider:", self.chat_provider)
         chat_form.addRow("Model:", self.chat_model)
-        chat_form.addRow(
-            "Show available OpenAI models:",
-            self.show_available_models,
+        self.model_warning = QLabel()
+        self.model_warning.setWordWrap(True)
+        chat_form.addRow(self.model_warning)
+        self.discovery = QWidget()
+        discovery_layout = QVBoxLayout(self.discovery)
+        discovery_layout.setContentsMargins(0, 0, 0, 0)
+        discovery_layout.addWidget(self.show_available_models)
+        status_row = QHBoxLayout()
+        self.discovery_status = QLabel()
+        self.discovery_status.setWordWrap(True)
+        self.discovery_status.setAccessibleDescription("OpenAI model discovery status")
+        self.discovery_status.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self.refresh_models = QPushButton("Refresh")
+        self.refresh_models.setAccessibleName("Refresh available OpenAI models")
+        self.refresh_models.clicked.connect(
+            lambda: self._refresh_openai_models_if_needed("openai")
+        )
+        status_row.addWidget(self.discovery_status, 1)
+        status_row.addWidget(self.refresh_models)
+        discovery_layout.addLayout(status_row)
+        chat_form.addRow(self.discovery)
+        cached = chat_provider.get_cached_openai_chat_models()
+        self.discovery_status.setText(
+            f"Cached list: {len(cached)} text models. Refresh to check availability."
+            if cached
+            else "Availability has not been checked for this connection."
         )
 
-        text_rules = QGroupBox("🔤 Text Processing")
+        text_rules = QGroupBox("Formatting")
         text_layout = default_form_layout()
         text_rules.setLayout(text_layout)
         text_rules.setHidden(not self._show_text_processing)
         self.convert_box = ReactiveCheckBox(self.state, "chat_markdown_to_html")
-        text_layout.addRow(QLabel("Convert Markdown to HTML:"), self.convert_box)
+        self.convert_box.setText("Render Markdown formatting in Anki fields")
+        text_layout.addRow(self.convert_box)
         convert_explainer = QLabel(
-            "Language models often use **Markdown** in their responses - convert it to HTML to render within Anki."
+            "Render lists, emphasis and code blocks safely. When off, responses are saved as plain text."
         )
+        convert_explainer.setWordWrap(True)
         convert_explainer.setFont(font_small)
         text_layout.addRow(convert_explainer)
-        advanced = QGroupBox("⚙️ Advanced")
+        advanced = QGroupBox("Response controls")
         advanced_layout = default_form_layout()
         advanced.setLayout(advanced_layout)
         advanced_layout.addRow("Temperature:", self.temperature)
-        temp_desc = QLabel(
-            "Temperature controls the creativity of responses. Values range from 0-2 (ChatGPT default is 1)."
-        )
-        temp_desc.setFont(font_small)
-        advanced_layout.addRow(temp_desc)
+        self.temperature_help = QLabel()
+        self.temperature_help.setWordWrap(True)
+        self.temperature_help.setFont(font_small)
+        advanced_layout.addRow(self.temperature_help)
 
         advanced_layout.addRow("Reasoning Effort:", self.reasoning_effort)
-        reasoning_desc = QLabel(
-            "Controls how hard the model thinks. Only available for some models. Disables temperature when active."
-        )
-        reasoning_desc.setFont(font_small)
-        advanced_layout.addRow(reasoning_desc)
+        self.reasoning_help = QLabel()
+        self.reasoning_help.setWordWrap(True)
+        self.reasoning_help.setFont(font_small)
+        advanced_layout.addRow(self.reasoning_help)
 
-        tools = QGroupBox("🧰 Tools")
+        tools = QGroupBox("Tools")
         tools_layout = default_form_layout()
         tools.setLayout(tools_layout)
         tools.setHidden(not self._show_tools_toggle)
         self.use_tools_box = ReactiveCheckBox(self.state, "chat_use_tools")
-        tools_layout.addRow(QLabel("Use tools by default:"), self.use_tools_box)
+        self.use_tools_box.setText("Use enabled tools by default")
+        tools_layout.addRow(self.use_tools_box)
         tools_desc = QLabel(
-            "Allow chat Smart Fields to call enabled built-in tools and configured external MCP tools unless a field overrides this setting."
+            "Choose available tools on the Tools page. Individual Smart Fields can override this default. Tool calls may share referenced note data with an external server."
         )
+        tools_desc.setWordWrap(True)
         tools_desc.setFont(font_small)
         tools_layout.addRow(tools_desc)
 
-        chat_layout = default_form_layout()
-        chat_layout.addRow(chat_box)
-        chat_layout.addItem(QSpacerItem(0, 12))
-        chat_layout.addRow(text_rules)
-        if self._show_text_processing:
-            chat_layout.addItem(QSpacerItem(0, 12))
-        chat_layout.addRow(advanced)
-        if self._show_tools_toggle:
-            chat_layout.addItem(QSpacerItem(0, 12))
-            chat_layout.addRow(tools)
+        chat_layout = QVBoxLayout(self)
         chat_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.setLayout(chat_layout)
+        chat_layout.setSpacing(12)
+        chat_layout.addWidget(chat_box)
+        chat_layout.addWidget(advanced)
+        if self._show_text_processing:
+            chat_layout.addWidget(text_rules)
+        if self._show_tools_toggle:
+            chat_layout.addWidget(tools)
+        chat_layout.addStretch()
 
         self._on_reasoning_effort_change(self.state.s.get("chat_reasoning_effort"))
-        self._on_model_change(self.state.s["chat_model"])
+        self._on_model_change(self.state.s["chat_model"], preserve_effort=True)
         self._update_editable_state(self.state.s["chat_provider"])
         self._update_available_models_visibility(self.state.s["chat_provider"])
         current_provider = self.state.s["chat_provider"]
@@ -219,14 +265,17 @@ class ChatOptions(QWidget):
             temperature=current_temp,
             reasoning_effort=current_effort,
         )
-        self._refresh_openai_models_if_needed(current_provider)
+
+    def showEvent(self, a0: QShowEvent | None) -> None:
+        super().showEvent(a0)
+        self._refresh_openai_models_if_needed(self.state.s["chat_provider"])
 
     def _update_editable_state(self, provider: str) -> None:
         is_custom = provider not in all_chat_providers
         self.chat_model.setEditable(is_custom)
 
     def _update_available_models_visibility(self, provider: str) -> None:
-        self.show_available_models.setVisible(provider == "openai")
+        self.discovery.setVisible(provider == "openai")
 
     def _sync_model_labels(self, models: list[str]) -> None:
         for model in models:
@@ -236,6 +285,7 @@ class ChatOptions(QWidget):
         self.chat_model.state_to_ui = models_map
         self.chat_model.ui_to_state = {v: k for k, v in models_map.items()}
 
+    @with_widget_settings
     def _models_for_provider(self, provider: str, current_model: str) -> list[str]:
         if provider == "openai":
             return openai_chat_models_for_display(
@@ -245,15 +295,22 @@ class ChatOptions(QWidget):
             )
 
         if provider in all_chat_providers:
-            return list(provider_model_map[provider])
+            models = list(provider_model_map[provider])
+            if current_model and current_model not in models:
+                models.append(current_model)
+            return models
 
         custom_provider = next(
             (p for p in (config.custom_providers or []) if p["name"] == provider), None
         )
-        if not custom_provider:
-            return []
-
-        return custom_provider.get("chat_models") or custom_provider.get("models") or []
+        models = list(
+            (custom_provider.get("chat_models") or custom_provider.get("models") or [])
+            if custom_provider
+            else []
+        )
+        if current_model and current_model not in models:
+            models.append(current_model)
+        return models
 
     def _on_provider_change(self, text: str) -> None:
         is_custom = text not in all_chat_providers
@@ -298,8 +355,7 @@ class ChatOptions(QWidget):
             }
         )
 
-        is_reasoning = new_effort and new_effort != "none"
-        self.temperature.setEnabled(not is_reasoning)
+        self._update_capabilities()
 
         self._update_provider_settings(
             text,
@@ -317,8 +373,8 @@ class ChatOptions(QWidget):
 
         current = self.state.s["chat_provider"]
         if current not in new_providers:
-            self.state.update({"chat_provider": "openai"})
-            self._on_provider_change("openai")
+            self.state.update({"chat_providers": [*new_providers, current]})
+            self._update_capabilities()
         elif current in custom_provider_names:
             self._on_provider_change(current)
         elif current == "openai":
@@ -336,7 +392,7 @@ class ChatOptions(QWidget):
 
         custom_provider_names = [p["name"] for p in (config.custom_providers or [])]
         ret["chat_providers"] = all_chat_providers + custom_provider_names
-        ret["provider_settings"] = config.provider_settings or {}
+        ret["provider_settings"] = deepcopy(config.provider_settings or {})
 
         current_provider = ret["chat_provider"]
         if current_provider in provider_model_map:
@@ -367,7 +423,12 @@ class ChatOptions(QWidget):
                 else []
             )
 
+        if current_provider not in ret["chat_providers"]:
+            ret["chat_providers"].append(current_provider)
         current_model = ret.get("chat_model")
+        ret["chat_models"] = list(ret["chat_models"])
+        if current_model and current_model not in ret["chat_models"]:
+            ret["chat_models"].append(current_model)
         efforts = (
             openai_reasoning_efforts_for_model(current_model) if current_model else []
         )
@@ -380,8 +441,11 @@ class ChatOptions(QWidget):
 
         return ret
 
-    def _on_model_change(self, model: str) -> None:
+    def _on_model_change(self, model: str, preserve_effort: bool = False) -> None:
         efforts = openai_reasoning_efforts_for_model(model)
+        saved_effort = self.state.s.get("chat_reasoning_effort")
+        if preserve_effort and saved_effort is not None and saved_effort not in efforts:
+            efforts.append(saved_effort)
 
         provider = self.state.s["chat_provider"]
         self._update_provider_settings(provider, model=model)
@@ -396,18 +460,70 @@ class ChatOptions(QWidget):
             self.state.update({"chat_reasoning_effort": new_effort})
             self._update_provider_settings(provider, reasoning_effort=new_effort)
 
-        self.temperature.setEnabled(
-            self.state.s.get("chat_reasoning_effort") in {None, "none"}
-        )
+        self._update_capabilities()
 
-    def _on_reasoning_effort_change(self, effort: Optional[str]) -> None:
+    def _on_reasoning_effort_change(self, effort: str | None) -> None:
         self.state.update({"chat_reasoning_effort": effort})  # type: ignore
         self._update_provider_settings(
             self.state.s["chat_provider"], reasoning_effort=effort
         )  # type: ignore
 
-        is_reasoning = effort and effort != "none"
-        self.temperature.setEnabled(not is_reasoning)
+        self._update_capabilities()
+
+    @with_widget_settings
+    def _update_capabilities(self) -> None:
+        provider = self.state.s["chat_provider"]
+        model = self.state.s["chat_model"]
+        effort = self.state.s["chat_reasoning_effort"]
+        supports_reasoning = provider == "openai" or provider not in all_chat_providers
+        self.chat_model.setToolTip(model)
+        self.reasoning_effort.setEnabled(supports_reasoning)
+        supports_temperature = not supports_reasoning or openai_supports_temperature(
+            model, effort
+        )
+        self.temperature.setEnabled(supports_temperature)
+        self.temperature_help.setText(
+            "Higher values vary the wording more; lower values make responses more consistent (0–2)."
+            if supports_temperature
+            else f"{model} does not support temperature."
+            if not openai_supports_temperature(model, None)
+            else "Temperature is unavailable while reasoning is enabled. Choose None for reasoning to use temperature."
+        )
+        self.reasoning_help.setText(
+            "Higher effort can take longer and use more tokens. Available levels depend on the model."
+            if supports_reasoning
+            else f"Reasoning effort is not sent to {providers_map.get(provider, provider)} by this plugin."
+        )
+        custom = next(
+            (p for p in (config.custom_providers or []) if p["name"] == provider), None
+        )
+        supports_tools = (
+            not custom
+            or custom.get("chat_api_mode") != "chat_completions"
+            or openai_supports_chat_tools(model)
+        )
+        if hasattr(self, "use_tools_box"):
+            self.use_tools_box.setEnabled(supports_tools)
+        unavailable = (provider, model) in RETIRED_PROVIDER_MODELS or (
+            provider not in all_chat_providers and custom is None
+        )
+        absent_from_connection = (
+            provider == "openai"
+            and self._available_openai_models is not None
+            and model not in self._available_openai_models
+        )
+        self.model_warning.setText(
+            "Saved provider or model is unavailable. Choose a supported selection before generating."
+            if unavailable
+            else "The saved model was not returned by this connection. It is preserved; verify access or choose a listed model."
+            if absent_from_connection
+            else "This model requires Responses mode for tool calling."
+            if not supports_tools
+            else ""
+        )
+        self.model_warning.setVisible(
+            unavailable or absent_from_connection or not supports_tools
+        )
 
     def _on_show_available_openai_models_change(self, _: bool) -> None:
         if self.state.s["chat_provider"] != "openai":
@@ -417,26 +533,7 @@ class ChatOptions(QWidget):
         models = self._models_for_provider("openai", current_model=current_model)
         self._sync_model_labels(models)
 
-        next_model = current_model if current_model in models else models[0]
-        next_efforts = openai_reasoning_efforts_for_model(next_model)
-        next_effort = self.state.s["chat_reasoning_effort"]
-        if next_effort not in next_efforts:
-            next_effort = "none" if "none" in next_efforts else next_efforts[0]
-
-        self.state.update(
-            {
-                "chat_models": models,
-                "chat_model": next_model,
-                "chat_reasoning_efforts": next_efforts,
-                "chat_reasoning_effort": next_effort,
-            }
-        )
-        self._update_provider_settings(
-            "openai",
-            model=next_model,
-            reasoning_effort=next_effort,
-        )
-        self._refresh_openai_models_if_needed("openai")
+        self.state.update({"chat_models": models})
 
     def _update_provider_settings(self, provider: str, **kwargs: Any) -> None:
         settings_map = self.state.s["provider_settings"]
@@ -457,57 +554,85 @@ class ChatOptions(QWidget):
         self.state.update({"chat_temperature": temp})
         self._update_provider_settings(self.state.s["chat_provider"], temperature=temp)
 
+    @with_widget_settings
     def _refresh_openai_models_if_needed(self, provider: str) -> None:
         if (
-            provider != "openai"
-            or not config.openai_api_key
+            not self.isVisible()
+            or provider != "openai"
             or self._openai_refresh_inflight
         ):
             return
+        if not config.openai_api_key:
+            self.discovery_status.setText(
+                "Add an OpenAI API key on the Providers page to check model availability."
+            )
+            self.refresh_models.setEnabled(False)
+            return
 
+        connection = (config.openai_endpoint, config.openai_api_key)
+        self._available_openai_models = None
         self._openai_refresh_inflight = True
+        self.refresh_models.setEnabled(False)
+        self.refresh_models.setText("Refresh")
+        cached = chat_provider.get_cached_openai_chat_models()
+        self.discovery_status.setText(
+            f"Refreshing model availability… Showing {len(cached)} cached text models."
+            if cached
+            else "Checking model availability…"
+        )
 
         def on_success(models: list[str]) -> None:
-            self._openai_refresh_inflight = False
-            if not models or self.state.s["chat_provider"] != "openai":
+            self.refresh_models.setEnabled(True)
+            current_settings = widget_settings(self)
+            if connection != (
+                current_settings.get("openai_endpoint"),
+                current_settings.get("openai_api_key"),
+            ):
+                self.discovery_status.setText(
+                    "Connection changed while loading. Refresh to check the current credentials."
+                )
                 return
-
-            current_model = self.state.s["chat_model"]
-            display_models = self._models_for_provider(
-                "openai", current_model=current_model
+            self._available_openai_models = models
+            self.discovery_status.setText(
+                f"Fetched {len(models)} text models. Availability checked for this connection."
+                if models
+                else "This connection returned no supported text models. Saved selections are preserved."
+            )
+            if self.state.s["chat_provider"] != "openai":
+                return
+            display_models = openai_chat_models_for_display(
+                models,
+                include_available=self.state.s["show_available_openai_models"],
+                current_model=self.state.s["chat_model"],
             )
             self._sync_model_labels(display_models)
-            next_model = (
-                current_model if current_model in display_models else display_models[0]
-            )
-            next_efforts = openai_reasoning_efforts_for_model(next_model)
-            next_effort = self.state.s["chat_reasoning_effort"]
-            if next_effort not in next_efforts:
-                next_effort = (
-                    "none"
-                    if "none" in next_efforts
-                    else (next_efforts[0] if next_efforts else None)
-                )
+            self.state.update({"chat_models": display_models})
+            self._update_capabilities()
 
-            self.state.update(
-                {
-                    "chat_models": display_models,
-                    "chat_model": next_model,
-                    "chat_reasoning_efforts": next_efforts,
-                    "chat_reasoning_effort": next_effort,
-                }
+        def on_failure(error: Exception) -> None:
+            self.refresh_models.setEnabled(True)
+            self.refresh_models.setText("Retry")
+            fallback = (
+                f" Keeping {len(cached)} cached models."
+                if cached
+                else " Saved selections are preserved."
             )
-            self._update_provider_settings(
-                "openai",
-                model=next_model,
-                reasoning_effort=next_effort,
+            self.discovery_status.setText(
+                f"Could not check availability: {redact_text(str(error))}.{fallback}"
             )
 
-        def on_failure(_: Exception) -> None:
+        def finish() -> None:
             self._openai_refresh_inflight = False
 
-        run_async_in_background_with_sentry(
-            chat_provider.fetch_openai_chat_models,
-            on_success,
-            on_failure,
-        )
+        try:
+            run_async_in_background_with_sentry(
+                chat_provider.fetch_openai_chat_models,
+                on_success,
+                on_failure,
+                show_error=False,
+                on_finished=finish,
+            )
+        except Exception:
+            finish()
+            self.refresh_models.setEnabled(True)
+            raise

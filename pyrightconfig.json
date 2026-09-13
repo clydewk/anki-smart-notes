@@ -18,7 +18,7 @@
   ],
   "venvPath": ".",
   "venv": ".venv",
-  "pythonVersion": "3.9",
+  "pythonVersion": "3.13",
   "typeCheckingMode": "strict",
   "useLibraryCodeForTypes": true,
   "reportMissingImports": "error",

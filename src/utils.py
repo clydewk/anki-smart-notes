@@ -26,6 +26,7 @@ from typing import Any, TypeVar, cast
 from aqt import mw
 
 from .env import environment
+from .job_context import current_job
 
 
 def to_lowercase_dict(d: dict[str, Any]) -> dict[str, Any]:
@@ -72,7 +73,15 @@ def load_file(file: str, test_override: str = "") -> str:
 def run_on_main(work: Callable[[], Any]) -> None:
     if not mw:
         return
-    mw.taskman.run_on_main(work)
+    context = current_job.get()
+
+    def guarded() -> None:
+        if context is None or (
+            mw and mw.col is context.collection and context.ui_valid()
+        ):
+            work()
+
+    mw.taskman.run_on_main(guarded)
 
 
 def run_in_background(work: Callable[[], None]) -> None:

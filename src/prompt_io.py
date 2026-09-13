@@ -20,8 +20,8 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Optional, TypedDict, cast
+from datetime import UTC, datetime
+from typing import Any, TypedDict, cast
 
 from .constants import GLOBAL_DECK_ID, GLOBAL_DECK_NAME
 from .models import FieldExtras, PromptMap, normalize_field_extras
@@ -78,7 +78,7 @@ def create_prompt_export(
     return {
         "schema": PROMPT_EXPORT_SCHEMA,
         "schema_version": PROMPT_EXPORT_SCHEMA_VERSION,
-        "exported_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "exported_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "prompts_map": normalize_prompt_map(prompts_map),
         "decks": decks,
     }
@@ -159,7 +159,7 @@ def preview_prompt_import(
                 extras = note_type_map.get("extras", {}).get(exported_field)
                 local_note_type_map["fields"][local_field] = prompt
                 local_note_type_map["extras"][local_field] = normalize_field_extras(
-                    cast("Optional[dict[str, Any] | FieldExtras]", extras)
+                    cast("dict[str, Any] | FieldExtras | None", extras)
                 )
 
     return ImportPreview(
@@ -177,7 +177,7 @@ def normalize_prompt_map(prompts_map: PromptMap) -> PromptMap:
             for field in note_type_map.get("fields", {}):
                 raw_extras = note_type_map.get("extras", {}).get(field)
                 note_type_map.setdefault("extras", {})[field] = normalize_field_extras(
-                    cast("Optional[dict[str, Any] | FieldExtras]", raw_extras)
+                    cast("dict[str, Any] | FieldExtras | None", raw_extras)
                 )
     return normalized
 
@@ -221,7 +221,7 @@ def prompt_map_from_payload(payload: Mapping[str, Any]) -> PromptMap:
                 ):
                     raise PromptImportError("Prompt export has invalid extras data.")
                 extras[field] = normalize_field_extras(
-                    cast("Optional[dict[str, Any]]", raw_field_extras)
+                    cast("dict[str, Any] | None", raw_field_extras)
                 )
             prompts_map["note_types"][note_type][deck_id] = {
                 "fields": fields,
@@ -247,7 +247,7 @@ def local_deck_id_for_exported_deck(
     exported_deck_id: str,
     exported_decks: Mapping[str, str],
     deck_ids_by_name: Mapping[str, int],
-) -> Optional[int]:
+) -> int | None:
     if exported_deck_id == str(int(GLOBAL_DECK_ID)):
         return GLOBAL_DECK_ID
 

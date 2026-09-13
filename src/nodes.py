@@ -17,10 +17,10 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import Literal
 
 from anki.decks import DeckId
-from attr import dataclass
 
 from .models import SmartFieldType
 
@@ -31,7 +31,7 @@ from .models import SmartFieldType
 class FieldNode:
     field: str
     field_upper: str
-    existing_value: Optional[str]
+    existing_value: str | None
     out_nodes: list["FieldNode"]
     in_nodes: list["FieldNode"]
     manual: bool
@@ -43,9 +43,10 @@ class FieldNode:
     generate_despite_manual: bool = False  # Used if it's pre a target field
     did_update: bool = False
 
-    abort = False
+    abort: bool = False
+    outcome: Literal["successful", "unchanged", "failed", "blocked"] = "unchanged"
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"Node(field={self.field}, in_nodes={[n.field for n in self.in_nodes]}, out_nodes={[n.field for n in self.out_nodes]}, manual={self.manual}, overwrite={self.overwrite}, generate_despite_manual={self.generate_despite_manual}, is_target={self.is_target}, did_update={self.did_update}"
 
     __repr__ = __str__

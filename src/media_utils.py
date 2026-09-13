@@ -17,13 +17,15 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import asyncio
 import functools
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-from typing import Optional
+from contextlib import suppress
+from pathlib import Path
 
 from anki.notes import Note
 from aqt import mw
@@ -40,9 +42,10 @@ HARDCODED_PATHS = (
 )
 
 SOUND_TAG_RE = re.compile(r"\[sound:([^\]]+)\]")
+MEDIA_TIMEOUT_SECONDS = 30.0
 
 
-def extract_sound_file_name(sound_field: str) -> Optional[str]:
+def extract_sound_file_name(sound_field: str) -> str | None:
     match = SOUND_TAG_RE.search(sound_field)
     if not match:
         return None
@@ -50,7 +53,7 @@ def extract_sound_file_name(sound_field: str) -> Optional[str]:
 
 
 @functools.cache
-def find_executable(name: str) -> Optional[str]:
+def find_executable(name: str) -> str | None:
     """
     Find executable in system PATH or hardcoded fallback paths.
     Matches AJT Media Converter logic for finding ffmpeg/cwebp on macOS.
@@ -78,7 +81,7 @@ def get_media_path(note: Note, field: str, format: str) -> str:
     return build_media_filename(get_note_type(note), note.id, field, format)
 
 
-def convert_image_data(data: bytes, format: str, quality: int = -1) -> bytes:
+async def convert_image_data(data: bytes, format: str, quality: int = -1) -> bytes:
     """
     Convert image data to specified format and quality using Qt, with fallback to external tools (ffmpeg/cwebp).
 
@@ -92,9 +95,9 @@ def convert_image_data(data: bytes, format: str, quality: int = -1) -> bytes:
     """
     image = QImage()
     if not image.loadFromData(data):
-        raise ValueError(
-            "Failed to load image data. Input data might be corrupted or in an unsupported format."
-        )
+        data = await decode_to_png(data)
+        if not image.loadFromData(data):
+            raise ValueError("Failed to decode image data.")
 
     fmt = format.upper()
     if fmt == "JPEG":
@@ -112,20 +115,20 @@ def convert_image_data(data: bytes, format: str, quality: int = -1) -> bytes:
     # Specifically for AVIF which is often missing in Qt builds
     if fmt == "AVIF":
         try:
-            return _convert_to_avif_ffmpeg(data, quality)
-        except Exception:
+            return await convert_to_avif_ffmpeg(data, quality)
+        except (OSError, subprocess.CalledProcessError):
             # Fall through to raise the support error
             pass
 
     # Try cwebp for WebP if Qt failed (unlikely but possible)
     if fmt == "WEBP":
         try:
-            return _convert_to_webp_cwebp(data, quality)
-        except Exception:
+            return await convert_to_webp_cwebp(data, quality)
+        except (OSError, subprocess.CalledProcessError):
             pass
 
     # If we get here, everything failed.
-    supported = [bytes(f).decode() for f in QImageWriter.supportedImageFormats()]
+    supported = [f.data().decode() for f in QImageWriter.supportedImageFormats()]
     msg = f"Failed to convert image to {fmt}. It might not be supported by your Anki version. Supported formats: {', '.join(supported)}"
 
     if fmt == "AVIF":
@@ -136,7 +139,50 @@ def convert_image_data(data: bytes, format: str, quality: int = -1) -> bytes:
     raise ValueError(msg)
 
 
-def _convert_to_avif_ffmpeg(data: bytes, quality: int) -> bytes:
+async def image_preview_data(data: bytes) -> bytes:
+    """Keep the saved format, decoding only unsupported native previews to PNG."""
+    if QImage.fromData(data).isNull():
+        return await convert_image_data(data, "png")
+    return data
+
+
+async def decode_to_png(data: bytes) -> bytes:
+    ffmpeg_path = find_executable("ffmpeg")
+    if not ffmpeg_path:
+        raise ValueError(
+            "Anki cannot decode this image format. Install FFmpeg for image previews."
+        )
+    with tempfile.TemporaryDirectory(prefix="smart-notes-image-") as directory:
+        source = Path(directory) / "source"
+        target = Path(directory) / "preview.png"
+        source.write_bytes(data)
+        await run_media_conversion(
+            [ffmpeg_path, "-y", "-i", str(source), "-frames:v", "1", str(target)]
+        )
+        return target.read_bytes()
+
+
+async def run_media_conversion(command: list[str]) -> None:
+    process = await asyncio.create_subprocess_exec(
+        *command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+    )
+    try:
+        return_code = await asyncio.wait_for(process.wait(), MEDIA_TIMEOUT_SECONDS)
+        if return_code:
+            raise subprocess.CalledProcessError(return_code, command)
+    finally:
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), 2)
+            except TimeoutError:
+                with suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
+
+
+async def convert_to_avif_ffmpeg(data: bytes, quality: int) -> bytes:
     ffmpeg_path = find_executable("ffmpeg")
     if not ffmpeg_path:
         raise FileNotFoundError("ffmpeg not found")
@@ -149,7 +195,7 @@ def _convert_to_avif_ffmpeg(data: bytes, quality: int) -> bytes:
 
     try:
         # Map 0-100 quality to CRF (approximate)
-        # ffmpeg libaom-av1: crf 0-63 (0 is lossless)
+        # AV1 encoders use CRF 0-63 (lower values mean higher quality).
         # 100 -> 0, 0 -> 63
         if quality == -1:
             crf = 23  # Default
@@ -164,8 +210,6 @@ def _convert_to_avif_ffmpeg(data: bytes, quality: int) -> bytes:
             "-y",
             "-i",
             in_path,
-            "-c:v",
-            "libaom-av1",
             "-crf",
             str(crf),
             "-b:v",
@@ -174,7 +218,7 @@ def _convert_to_avif_ffmpeg(data: bytes, quality: int) -> bytes:
         ]
 
         # Run ffmpeg
-        subprocess.run(cmd, check=True, capture_output=True)
+        await run_media_conversion(cmd)
 
         if not os.path.exists(out_path):
             raise Exception("ffmpeg failed to produce output file")
@@ -189,7 +233,7 @@ def _convert_to_avif_ffmpeg(data: bytes, quality: int) -> bytes:
             os.remove(out_path)
 
 
-def _convert_to_webp_cwebp(data: bytes, quality: int) -> bytes:
+async def convert_to_webp_cwebp(data: bytes, quality: int) -> bytes:
     cwebp_path = find_executable("cwebp")
     if not cwebp_path:
         raise FileNotFoundError("cwebp not found")
@@ -205,7 +249,7 @@ def _convert_to_webp_cwebp(data: bytes, quality: int) -> bytes:
 
         cmd = [cwebp_path, "-q", str(q), in_path, "-o", out_path]
 
-        subprocess.run(cmd, check=True, capture_output=True)
+        await run_media_conversion(cmd)
 
         if not os.path.exists(out_path):
             raise Exception("cwebp failed to produce output file")
@@ -220,7 +264,7 @@ def _convert_to_webp_cwebp(data: bytes, quality: int) -> bytes:
             os.remove(out_path)
 
 
-def write_media(file_name: str, file: bytes) -> Optional[str]:
+def write_media(file_name: str, file: bytes) -> str | None:
     if not mw or not mw.col:
         return None
     media = mw.col.media

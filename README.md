@@ -1,200 +1,46 @@
-# **Smart Notes** - Anki + AI generated fields ✨
+# Anki Smart Notes (BYOK)
 
-[![CI](https://github.com/piazzatron/anki-smart-notes/actions/workflows/ci.yml/badge.svg)](https://github.com/piazzatron/anki-smart-notes/actions/workflows/ci.yml)
+Generate text, speech, and images in Anki fields using your own provider API keys. This fork retains the native Qt interface, dependent smart fields, prompt import/export, voice routing, built-in Anki tools, and MCP servers. It does not require a Smart Notes subscription; providers charge your own account for API use.
 
-</br>
+Supports **Anki 26.5 or newer on Windows and macOS**. Development and tests use Python 3.13.
 
-## 💬 Use AI to automatically generate any field.
+## Install or update
 
-For example, use ChatGPT / Claude / DeepSeek to automatically generate example sentences for vocab cards in nearly any language in **bulk**.
-</br>
-</br>
+Build this repository and install `dist/smart-notes.ankiaddon` through **Tools → Add-ons → Install from file**, then restart Anki. The package keeps the existing add-on ID so an existing installation can migrate in place. The BYOK fork and upstream share this ID: install only one, and do not replace the fork with upstream when updating.
 
-## 🗣️ Speak your notes with Text to Speech (TTS) from Google, OpenAI, and ElevenLabs.
+Back up your Anki profile before upgrading. On first opening version 3.0, every existing profile receives an independent copy of the legacy prompts and generation behavior. New profiles start with no prompts. Credentials, provider defaults, MCP settings, and the estimated token guard remain shared across the installation. Profile settings live in `smart-notes.json` inside each profile folder; they are local settings and are not synced by Anki. Existing fields are not rewritten by migration.
 
-Generate nearly 1000 premium voices in 90+ languages, from Google, Azure, OpenAI, and ElevenLabs - including the latest advanced <a href="https://cloud.google.com/text-to-speech/docs/chirp3-hd">Google Chirp</a> voices.
+## Generate fields
 
+1. Open **Tools → Smart Notes**, enter your provider API keys, and choose models.
+2. Associate a prompt with a note type, deck, and target field. Reference source fields using `{{Field Name}}`; dependent smart fields run in dependency order.
+3. Save the settings. Generate from the editor's sparkle button or field context menu, select notes in the browser for batch generation, or enable generation during review.
 
-Smart Notes supports 250+ voices in 50+ languages.
-</br>
-</br>
+Prompt previews use the current settings draft. **Save** commits settings; **Cancel** discards the draft, including edits made in nested dialogs. Unsaved notes receive results only in their originating editor. Cancelling a job discards uncommitted results; completed batch chunks remain undoable.
 
-## 💳 Smart Notes is a paid add-on (with a free trial)
+Enable only the built-in tools and MCP servers you intend providers to call. MCP supports stdio and Streamable HTTP for protocol version `2025-03-26`; stdio servers inherit essential OS variables plus explicitly selected environment variables and overrides. Existing Azure configurations are retained, but Azure choices are unavailable until a supported direct integration exists.
 
-Set up your trial inside Anki. 
+The OpenAI token setting is an **estimated token guard**, not an exact billing ceiling. Actual usage may remain unknown when a dispatched request fails or is cancelled. Check provider billing for charges.
 
-*If you are unable to afford Smart Notes due to financial hardship, please get in touch at <a href="mailto:support@smart-notes.xyz">support@smart-notes.xyz</a>.*
+## Development
 
-</br>
+Create a Python 3.13 virtual environment at `.venv`, activate it, and install the development requirements:
 
-
-> ### 💡 Check out the  [Roadmap](https://github.com/piazzatron/anki-smart-notes/issues/30) to see where we're headed.
-> And leave feedback to help steer development!
-</br>
-
-> ### ⚠️ Smart Notes only supports Anki Qt6.
-
-</br>
-
-
-# Usage
-
-</br>
-
-### 🚧 These docs are under construction / outdated since v2.0 🚧
-
-(New docs soon)
-
-**Write a prompt, associate it with a note type and field, and Smart Notes will automatically generate that field for you at review time – or generate groups of notes with a single click**
-
-<img src="https://piazzatron.github.io/anki-smart-notes/resources/screenshots/create_field.gif" />
-</br>
-</br>
-
-<img src="https://piazzatron.github.io/anki-smart-notes/resources/screenshots/generate_prompt.gif" />
-
-</br>
-</br>
-
-## 1. **Installation**:
-
-Tools > Addons > Get Addon, paste in plugin id `1531888719`. Restart Anki.
-
-## 2. **Start your free trial:**
-
-Tools > Smart Notes.
-
-## 3. **Add Smart Fields**
-
-</br>
-
-**Smart fields are AI generated fields associated with a particular card type.**
-They may reference other fields, and you can have as many smart fields as you like.
-
-</br>
-
-1. Click Tools > Smart Notes.
-
-2. Pick the `card type` and `target field` you want to automatically generate.
-
-3. Then, write the `prompt` that will be automatically sent to Claude/ChatGPT/DeepSeek to generate the `target field`.
-
-</br>
-
-> 💡 **Tip:** Uncheck "Always Generate Smart Field" if you don't want the smart field generated by default, and prefer to generate it manually by right clicking the field in the editor.
-
-</br>
-
-### Writing a Prompt
-
-A prompt may reference any other field on the card via `{{double curly braces}}`.
-
-For example, if you're studying a language and want to generate a mmemonic to aid in memorization, you might make a prompt like this (assuming you have a field called "vocab"):
-
-```
-Create a simple, memorable mmemonic in Japanese for the word {{vocab}}. Reply with only the mmemonic.
+```sh
+python -m pip install -r requirements.txt
+./scripts/build.sh check
+python -m pytest
+./scripts/build.sh build
 ```
 
-It's often useful to tell language model to "only reply" with the phrase you care about.
+The script detects `.venv/bin/python` on macOS and `.venv/Scripts/python.exe` on Windows. Use Git Bash to run the shell script on Windows. `fix` applies formatting and lint fixes; `clean` deletes only the repository's `dist` staging directory and refuses a symlinked staging directory.
 
-_You can't reference the target field, or other smart fields – but the addon will validate your prompt, so don't worry!_
+Builds bundle the selected pure Python runtime dependencies and their license notices. They package committed `config.json` defaults, never a source checkout's modified runtime configuration. Commit intentional default changes before a release build. Backups, usage ledgers, logs, environment files, tests, and installed Anki folders are excluded. Building or cleaning never installs the add-on or changes an Anki profile.
 
-</br>
+For independent MCP integration tests, install `mcp==1.12.4` in a separate Python environment and set `MCP_TEST_PYTHON` to its interpreter before running `python -m pytest tests/test_mcp.py`. These tests start local subprocess/HTTP servers. The SDK is a test dependency only and is never bundled. CI runs checks, unit tests, SDK integration tests, and packaging on Windows and macOS.
 
-## 4. **Automatically generate notes** 😎
+Before release, verify the built add-on in disposable Windows and macOS profiles at an 800×650 logical viewport: profile switching, active shutdown, unsaved editors, undo, sync, settings migration, and media updates. Paid-provider smoke tests require separate authorization.
 
-Generate smart notes during review, in edit or add flows, or batched in the card browser.
+## Project
 
-</br>
-
-</br>
-
-### **Generate during review**
-
-Smart fields are automatically generated in the background at review time.
-
-This is approach is super useful if you import notes via AnkiConnect (Yomichan, etc) - simply set up your smart fields and no further effort required.
-
- <img src="https://piazzatron.github.io/anki-smart-notes/resources/screenshots/sparkle.gif?raw=true" />
-
-_A sparkle emoji will briefly show (we love sparkle)._
-
-Note that you can turn automatic generation off in _Smart Notes > Advanced_.
-
-</br>
-</br>
-
-### **Generate when adding or editing cards**
-
-Smart fields can also be generated prior to review. To generate all smart fields on a note, press `ctrl+shift+g` (on Mac: `cmd+shift+g`) or click the ✨ button in the editor:
-
-<img src="https://piazzatron.github.io/anki-smart-notes/resources/screenshots/editor_button.png?raw=true" height="200px" />
-
-Clicking ✨ a single time will generate only empty smart fields. Click it a second time to regenerate the entire note.
-
-</br>
-</br>
-
-To (re)generate a single smart field, right click it in the editor and click **"Generate Smart Field"**:
-
-<img src="https://piazzatron.github.io/anki-smart-notes/resources/screenshots/per_field.png?raw=true" height="300px" />
-
-</br>
-</br>
-
-### **Generating Multiple Notes**
-
-In the notes browser, select a group of notes and then **right click > generate smart fields** to generate multiple notes.
-
-<img src="https://piazzatron.github.io/anki-smart-notes/resources/screenshots/batch.png?raw=true" height="250px" />
-
-**Generate an entire deck** or note type by right clicking it in the browser.
-<img src="https://piazzatron.github.io/anki-smart-notes/resources/screenshots/edit_deck.png?raw=true" height="250px" />
-
-</br>
-
-# Additional Features
-
-### **Select New Models**
-
-- **Tools > Smart Notes > Language Models:** to select a different language model
-- **Tools > Smart Notes > TTS:** to select a different TTS model.
-
-</br>
-
-### **Create complex prompts**
-
-Smart fields can reference as many other fields on your card as you like, including other smart fields. Set up complex pipelines!
-
-</br>
-
-# Support
-
-Found a bug or want to request a feature? File an <a href="https://github.com/piazzatron/anki-smart-notes/issues"> issue on Github</a> or email <a href="mailto:support@smart-notes.xyz">support@smart-notes.xyz</a>
-
-Enjoying this addon? <a href="https://ankiweb.net/shared/info/1531888719">Please rate it to help others find it.👍</a>
-
-</br>
-
-# Contributing
-
-PRs are welcome! See <a href="https://github.com/piazzatron/anki-smart-notes/pull/41">this PR</a> for a great example.
-
-# Cost
-
-Using OpenAI, Anthropic, and TTS models all cost money, so Smart Notes is a paid plugin.
-
-<a href="https://smart-notes.xyz/prices/">Learn More about Smart Notes Plans.</a>
-
-</br>
-
-# Changelog
-
-See <a href="https://github.com/piazzatron/anki-smart-notes/blob/main/changelog.md">Changelog.md</a>
-
-
-## </br>
-
-</br>
-
-_Smart Notes owes a debt of gratitude for inspiration to <a href="https://ankiweb.net/shared/info/1416178071">Intellifiller.</a>_
+See [changelog.md](changelog.md) for version history and [the fork's issue tracker](https://github.com/clydewk/anki-smart-notes/issues) for reports. Original project: [piazzatron/anki-smart-notes](https://github.com/piazzatron/anki-smart-notes). Licensed under GPLv3 or later; see [license](license).

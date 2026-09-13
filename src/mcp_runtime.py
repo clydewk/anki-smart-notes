@@ -22,6 +22,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager, suppress
+from contextvars import Context
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -32,11 +35,36 @@ from .provider_runtime import RequestTimeouts, build_httpx_timeout, provider_run
 from .utils import get_version
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, AsyncIterator
+
     from .models import McpKeyValuePair, McpServerConfig
 
 MCP_PROTOCOL_VERSION = "2025-03-26"
 MCP_DEFAULT_CONNECT_TIMEOUT_SEC = 10.0
 MCP_DEFAULT_READ_TIMEOUT_SEC = 60.0
+MCP_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+MCP_MAX_STDERR_BYTES = 64 * 1024
+MCP_CLOSE_TIMEOUT_SEC = 2.0
+MCP_STDIO_ENV = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+)
 
 
 class McpError(Exception):
@@ -82,7 +110,7 @@ def pairs_to_dict(pairs: list[McpKeyValuePair]) -> dict[str, str]:
 
 
 def build_stdio_env(config: McpServerConfig) -> dict[str, str]:
-    env = os.environ.copy()
+    env = {key: os.environ[key] for key in MCP_STDIO_ENV if key in os.environ}
 
     for env_name in config.get("env_passthrough", []):
         if env_name in os.environ:
@@ -136,12 +164,12 @@ def parse_tools(payload: Any) -> list[McpToolSpec]:
     tools: list[McpToolSpec] = []
     for raw_tool in raw_tools:
         if not isinstance(raw_tool, dict):
-            logger.warning("Skipping invalid MCP tool entry: %s", raw_tool)
+            logger.warning("Skipping invalid MCP tool entry")
             continue
 
         name = raw_tool.get("name")
         if not isinstance(name, str) or not name:
-            logger.warning("Skipping MCP tool without a valid name: %s", raw_tool)
+            logger.warning("Skipping MCP tool without a valid name")
             continue
 
         description = raw_tool.get("description")
@@ -189,63 +217,159 @@ def parse_tool_call_result(payload: Any) -> McpToolCallResult:
     )
 
 
+def encode_message(payload: dict[str, Any]) -> bytes:
+    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    if len(body) > MCP_MAX_MESSAGE_BYTES:
+        raise McpProtocolError("MCP message exceeded the 8 MiB limit.")
+    return body
+
+
+def decode_messages(body: bytes) -> list[dict[str, Any]]:
+    if len(body) > MCP_MAX_MESSAGE_BYTES:
+        raise McpProtocolError("MCP message exceeded the 8 MiB limit.")
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise McpProtocolError("MCP response was not valid JSON.") from exc
+    messages = payload if isinstance(payload, list) else [payload]
+    if not messages or any(
+        not isinstance(message, dict) or message.get("jsonrpc") != "2.0"
+        for message in messages
+    ):
+        raise McpProtocolError("MCP response was not a JSON-RPC 2.0 message.")
+    return cast("list[dict[str, Any]]", messages)
+
+
 class BaseMcpSession:
     def __init__(self, config: McpServerConfig) -> None:
-        self.config = config
+        self.config = deepcopy(config)
+        self.environment = build_stdio_env(config)
+        self.headers = build_http_headers(config)
         self._next_id = 1
         self._lock = asyncio.Lock()
         self.server_info: McpServerInfo | None = None
         self._initialized = False
+        self._closed = False
+
+    def matches(self, config: McpServerConfig) -> bool:
+        return (
+            not self._closed
+            and self.config == config
+            and self.environment == build_stdio_env(config)
+            and self.headers == build_http_headers(config)
+        )
 
     def _take_id(self) -> int:
         request_id = self._next_id
         self._next_id += 1
         return request_id
 
-    async def initialize(self) -> McpServerInfo:
-        async with self._lock:
-            if self._initialized and self.server_info is not None:
-                return self.server_info
+    @asynccontextmanager
+    async def _operation(self) -> AsyncGenerator[None]:
+        async with asyncio.timeout(MCP_DEFAULT_READ_TIMEOUT_SEC), self._lock:
+            if self._closed:
+                raise McpError(
+                    "MCP session is closed; retry with the current configuration."
+                )
+            try:
+                yield
+            except (asyncio.CancelledError, McpProtocolError, httpx.HTTPError, OSError):
+                # A cancelled request can leave an unread response in the pipe.
+                await self.close()
+                raise
 
-            result = await self._send_request_locked(
-                "initialize",
-                {
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "anki-smart-notes",
-                        "version": get_version(),
-                    },
-                },
-            )
-            self.server_info = parse_server_info(result)
-            await self._send_notification_locked("notifications/initialized", {})
-            self._initialized = True
+    async def initialize(self) -> McpServerInfo:
+        async with self._operation():
+            return await self._initialize_locked()
+
+    async def _initialize_locked(self) -> McpServerInfo:
+        if self._initialized and self.server_info is not None:
             return self.server_info
+        result = await self._send_request_locked(
+            "initialize",
+            {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "anki-smart-notes",
+                    "version": get_version(),
+                },
+            },
+        )
+        if result.get("protocolVersion") != MCP_PROTOCOL_VERSION:
+            raise McpProtocolError(
+                "MCP server selected an unsupported protocol version."
+            )
+        self.server_info = parse_server_info(result)
+        await self._send_notification_locked("notifications/initialized", {})
+        self._initialized = True
+        return self.server_info
 
     async def list_tools(self) -> list[McpToolSpec]:
-        await self.initialize()
-        async with self._lock:
-            result = await self._send_request_locked("tools/list", {})
-            return parse_tools(result)
+        async with self._operation():
+            await self._initialize_locked()
+            tools: list[McpToolSpec] = []
+            params: dict[str, Any] = {}
+            seen_cursors: set[str] = set()
+            while True:
+                result = await self._send_request_locked("tools/list", params)
+                tools.extend(parse_tools(result))
+                cursor = result.get("nextCursor")
+                if cursor is None:
+                    return tools
+                if not isinstance(cursor, str) or cursor in seen_cursors:
+                    raise McpProtocolError(
+                        "MCP tools/list returned an invalid pagination cursor."
+                    )
+                seen_cursors.add(cursor)
+                params = {"cursor": cursor}
 
     async def call_tool(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> McpToolCallResult:
-        await self.initialize()
-        async with self._lock:
+        async with self._operation():
+            await self._initialize_locked()
             result = await self._send_request_locked(
-                "tools/call",
-                {"name": tool_name, "arguments": arguments},
+                "tools/call", {"name": tool_name, "arguments": arguments}
             )
             return parse_tool_call_result(result)
 
     async def close(self) -> None:
         self._initialized = False
+        self._closed = True
+
+    async def _handle_message(
+        self, message: dict[str, Any], request_id: int
+    ) -> dict[str, Any] | None:
+        method = message.get("method")
+        if method is not None:
+            if "id" in message:
+                reply: dict[str, Any] = {"jsonrpc": "2.0", "id": message["id"]}
+                if method == "ping":
+                    reply["result"] = {}
+                else:
+                    reply["error"] = {"code": -32601, "message": "Method not supported"}
+                await self._send_message_locked(reply)
+            # Progress/log notifications need no reply. tools/list is never cached.
+            return None
+        if message.get("id") != request_id:
+            return None
+        error = message.get("error")
+        if isinstance(error, dict):
+            raise McpProtocolError(str(error.get("message") or "MCP request failed."))
+        result = message.get("result")
+        if not isinstance(result, dict):
+            raise McpProtocolError("MCP response did not include a result object.")
+        return cast("dict[str, Any]", result)
 
     async def _send_notification_locked(
         self, method: str, params: dict[str, Any]
     ) -> None:
+        await self._send_message_locked(
+            {"jsonrpc": "2.0", "method": method, "params": params}
+        )
+
+    async def _send_message_locked(self, payload: dict[str, Any]) -> None:
         raise NotImplementedError
 
     async def _send_request_locked(
@@ -258,16 +382,21 @@ class StdioMcpSession(BaseMcpSession):
     def __init__(self, config: McpServerConfig) -> None:
         super().__init__(config)
         self._process: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._stderr_tail = bytearray()
 
     async def _ensure_process(self) -> asyncio.subprocess.Process:
-        if self._process is not None and self._process.returncode is None:
-            return self._process
+        if self._closed:
+            raise McpError("MCP session is closed.")
+        if self._process is not None:
+            if self._process.returncode is None:
+                return self._process
+            raise McpProtocolError("MCP stdio server exited unexpectedly.")
 
         command = self.config.get("command", "").strip()
         if not command:
             raise McpInitializationError("MCP stdio server command is required.")
 
-        logger.debug("Starting MCP stdio server %s", self.config["name"])
         self._process = await asyncio.create_subprocess_exec(
             command,
             *self.config.get("args", []),
@@ -275,127 +404,78 @@ class StdioMcpSession(BaseMcpSession):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.config.get("cwd") or None,
-            env=build_stdio_env(self.config),
+            env=self.environment,
+            limit=MCP_MAX_MESSAGE_BYTES + 1,
+        )
+        self._stderr_task = asyncio.create_task(
+            self._drain_stderr(self._process), context=Context()
         )
         return self._process
 
-    async def close(self) -> None:
-        process = self._process
-        self._process = None
-        await super().close()
-
-        if process is None:
+    async def _drain_stderr(self, process: asyncio.subprocess.Process) -> None:
+        if process.stderr is None:
             return
+        while chunk := await process.stderr.read(8192):
+            self._stderr_tail.extend(chunk)
+            del self._stderr_tail[:-MCP_MAX_STDERR_BYTES]
 
-        if process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
+    async def close(self) -> None:
+        process, self._process = self._process, None
+        stderr_task, self._stderr_task = self._stderr_task, None
+        await super().close()
+        try:
+            if process is not None:
+                if process.stdin is not None:
+                    process.stdin.close()
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), MCP_CLOSE_TIMEOUT_SEC)
+                    except TimeoutError:
+                        with suppress(ProcessLookupError):
+                            process.kill()
+                        await process.wait()
+        finally:
+            if process is not None and process.returncode is None:
+                with suppress(ProcessLookupError):
+                    process.kill()
+            if stderr_task is not None:
+                stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
 
-    async def _send_notification_locked(
-        self, method: str, params: dict[str, Any]
-    ) -> None:
+    async def _send_message_locked(self, payload: dict[str, Any]) -> None:
         process = await self._ensure_process()
-        await self._write_message(
-            process, {"jsonrpc": "2.0", "method": method, "params": params}
-        )
+        if process.stdin is None:
+            raise McpProtocolError("MCP stdio server stdin was unavailable.")
+        process.stdin.write(encode_message(payload) + b"\n")
+        await process.stdin.drain()
 
     async def _send_request_locked(
         self, method: str, params: dict[str, Any]
     ) -> dict[str, Any]:
-        process = await self._ensure_process()
         request_id = self._take_id()
-        await self._write_message(
-            process,
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            },
+        await self._send_message_locked(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         )
-        response = await self._read_response(process)
-        if response.get("id") != request_id:
-            raise McpProtocolError(
-                f"MCP stdio server returned mismatched id {response.get('id')}"
-            )
-
-        error = response.get("error")
-        if isinstance(error, dict):
-            message = error.get("message") or json.dumps(error, ensure_ascii=True)
-            raise McpProtocolError(str(message))
-
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise McpProtocolError(
-                "MCP stdio response did not include a result object."
-            )
-        return cast("dict[str, Any]", result)
-
-    async def _write_message(
-        self, process: asyncio.subprocess.Process, payload: dict[str, Any]
-    ) -> None:
-        if process.stdin is None:
-            raise McpProtocolError("MCP stdio server stdin was unavailable.")
-
-        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        headers = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        process.stdin.write(headers + body)
-        await process.stdin.drain()
-
-    async def _read_response(
-        self, process: asyncio.subprocess.Process
-    ) -> dict[str, Any]:
+        process = await self._ensure_process()
         if process.stdout is None:
             raise McpProtocolError("MCP stdio server stdout was unavailable.")
-
-        content_length: int | None = None
         while True:
-            line = await process.stdout.readline()
-            if not line:
-                stderr_text = await self._read_stderr(process)
-                raise McpProtocolError(
-                    f"MCP stdio server closed unexpectedly. {stderr_text}".strip()
-                )
-
-            if line == b"\r\n":
-                break
-
             try:
-                header_name, header_value = line.decode("ascii").split(":", 1)
+                body = await process.stdout.readline()
             except ValueError as exc:
-                raise McpProtocolError(f"Invalid MCP stdio header: {line!r}") from exc
-
-            if header_name.lower() == "content-length":
-                content_length = int(header_value.strip())
-
-        if content_length is None:
-            raise McpProtocolError("MCP stdio response was missing Content-Length.")
-
-        body = await process.stdout.readexactly(content_length)
-        try:
-            response = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise McpProtocolError(
-                "MCP stdio response body was not valid JSON."
-            ) from exc
-
-        if not isinstance(response, dict):
-            raise McpProtocolError("MCP stdio response body was not a JSON object.")
-        return cast("dict[str, Any]", response)
-
-    async def _read_stderr(self, process: asyncio.subprocess.Process) -> str:
-        if process.stderr is None:
-            return ""
-
-        try:
-            data = await asyncio.wait_for(process.stderr.read(), timeout=0.1)
-        except asyncio.TimeoutError:
-            return ""
-        return data.decode("utf-8", errors="replace").strip()
+                raise McpProtocolError("MCP message exceeded the 8 MiB limit.") from exc
+            if not body:
+                raise McpProtocolError("MCP stdio server closed unexpectedly.")
+            if not body.endswith(b"\n"):
+                raise McpProtocolError(
+                    "MCP stdio server returned an incomplete message."
+                )
+            for message in decode_messages(body.rstrip(b"\r\n")):
+                result = await self._handle_message(message, request_id)
+                if result is not None:
+                    return result
 
 
 class StreamableHttpMcpSession(BaseMcpSession):
@@ -404,146 +484,117 @@ class StreamableHttpMcpSession(BaseMcpSession):
         self._session_id: str | None = None
 
     async def close(self) -> None:
-        session_id = self._session_id
-        self._session_id = None
+        session_id, self._session_id = self._session_id, None
         await super().close()
-
         if session_id is None:
             return
-
-        client = await provider_runtime.get_http_client()
-        headers = self._request_headers()
-        headers["Mcp-Session-Id"] = session_id
         try:
-            await client.request(
-                "DELETE",
-                self.config["url"],
-                headers=headers,
-                timeout=build_httpx_timeout(
-                    RequestTimeouts(
-                        connect_timeout_sec=MCP_DEFAULT_CONNECT_TIMEOUT_SEC,
-                        sock_read_timeout_sec=MCP_DEFAULT_READ_TIMEOUT_SEC,
-                    )
-                ),
-            )
-        except httpx.HTTPError:
-            logger.debug(
-                "Ignoring MCP session close failure for %s", self.config["name"]
-            )
+            async with asyncio.timeout(MCP_CLOSE_TIMEOUT_SEC):
+                client = await provider_runtime.get_http_client()
+                headers = self._request_headers()
+                headers["Mcp-Session-Id"] = session_id
+                async with client.stream("DELETE", self.config["url"], headers=headers):
+                    pass
+        except (httpx.HTTPError, TimeoutError):
+            logger.debug("Ignoring MCP session close failure")
 
-    async def _send_notification_locked(
-        self, method: str, params: dict[str, Any]
-    ) -> None:
-        await self._request_locked(
-            {"jsonrpc": "2.0", "method": method, "params": params},
-            expect_response=False,
-        )
+    async def _send_message_locked(self, payload: dict[str, Any]) -> None:
+        await self._request_locked(payload, request_id=None)
 
     async def _send_request_locked(
         self, method: str, params: dict[str, Any]
     ) -> dict[str, Any]:
         request_id = self._take_id()
-        response = await self._request_locked(
+        return await self._request_locked(
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
-            expect_response=True,
+            request_id=request_id,
         )
-        if response.get("id") != request_id:
-            raise McpProtocolError(
-                f"MCP HTTP server returned mismatched id {response.get('id')}"
-            )
-
-        error = response.get("error")
-        if isinstance(error, dict):
-            message = error.get("message") or json.dumps(error, ensure_ascii=True)
-            raise McpProtocolError(str(message))
-
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise McpProtocolError("MCP HTTP response did not include a result object.")
-        return cast("dict[str, Any]", result)
 
     async def _request_locked(
-        self, payload: dict[str, Any], *, expect_response: bool
+        self, payload: dict[str, Any], *, request_id: int | None
     ) -> dict[str, Any]:
+        if self._closed:
+            raise McpError("MCP session is closed.")
         client = await provider_runtime.get_http_client()
         headers = self._request_headers()
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
-
-        response = await client.request(
+        async with client.stream(
             "POST",
             self.config["url"],
             headers=headers,
-            json=payload,
+            content=encode_message(payload),
             timeout=build_httpx_timeout(
                 RequestTimeouts(
                     connect_timeout_sec=MCP_DEFAULT_CONNECT_TIMEOUT_SEC,
                     sock_read_timeout_sec=MCP_DEFAULT_READ_TIMEOUT_SEC,
                 )
             ),
-        )
-        response.raise_for_status()
-
-        response_session_id = response.headers.get("Mcp-Session-Id")
-        if response_session_id:
-            self._session_id = response_session_id
-
-        if not expect_response and not response.content:
-            return {}
-
-        return self._parse_http_response(response)
+        ) as response:
+            response.raise_for_status()
+            session_id = response.headers.get("Mcp-Session-Id")
+            if session_id:
+                self._session_id = session_id
+            if request_id is None:
+                return {}
+            if "text/event-stream" in response.headers.get("Content-Type", ""):
+                async for message in self._sse_messages(response):
+                    result = await self._handle_message(message, request_id)
+                    if result is not None:
+                        return result
+            else:
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > MCP_MAX_MESSAGE_BYTES:
+                        raise McpProtocolError("MCP message exceeded the 8 MiB limit.")
+                for message in decode_messages(bytes(body)):
+                    result = await self._handle_message(message, request_id)
+                    if result is not None:
+                        return result
+            raise McpProtocolError(
+                "MCP stream ended before the requested response arrived."
+            )
 
     def _request_headers(self) -> dict[str, str]:
-        headers = {
+        return {
+            **self.headers,
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
             "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
         }
-        headers.update(build_http_headers(self.config))
-        return headers
 
-    def _parse_http_response(self, response: httpx.Response) -> dict[str, Any]:
-        content_type = response.headers.get("Content-Type", "")
-        if "text/event-stream" in content_type:
-            return self._parse_sse_response(response.text)
-
-        try:
-            payload = response.json()
-        except json.JSONDecodeError as exc:
-            raise McpProtocolError(
-                "MCP HTTP response body was not valid JSON."
-            ) from exc
-
-        if not isinstance(payload, dict):
-            raise McpProtocolError("MCP HTTP response body was not a JSON object.")
-        return cast("dict[str, Any]", payload)
-
-    def _parse_sse_response(self, body: str) -> dict[str, Any]:
-        events = []
-        for chunk in body.split("\n\n"):
-            lines = [line for line in chunk.splitlines() if line.startswith("data:")]
-            if not lines:
-                continue
-            payload = "\n".join(line[5:].strip() for line in lines)
-            if payload == "[DONE]":
-                continue
-            try:
-                event = json.loads(payload)
-            except json.JSONDecodeError as exc:
-                raise McpProtocolError(
-                    "MCP HTTP SSE payload was not valid JSON."
-                ) from exc
-            if isinstance(event, dict):
-                events.append(event)
-
-        if not events:
-            raise McpProtocolError("MCP HTTP SSE response did not contain any events.")
-        return cast("dict[str, Any]", events[-1])
+    async def _sse_messages(
+        self, response: httpx.Response
+    ) -> AsyncIterator[dict[str, Any]]:
+        pending = bytearray()
+        data: list[bytes] = []
+        event_size = 0
+        async for chunk in response.aiter_bytes():
+            pending.extend(chunk)
+            while b"\n" in pending:
+                line, _, remainder = pending.partition(b"\n")
+                pending = remainder
+                line = line.rstrip(b"\r")
+                event_size += len(line)
+                if event_size > MCP_MAX_MESSAGE_BYTES:
+                    raise McpProtocolError("MCP SSE event exceeded the 8 MiB limit.")
+                if not line:
+                    if data:
+                        for message in decode_messages(b"\n".join(data)):
+                            yield message
+                    data = []
+                    event_size = 0
+                elif line.startswith(b"data:"):
+                    data.append(bytes(line[5:]).removeprefix(b" "))
+            if len(pending) + event_size > MCP_MAX_MESSAGE_BYTES:
+                raise McpProtocolError("MCP SSE event exceeded the 8 MiB limit.")
 
 
 class McpRuntime:
     def __init__(self) -> None:
         self._sessions: dict[tuple[asyncio.AbstractEventLoop, str], BaseMcpSession] = {}
+        self._closing: set[asyncio.Task[None]] = set()
 
     def _session_key(
         self, config: McpServerConfig
@@ -559,19 +610,38 @@ class McpRuntime:
             f"Unsupported MCP transport: {config['transport']}"
         )
 
+    async def _close_session(self, session: BaseMcpSession) -> None:
+        try:
+            await session.close()
+        except Exception:
+            logger.warning("Failed to close MCP session")
+
     def get_session(self, config: McpServerConfig) -> BaseMcpSession:
         key = self._session_key(config)
         session = self._sessions.get(key)
+        if session is not None and not session.matches(config):
+            closing = asyncio.create_task(
+                self._close_session(session), context=Context()
+            )
+            self._closing.add(closing)
+            closing.add_done_callback(self._closing.discard)
+            session = None
         if session is None:
             session = self._build_session(config)
             self._sessions[key] = session
         return session
 
-    async def probe_server(self, config: McpServerConfig) -> McpServerProbeResult:
-        session = self.get_session(config)
-        server_info = await session.initialize()
-        tools = await session.list_tools()
-        return McpServerProbeResult(server_info=server_info, tools=tools)
+    async def probe_server(
+        self, config: McpServerConfig, *, isolated: bool = False
+    ) -> McpServerProbeResult:
+        session = self._build_session(config) if isolated else self.get_session(config)
+        try:
+            server_info = await session.initialize()
+            tools = await session.list_tools()
+            return McpServerProbeResult(server_info=server_info, tools=tools)
+        finally:
+            if isolated:
+                await session.close()
 
     async def call_tool(
         self, config: McpServerConfig, tool_name: str, arguments: dict[str, Any]
@@ -581,13 +651,12 @@ class McpRuntime:
 
     async def close_current_session(self) -> None:
         loop = asyncio.get_running_loop()
-        keys_to_remove = [key for key in self._sessions if key[0] is loop]
-        sessions = [self._sessions.pop(key) for key in keys_to_remove]
-        for session in sessions:
-            try:
-                await session.close()
-            except Exception as exc:
-                logger.warning("Failed to close MCP session: %s", exc)
+        keys = [key for key in self._sessions if key[0] is loop]
+        sessions = [self._sessions.pop(key) for key in keys]
+        closing = [task for task in self._closing if task.get_loop() is loop]
+        await asyncio.gather(
+            *(self._close_session(session) for session in sessions), *closing
+        )
 
 
 mcp_runtime = McpRuntime()

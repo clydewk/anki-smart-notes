@@ -18,7 +18,6 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import hashlib
-from typing import Optional
 
 from .models import TTSVoiceTarget
 
@@ -44,7 +43,7 @@ LANGUAGE_ALIASES = {
 }
 
 
-def normalize_tts_language(language: Optional[str]) -> Optional[str]:
+def normalize_tts_language(language: str | None) -> str | None:
     if not language:
         return None
     normalized = language.strip().lower().replace("_", "-")
@@ -53,9 +52,7 @@ def normalize_tts_language(language: Optional[str]) -> Optional[str]:
     return LANGUAGE_ALIASES.get(normalized, normalized)
 
 
-def tts_language_matches(
-    target_language: Optional[str], requested: Optional[str]
-) -> bool:
+def tts_language_matches(target_language: str | None, requested: str | None) -> bool:
     target = normalize_tts_language(target_language)
     requested_language = normalize_tts_language(requested)
     if target is None or requested_language is None:
@@ -67,7 +64,7 @@ def tts_language_matches(
 
 
 def eligible_tts_targets(
-    pool: list[TTSVoiceTarget], language: Optional[str] = None
+    pool: list[TTSVoiceTarget], language: str | None = None
 ) -> list[TTSVoiceTarget]:
     return [
         target
@@ -81,7 +78,7 @@ def eligible_tts_targets(
 
 
 def select_tts_target(
-    pool: list[TTSVoiceTarget], *, language: Optional[str], selection_key: str
+    pool: list[TTSVoiceTarget], *, language: str | None, selection_key: str
 ) -> TTSVoiceTarget:
     eligible = eligible_tts_targets(pool, language)
     if not eligible:

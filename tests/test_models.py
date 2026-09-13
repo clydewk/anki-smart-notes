@@ -17,13 +17,19 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import asyncio
 import base64
 import io
 import json
 import wave
+from collections.abc import AsyncIterator, Callable
+from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
-from typing import Any, Optional, get_args
+from typing import TYPE_CHECKING, Any, cast, get_args
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from src import models
@@ -35,11 +41,28 @@ from src.chat_provider import (
     choose_reasoning_effort,
     filter_openai_text_models,
     prompt_cache_key_for_request,
+    validate_anthropic_completion,
+    validate_chat_completion,
+    validate_google_completion,
+    validate_responses_completion,
 )
+from src.chat_usage import ChatUsageTracker
 from src.constants import DEFAULT_CHAT_MODEL
+from src.field_processor import FieldProcessor
 from src.image_provider import ImageProvider
-from src.provider_runtime import ProviderHTTPError, StreamingNotSupportedError
+from src.job_context import JobContext, current_job
+from src.provider_runtime import (
+    ProviderHTTPError,
+    ProviderRuntime,
+    ResponseFormatError,
+    StreamingNotSupportedError,
+    request_accounting,
+)
+from src.tasks import JobHandle
 from src.tts_provider import TTSProvider
+
+if TYPE_CHECKING:
+    from anki.decks import DeckId
 
 
 def test_curated_openai_chat_models_are_ordered_and_labeled() -> None:
@@ -269,9 +292,9 @@ def response_created_event(response_id: str) -> dict[str, Any]:
 def response_completed_event(
     response_id: str,
     *,
-    text: Optional[str] = None,
-    usage: Optional[dict[str, Any]] = None,
-    output: Optional[list[dict[str, Any]]] = None,
+    text: str | None = None,
+    usage: dict[str, Any] | None = None,
+    output: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     response: dict[str, Any] = {"id": response_id}
     if text is not None:
@@ -288,7 +311,7 @@ def function_call_item(
     call_id: str,
     name: str,
     arguments: str,
-    item_id: Optional[str] = None,
+    item_id: str | None = None,
 ) -> dict[str, Any]:
     return {
         "type": "function_call",
@@ -305,7 +328,7 @@ def function_call_added_event(
     output_index: int,
     call_id: str,
     name: str,
-    item_id: Optional[str] = None,
+    item_id: str | None = None,
 ) -> dict[str, Any]:
     return {
         "type": "response.output_item.added",
@@ -341,10 +364,10 @@ def function_call_done_event(
     *,
     output_index: int,
     call_id: str,
-    name: Optional[str],
+    name: str | None,
     arguments: str,
-    item_id: Optional[str] = None,
-    item: Optional[dict[str, Any]] = None,
+    item_id: str | None = None,
+    item: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "type": "response.function_call_arguments.done",
@@ -364,7 +387,7 @@ def function_call_done_event(
 def make_stream_sse_json(
     turns: list[list[dict[str, Any]]],
     *,
-    payloads: Optional[list[dict[str, Any]]] = None,
+    payloads: list[dict[str, Any]] | None = None,
 ):
     turn_index = 0
 
@@ -394,7 +417,7 @@ def make_stream_sse_json(
 async def test_openai_payload_with_reasoning(
     monkeypatch: pytest.MonkeyPatch,
     model: str,
-    effort: Optional[models.OpenAIReasoningEffort],
+    effort: models.OpenAIReasoningEffort | None,
     expected: str,
 ) -> None:
     cp = ChatProvider()
@@ -412,6 +435,7 @@ async def test_openai_payload_with_reasoning(
         yield {
             "type": "response.completed",
             "response": {
+                "status": "completed",
                 "id": "resp_123",
                 "usage": {"total_tokens": 9},
                 "output_text": "hello",
@@ -459,7 +483,7 @@ async def test_openai_payload_with_reasoning(
 async def test_openai_fast_mode_sets_service_tier(
     monkeypatch: pytest.MonkeyPatch,
     model: str,
-    endpoint: Optional[str],
+    endpoint: str | None,
     fast: bool,
 ) -> None:
     cp = ChatProvider()
@@ -496,7 +520,7 @@ async def test_openai_fast_mode_sets_service_tier(
 
 
 @pytest.mark.asyncio
-async def test_reasoning_trace_logging_when_debug_enabled(
+async def test_reasoning_content_is_never_logged_when_debug_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cp = ChatProvider()
@@ -554,8 +578,8 @@ async def test_reasoning_trace_logging_when_debug_enabled(
 
     assert result.text == "final answer"
     joined_logs = "\n".join(logged_messages)
-    assert "Checking local examples." in joined_logs
-    assert "Using bold-tag convention." in joined_logs
+    assert "Checking local examples." not in joined_logs
+    assert "Using bold-tag convention." not in joined_logs
     assert "opaque-secret" not in joined_logs
 
 
@@ -638,6 +662,7 @@ async def test_custom_provider_without_api_key_omits_auth_header(
         yield {
             "type": "response.completed",
             "response": {
+                "status": "completed",
                 "id": "resp_local",
                 "output_text": "hello from local",
             },
@@ -697,9 +722,10 @@ async def test_custom_provider_chat_completions_mode_returns_text(
         return {
             "choices": [
                 {
+                    "finish_reason": "stop",
                     "message": {
                         "content": "chat completions result",
-                    }
+                    },
                 }
             ]
         }
@@ -1269,7 +1295,11 @@ async def test_openai_responses_tool_loop_executes_tool_calls(
     assert payloads[1]["stream"] is True
     assert payloads[1]["previous_response_id"] == "resp_1"
     assert payloads[1]["input"] == [
-        {"type": "function_call_output", "call_id": "call_1", "output": "tool:hi"}
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "tool:hi",
+        }
     ]
 
 
@@ -1693,9 +1723,13 @@ async def test_custom_responses_tool_loop_executes_tool_calls(
     )
 
     async def fake_request_json(**kwargs: Any) -> dict[str, Any]:
+        accounting = request_accounting.get()
+        if accounting is not None:
+            accounting.start_request()
         payloads.append(kwargs["json_payload"])
         if len(payloads) == 1:
             return {
+                "status": "completed",
                 "id": "resp_custom_1",
                 "output": [
                     {
@@ -1710,6 +1744,7 @@ async def test_custom_responses_tool_loop_executes_tool_calls(
             }
 
         return {
+            "status": "completed",
             "id": "resp_custom_2",
             "output_text": "tool-backed answer",
             "usage": {"output_tokens": 3},
@@ -1748,7 +1783,11 @@ async def test_custom_responses_tool_loop_executes_tool_calls(
     assert payloads[1]["store"] is True
     assert payloads[1]["previous_response_id"] == "resp_custom_1"
     assert payloads[1]["input"] == [
-        {"type": "function_call_output", "call_id": "call_1", "output": "tool:hi"}
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "tool:hi",
+        }
     ]
 
 
@@ -1776,6 +1815,7 @@ async def test_custom_responses_tool_loop_streaming_falls_back_to_non_streaming(
         payloads.append(kwargs["json_payload"])
         if len(payloads) == 1:
             return {
+                "status": "completed",
                 "id": "resp_custom_1",
                 "output": [
                     {
@@ -1790,6 +1830,7 @@ async def test_custom_responses_tool_loop_streaming_falls_back_to_non_streaming(
             }
 
         return {
+            "status": "completed",
             "id": "resp_custom_2",
             "output_text": "tool-backed answer",
             "usage": {"output_tokens": 3},
@@ -1994,7 +2035,7 @@ async def test_custom_provider_streaming_falls_back_to_non_streaming(
         del kwargs
         nonlocal request_calls
         request_calls += 1
-        return {"id": "resp_1", "output_text": "fallback text"}
+        return {"status": "completed", "id": "resp_1", "output_text": "fallback text"}
 
     monkeypatch.setattr(
         "src.chat_provider.provider_runtime.stream_sse_json",
@@ -2153,6 +2194,7 @@ async def test_custom_chat_completions_tool_loop_executes_tool_calls(
                 "id": "chat_1",
                 "choices": [
                     {
+                        "finish_reason": "tool_calls",
                         "message": {
                             "content": None,
                             "tool_calls": [
@@ -2165,7 +2207,7 @@ async def test_custom_chat_completions_tool_loop_executes_tool_calls(
                                     },
                                 }
                             ],
-                        }
+                        },
                     }
                 ],
                 "usage": {"prompt_tokens": 2},
@@ -2173,7 +2215,7 @@ async def test_custom_chat_completions_tool_loop_executes_tool_calls(
 
         return {
             "id": "chat_2",
-            "choices": [{"message": {"content": "done"}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": "done"}}],
             "usage": {"completion_tokens": 1},
         }
 
@@ -2214,3 +2256,736 @@ async def test_custom_chat_completions_tool_loop_executes_tool_calls(
         "tool_call_id": "call_1",
         "content": "tool:hi",
     }
+
+
+@pytest.mark.parametrize(
+    ("validator", "response"),
+    [
+        (
+            validate_responses_completion,
+            {"status": "incomplete", "output_text": "partial"},
+        ),
+        (validate_responses_completion, {"output_text": "missing status"}),
+        (
+            validate_responses_completion,
+            {"status": "completed", "output": [{"content": [{"type": "refusal"}]}]},
+        ),
+        (
+            validate_chat_completion,
+            {
+                "choices": [
+                    {"finish_reason": "length", "message": {"content": "partial"}}
+                ]
+            },
+        ),
+        (
+            validate_chat_completion,
+            {"choices": [{"finish_reason": "stop", "message": {"refusal": "refused"}}]},
+        ),
+        (validate_anthropic_completion, {"stop_reason": "max_tokens"}),
+        (validate_anthropic_completion, {"stop_reason": "refusal"}),
+        (validate_google_completion, {"candidates": [{"finishReason": "MAX_TOKENS"}]}),
+        (validate_google_completion, {"candidates": [{"finishReason": "SAFETY"}]}),
+    ],
+)
+def test_unsuccessful_terminal_states_are_rejected(
+    validator: Callable[[Any], None], response: dict[str, Any]
+) -> None:
+    with pytest.raises(ResponseFormatError):
+        validator(response)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_mode", ["responses", "chat_completions"])
+async def test_truncated_stream_is_not_a_successful_response(
+    monkeypatch: pytest.MonkeyPatch, api_mode: str
+) -> None:
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        custom_provider_test_config(chat_api_mode=api_mode, streaming_mode="enabled"),
+    )
+    events = (
+        [{"type": "response.output_text.delta", "delta": "partial"}]
+        if api_mode == "responses"
+        else [{"choices": [{"delta": {"content": "partial"}}]}]
+    )
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json([events]),
+    )
+    fallback = AsyncMock()
+    monkeypatch.setattr("src.chat_provider.provider_runtime.request_json", fallback)
+    with pytest.raises(ResponseFormatError, match="ended before"):
+        await ChatProvider().generate_text(
+            TextGenerationRequest("hello", "compat-model", "Compat", 0.5, None)
+        )
+    fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partial_custom_stream_is_never_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        custom_provider_test_config(streaming_mode="enabled"),
+    )
+
+    async def stream(**kwargs: Any) -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.output_text.delta", "delta": "partial"}
+        raise StreamingNotSupportedError("stream changed protocol")
+
+    monkeypatch.setattr("src.chat_provider.provider_runtime.stream_sse_json", stream)
+    fallback = AsyncMock()
+    monkeypatch.setattr("src.chat_provider.provider_runtime.request_json", fallback)
+    with pytest.raises(StreamingNotSupportedError):
+        await ChatProvider().generate_text(
+            TextGenerationRequest("hello", "compat-model", "Compat", 0.5, None)
+        )
+    fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatched", [False, True])
+async def test_cancelled_openai_request_releases_reservation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatched: bool
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "usage.json"))
+    configuration = custom_provider_test_config()
+    configuration.custom_providers = []
+    configuration.openai_api_key = "test-key"
+    configuration.openai_endpoint = "https://api.openai.com"
+    configuration.openai_daily_token_budget_enabled = True
+    monkeypatch.setattr("src.chat_provider.config", configuration)
+    monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    waiting = asyncio.Event()
+
+    async def stream(**kwargs: Any) -> AsyncIterator[dict[str, Any]]:
+        accounting = request_accounting.get()
+        assert accounting is not None
+        accounting.dispatched = dispatched
+        waiting.set()
+        await asyncio.Event().wait()
+        yield response_completed_event("unreachable")
+
+    monkeypatch.setattr("src.chat_provider.provider_runtime.stream_sse_json", stream)
+    task = asyncio.create_task(
+        ChatProvider().generate_text(
+            TextGenerationRequest("hello", "gpt-5.6-sol", "openai", 0.5, None)
+        )
+    )
+    await asyncio.wait_for(waiting.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert tracker.active_turn_reserved_total_locked() == 0
+    usage = tracker.get_openai_daily_usage()
+    assert bool(usage.estimated_total_tokens) == dispatched
+    assert usage.used_total_tokens == usage.estimated_total_tokens
+    assert request_accounting.get() is None
+
+
+@pytest.mark.asyncio
+async def test_failed_openai_response_records_measured_usage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "usage.json"))
+    configuration = custom_provider_test_config()
+    configuration.custom_providers = []
+    configuration.openai_api_key = "test-key"
+    configuration.openai_endpoint = "https://api.openai.com"
+    configuration.openai_daily_token_budget_enabled = True
+    monkeypatch.setattr("src.chat_provider.config", configuration)
+    monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    {
+                        "type": "response.incomplete",
+                        "response": {
+                            "status": "incomplete",
+                            "usage": {"input_tokens": 10, "output_tokens": 20},
+                        },
+                    }
+                ]
+            ]
+        ),
+    )
+    with pytest.raises(ResponseFormatError):
+        await ChatProvider().generate_text(
+            TextGenerationRequest("hello", "gpt-5.6-sol", "openai", 0.5, None)
+        )
+    usage = tracker.get_openai_daily_usage()
+    assert usage.used_total_tokens == 30
+    assert usage.estimated_total_tokens == 0
+    assert tracker.active_turn_reserved_total_locked() == 0
+
+
+@pytest.mark.asyncio
+async def test_google_tool_history_preserves_opaque_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(google_api_key="secret", custom_providers=[]),
+    )
+    content = {
+        "role": "model",
+        "parts": [
+            {"thought": True, "text": "internal", "thoughtSignature": "opaque-one"},
+            {
+                "functionCall": {
+                    "name": "echo",
+                    "id": "call-one",
+                    "args": {"text": "hello"},
+                },
+                "thoughtSignature": "opaque-two",
+            },
+        ],
+    }
+    requests: list[dict[str, Any]] = []
+
+    async def request(**kwargs: Any) -> dict[str, Any]:
+        requests.append(kwargs)
+        response_content = (
+            content if len(requests) == 1 else {"parts": [{"text": "answer"}]}
+        )
+        return {"candidates": [{"finishReason": "STOP", "content": response_content}]}
+
+    monkeypatch.setattr("src.chat_provider.provider_runtime.request_json", request)
+    result = await ChatProvider().generate_text(
+        TextGenerationRequest(
+            "hello",
+            "gemini-3.1-pro-preview",
+            "google",
+            0.5,
+            None,
+            tools=[TextToolDefinition("echo", "Echo", {"type": "object"})],
+        ),
+        tool_executor=AsyncMock(return_value="hello"),
+    )
+    assert result.text == "answer"
+    assert requests[1]["json_payload"]["contents"][1] == content
+    assert (
+        requests[1]["json_payload"]["contents"][2]["parts"][0]["functionResponse"]["id"]
+        == "call-one"
+    )
+    assert requests[0]["headers"]["x-goog-api-key"] == "secret"
+    assert "secret" not in requests[0]["url"]
+    assert requests[0]["json_payload"]["generationConfig"]["maxOutputTokens"] == 6144
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_cache_is_scoped_to_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = SimpleNamespace(openai_api_key="first-key", openai_endpoint=None)
+    monkeypatch.setattr("src.chat_provider.config", configuration)
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.request_json",
+        AsyncMock(return_value={"data": [{"id": "gpt-5.6-sol"}]}),
+    )
+    provider = ChatProvider()
+    assert await provider.fetch_openai_chat_models() == ["gpt-5.6-sol"]
+    configuration.openai_api_key = "second-key"
+    assert provider.get_cached_openai_chat_models() == []
+    configuration.openai_api_key = "first-key"
+    configuration.openai_endpoint = "https://another.example"
+    assert provider.get_cached_openai_chat_models() == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_stream_is_never_replayed_or_executed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        custom_provider_test_config(streaming_mode="enabled"),
+    )
+    monkeypatch.setattr(
+        "src.chat_provider.provider_runtime.stream_sse_json",
+        make_stream_sse_json(
+            [
+                [
+                    function_call_done_event(
+                        "resp",
+                        output_index=0,
+                        call_id="call",
+                        name=None,
+                        arguments='{"text":"hello"}',
+                    ),
+                    response_completed_event("resp"),
+                ]
+            ]
+        ),
+    )
+    fallback = AsyncMock()
+    executor = AsyncMock()
+    monkeypatch.setattr("src.chat_provider.provider_runtime.request_json", fallback)
+    with pytest.raises(ResponseFormatError, match="tool name"):
+        await ChatProvider().generate_text(
+            TextGenerationRequest(
+                "hello",
+                "compat-model",
+                "Compat",
+                0.5,
+                None,
+                tools=[TextToolDefinition("echo", "Echo", {"type": "object"})],
+            ),
+            tool_executor=executor,
+        )
+    fallback.assert_not_awaited()
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_repeated_job_cancellation_preserves_contended_ledger_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "usage.json"))
+    configuration = custom_provider_test_config()
+    configuration.custom_providers = []
+    configuration.openai_api_key = "test-key"
+    configuration.openai_endpoint = "https://api.openai.com"
+    configuration.openai_daily_token_budget_enabled = True
+    monkeypatch.setattr("src.chat_provider.config", configuration)
+    monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    entered = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    cleanup_done = asyncio.Event()
+    finalize = tracker.finalize_openai_turn
+
+    async def record(**kwargs: Any) -> None:
+        cleanup_entered.set()
+        try:
+            await finalize(**kwargs)
+        finally:
+            cleanup_done.set()
+
+    monkeypatch.setattr(tracker, "finalize_openai_turn", record)
+
+    async def stream(**kwargs: Any) -> AsyncIterator[dict[str, Any]]:
+        accounting = request_accounting.get()
+        assert accounting is not None
+        accounting.dispatched = True
+        entered.set()
+        await asyncio.Event().wait()
+        yield response_completed_event("unreachable")
+
+    monkeypatch.setattr("src.chat_provider.provider_runtime.stream_sse_json", stream)
+    active = Event()
+    active.set()
+    context = JobContext(object(), 1, active)
+    token = current_job.set(context)
+    loop = asyncio.get_running_loop()
+    future = asyncio.run_coroutine_threadsafe(
+        ChatProvider().generate_text(
+            TextGenerationRequest("hello", "gpt-5.6-sol", "openai", 0.5, None)
+        ),
+        loop,
+    )
+    current_job.reset(token)
+    handle = JobHandle(future, context, loop, None)
+    await asyncio.wait_for(entered.wait(), 1)
+    condition = tracker.turn_permit_condition()
+    async with condition:
+        handle.cancel()
+        await asyncio.wait_for(cleanup_entered.wait(), 1)
+        handle.cancel()
+        await asyncio.sleep(0)
+        assert not cleanup_done.is_set()
+    await asyncio.wait_for(cleanup_done.wait(), 1)
+    assert tracker.active_turn_reserved_total_locked() == 0
+    assert tracker.get_openai_daily_usage().estimated_total_tokens > 0
+
+
+def non_openai_response(
+    provider: str, *, finish: bool, tool_call: bool = False
+) -> dict[str, Any]:
+    usage = {"input_tokens": 10, "output_tokens": 20}
+    if provider == "google":
+        return {
+            "candidates": [
+                {
+                    "finishReason": "STOP" if finish else "MAX_TOKENS",
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"functionCall": {"id": "call", "name": "echo", "args": {}}}
+                            if tool_call
+                            else {"text": "answer"}
+                        ],
+                    },
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 20,
+                "totalTokenCount": 30,
+            },
+        }
+    if provider == "anthropic":
+        return {
+            "stop_reason": ("tool_use" if tool_call else "end_turn")
+            if finish
+            else "max_tokens",
+            "content": [
+                {"type": "tool_use", "id": "call", "name": "echo", "input": {}}
+                if tool_call
+                else {"type": "text", "text": "answer"}
+            ],
+            "usage": usage,
+        }
+    return {
+        "choices": [
+            {
+                "finish_reason": ("tool_calls" if tool_call else "stop")
+                if finish
+                else "length",
+                "message": {
+                    "content": "" if tool_call else "answer",
+                    "tool_calls": [
+                        {
+                            "id": "call",
+                            "type": "function",
+                            "function": {
+                                "name": "echo",
+                                "arguments": "{}",
+                            },
+                        }
+                    ]
+                    if tool_call
+                    else [],
+                },
+            }
+        ],
+        "usage": usage,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider,model",
+    [
+        ("google", "gemini-3.1-pro-preview"),
+        ("anthropic", "claude-sonnet-4-6"),
+        ("deepseek", "deepseek-v4-flash"),
+    ],
+)
+async def test_failed_non_openai_usage_is_recorded_and_success_is_not_counted_twice(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, provider: str, model: str
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "usage.json"))
+    configuration = SimpleNamespace(
+        custom_providers=[],
+        google_api_key="key",
+        anthropic_api_key="key",
+        deepseek_api_key="key",
+        allow_empty_fields=False,
+    )
+    monkeypatch.setattr("src.chat_provider.config", configuration)
+    monkeypatch.setattr("src.field_processor.config", configuration)
+    monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    monkeypatch.setattr("src.field_processor.chat_usage_tracker", tracker)
+    responses = iter(
+        [
+            non_openai_response(provider, finish=False),
+            non_openai_response(provider, finish=True),
+        ]
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(responses))
+
+    runtime = ProviderRuntime()
+    scope = tracker.open_scope()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(runtime, "get_http_client", AsyncMock(return_value=client))
+        monkeypatch.setattr("src.chat_provider.provider_runtime", runtime)
+        processor = FieldProcessor(ChatProvider(), TTSProvider(), ImageProvider())
+
+        async def generate() -> str | None:
+            return await processor.get_chat_response(
+                note_id=1,
+                note_type="Basic",
+                deck_name="Default",
+                field_order=("Front", "Back"),
+                values={"front": "source", "back": ""},
+                deck_id=cast("DeckId", 1),
+                prompt="Explain {{Front}}",
+                model=model,
+                provider=provider,
+                field_lower="back",
+                temperature=0.5,
+                should_convert_to_html=False,
+                usage_scope_id=scope,
+                show_error_box=False,
+            )
+
+        with pytest.raises(ResponseFormatError):
+            await generate()
+        stats = tracker.get_runtime_profile_usage(
+            provider=provider,
+            model=model,
+            reasoning_effort=None,
+            use_tools=False,
+        )
+        assert stats is not None and stats.run_count == 1
+        assert stats.avg_total_tokens == 30
+        assert await generate() == "answer"
+    stats = tracker.get_runtime_profile_usage(
+        provider=provider,
+        model=model,
+        reasoning_effort=None,
+        use_tools=False,
+    )
+    assert stats is not None and stats.run_count == 2
+    summary = tracker.close_scope(scope)
+    assert summary.request_count == 2
+    assert summary.total_tokens == 60
+    assert tracker.get_openai_daily_usage().used_total_tokens == 0
+    assert request_accounting.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider,model",
+    [
+        ("google", "gemini-3.1-pro-preview"),
+        ("anthropic", "claude-sonnet-4-6"),
+        ("deepseek", "deepseek-v4-flash"),
+    ],
+)
+async def test_failed_tool_generation_keeps_usage_from_all_reported_turns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, provider: str, model: str
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "usage.json"))
+    configuration = SimpleNamespace(
+        custom_providers=[],
+        google_api_key="key",
+        anthropic_api_key="key",
+        deepseek_api_key="key",
+    )
+    monkeypatch.setattr("src.chat_provider.config", configuration)
+    monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    responses = iter(
+        [
+            non_openai_response(provider, finish=True, tool_call=True),
+            non_openai_response(provider, finish=False),
+        ]
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(responses))
+
+    runtime = ProviderRuntime()
+    executor = AsyncMock(return_value="tool output")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(runtime, "get_http_client", AsyncMock(return_value=client))
+        monkeypatch.setattr("src.chat_provider.provider_runtime", runtime)
+        with pytest.raises(ResponseFormatError):
+            await ChatProvider().generate_text(
+                TextGenerationRequest(
+                    "hello",
+                    model,
+                    provider,
+                    0.5,
+                    None,
+                    tools=[TextToolDefinition("echo", "Echo", {"type": "object"})],
+                ),
+                tool_executor=executor,
+            )
+    executor.assert_awaited_once()
+    stats = tracker.get_runtime_profile_usage(
+        provider=provider,
+        model=model,
+        reasoning_effort=None,
+        use_tools=True,
+    )
+    assert stats is not None and stats.run_count == 1
+    assert stats.avg_total_tokens == 60
+    assert tracker.get_openai_daily_usage().used_total_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_generation_records_usage_without_reopening_closed_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "usage.json"))
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            custom_providers=[],
+            google_api_key="key",
+        ),
+    )
+    monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    runtime = ProviderRuntime()
+    scope = tracker.open_scope()
+    entered = asyncio.Event()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json=non_openai_response("google", finish=True, tool_call=True)
+        )
+
+    async def execute(name: str, arguments: dict[str, Any]) -> str:
+        entered.set()
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(runtime, "get_http_client", AsyncMock(return_value=client))
+        monkeypatch.setattr("src.chat_provider.provider_runtime", runtime)
+        task = asyncio.create_task(
+            ChatProvider().generate_text(
+                TextGenerationRequest(
+                    "hello",
+                    "gemini-3.1-pro-preview",
+                    "google",
+                    0.5,
+                    None,
+                    tools=[TextToolDefinition("echo", "Echo", {"type": "object"})],
+                    usage_scope_id=scope,
+                ),
+                tool_executor=execute,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 1)
+        tracker.close_scope(scope)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    stats = tracker.get_runtime_profile_usage(
+        provider="google",
+        model="gemini-3.1-pro-preview",
+        reasoning_effort=None,
+        use_tools=True,
+    )
+    assert stats is not None and stats.avg_total_tokens == 30
+    assert tracker.close_scope(scope).request_count == 0
+
+
+@pytest.mark.asyncio
+async def test_recovered_http_failure_usage_is_included_once_in_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "usage.json"))
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        SimpleNamespace(
+            custom_providers=[],
+            google_api_key="key",
+        ),
+    )
+    monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    replies = iter(
+        [
+            httpx.Response(
+                500,
+                json={
+                    "error": {"message": "retry"},
+                    "usageMetadata": {"totalTokenCount": 7},
+                },
+            ),
+            httpx.Response(200, json=non_openai_response("google", finish=True)),
+        ]
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return next(replies)
+
+    runtime = ProviderRuntime()
+    monkeypatch.setattr(runtime, "_retry_delay", lambda *args: 0)
+    monkeypatch.setattr("src.provider_runtime.RETRY_BASE_SECONDS", 0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(runtime, "get_http_client", AsyncMock(return_value=client))
+        monkeypatch.setattr("src.chat_provider.provider_runtime", runtime)
+        result = await ChatProvider().generate_text(
+            TextGenerationRequest(
+                "hello",
+                "gemini-3.1-pro-preview",
+                "google",
+                0.5,
+                None,
+            )
+        )
+    assert result.text == "answer"
+    assert result.usage is not None and result.usage["totalTokenCount"] == 37
+    assert (
+        tracker.get_runtime_profile_usage(
+            provider="google",
+            model="gemini-3.1-pro-preview",
+            reasoning_effort=None,
+            use_tools=False,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported", [False, True])
+async def test_openai_retry_keeps_each_dispatched_attempt_in_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reported: bool
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "usage.json"))
+    configuration = custom_provider_test_config()
+    configuration.custom_providers = []
+    configuration.openai_api_key = "test-key"
+    configuration.openai_endpoint = "https://api.openai.com"
+    configuration.openai_daily_token_budget_enabled = True
+    monkeypatch.setattr("src.chat_provider.config", configuration)
+    monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    failed: dict[str, Any] = {"error": {"message": "retry"}}
+    if reported:
+        failed["usage"] = {"input_tokens": 3, "output_tokens": 4}
+    event = {
+        "type": "response.completed",
+        "response": {
+            "id": "response",
+            "status": "completed",
+            "output_text": "answer",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        },
+    }
+    replies = iter(
+        [
+            httpx.Response(500, json=failed),
+            httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                text=f"data: {json.dumps(event)}\n\n",
+            ),
+        ]
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return next(replies)
+
+    runtime = ProviderRuntime()
+    monkeypatch.setattr(runtime, "_retry_delay", lambda *args: 0)
+    monkeypatch.setattr("src.provider_runtime.RETRY_BASE_SECONDS", 0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(runtime, "get_http_client", AsyncMock(return_value=client))
+        monkeypatch.setattr("src.chat_provider.provider_runtime", runtime)
+        result = await ChatProvider().generate_text(
+            TextGenerationRequest(
+                "hello",
+                "gpt-5.6-sol",
+                "openai",
+                0.5,
+                None,
+            )
+        )
+    assert result.text == "answer"
+    usage = tracker.get_openai_daily_usage()
+    assert usage.request_count == 2
+    if reported:
+        assert usage.used_total_tokens == 37
+        assert usage.estimated_total_tokens == 0
+    else:
+        assert usage.estimated_total_tokens > 0
+        assert usage.used_total_tokens == usage.estimated_total_tokens + 30
+    assert tracker.active_turn_reserved_total_locked() == 0

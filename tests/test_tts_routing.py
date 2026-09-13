@@ -17,8 +17,6 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Optional
-
 import pytest
 
 from src.models import TTSVoiceTarget
@@ -30,7 +28,7 @@ from src.tts_routing import (
 
 
 def target(
-    voice: str, *, language: Optional[str] = None, enabled: bool = True
+    voice: str, *, language: str | None = None, enabled: bool = True
 ) -> TTSVoiceTarget:
     return {
         "provider": "fish",

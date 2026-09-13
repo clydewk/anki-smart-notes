@@ -247,7 +247,7 @@ class TTSProvider:
         try:
             return self._extract_google_gemini_audio_bytes(data)
         except (KeyError, IndexError) as exc:
-            logger.error(f"Unexpected response format from Google Gemini TTS: {data}")
+            logger.error("Google Gemini TTS returned an invalid audio payload.")
             raise Exception(
                 "Failed to extract audio from Google Gemini response"
             ) from exc

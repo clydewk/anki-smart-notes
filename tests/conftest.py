@@ -30,16 +30,21 @@ sys.modules["aqt"] = MagicMock()
 sys.modules["aqt.addons"] = MagicMock()
 sys.modules["aqt.operations"] = MagicMock()
 sys.modules["aqt.qt"] = MagicMock()
+sys.modules["aqt.utils"] = MagicMock()
 sys.modules["anki"] = MagicMock()
 sys.modules["anki.cards"] = MagicMock()
+sys.modules["anki.collection"] = MagicMock()
 sys.modules["anki.decks"] = MagicMock()
 sys.modules["anki.notes"] = MagicMock()
+sys.modules["anki.errors"] = MagicMock(
+    NotFoundError=type("NotFoundError", (Exception,), {})
+)
 sys.modules["anki.utils"] = MagicMock(strip_html=lambda text: text)
 os.environ["IS_TEST"] = "True"
 
 
 @pytest.fixture
-def mock_config(monkeypatch):
+def mock_config(monkeypatch: pytest.MonkeyPatch):
     config = MockConfig(
         prompts_map={
             "note_types": {
@@ -65,12 +70,12 @@ def mock_config(monkeypatch):
             }
         }
     )
-    monkeypatch.setattr("src.migrations.config", config)
+    monkeypatch.setattr("src.migrations.config", config, raising=False)
     return config
 
 
 @pytest.fixture
-def mock_logger(monkeypatch):
+def mock_logger(monkeypatch: pytest.MonkeyPatch):
     logger = MagicMock()
-    monkeypatch.setattr("src.migrations.logger", logger)
+    monkeypatch.setattr("src.migrations.logger", logger, raising=False)
     return logger

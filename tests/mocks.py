@@ -17,9 +17,9 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+from collections.abc import ItemsView, KeysView
+from dataclasses import dataclass
 from typing import Any
-
-from attr import dataclass
 
 
 @dataclass
@@ -70,31 +70,35 @@ class MockConfig:
         object.__setattr__(self, name, value)
 
 
-@dataclass
 class MockNote:
-    _note_type: str
-    _data: dict[str, Any]
+    id: int = 1
+    mid: int = 1
 
-    id = 1
+    def __init__(self, note_type: str, data: dict[str, str]) -> None:
+        self._note_type = note_type
+        self._data = data
 
-    def note_type(self):
+    def note_type(self) -> dict[str, str]:
         return {"name": self._note_type}
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str) -> str:
         return self._data[key]
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: str, value: str) -> None:
         self._data[key] = value
 
-    def __contains__(self, key):
+    def __contains__(self, key: str) -> bool:
         return key in self._data
 
-    def items(self):
+    def items(self) -> ItemsView[str, str]:
         return self._data.items()
 
-    def fields(self):
+    def keys(self) -> KeysView[str]:
+        return self._data.keys()
+
+    def fields(self) -> KeysView[str]:
         return self._data.keys()
 
 
-def p(str) -> str:
-    return f"p_{str}"
+def p(value: str) -> str:
+    return f"p_{value}"

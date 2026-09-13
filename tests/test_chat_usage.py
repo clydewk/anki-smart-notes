@@ -20,7 +20,8 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -31,6 +32,9 @@ from src.chat_usage import (
     build_prompt_usage_signature,
     normalize_chat_usage,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class Clock:
@@ -71,14 +75,16 @@ class Clock:
         ({"input_tokens": 6, "output_tokens": 4}, (6, 4, 10, 0, 0)),
     ],
 )
-def test_normalize_chat_usage(raw_usage, expected) -> None:
+def test_normalize_chat_usage(
+    raw_usage: dict[str, Any], expected: tuple[int, ...]
+) -> None:
     usage = normalize_chat_usage(raw_usage)
     assert usage is not None
     assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == expected[:3]
 
 
-def test_prompt_usage_lookup_resets_when_signature_changes(tmp_path) -> None:
-    clock = Clock(datetime(2026, 3, 22, tzinfo=timezone.utc))
+def test_prompt_usage_lookup_resets_when_signature_changes(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 3, 22, tzinfo=UTC))
     tracker = ChatUsageTracker(
         state_path=str(tmp_path / "chat_usage.json"),
         now_fn=clock.now,
@@ -128,7 +134,7 @@ def test_prompt_usage_lookup_resets_when_signature_changes(tmp_path) -> None:
     assert changed_snapshot is None
 
 
-def test_global_prompt_usage_lookup_aggregates_matching_decks(tmp_path) -> None:
+def test_global_prompt_usage_lookup_aggregates_matching_decks(tmp_path: Path) -> None:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
     signature = build_prompt_usage_signature(
         prompt="Question: {{Front}}",
@@ -174,7 +180,7 @@ def test_global_prompt_usage_lookup_aggregates_matching_decks(tmp_path) -> None:
     assert aggregate_snapshot.avg_response_chars is None
 
 
-def test_prompt_usage_snapshot_tracks_avg_response_chars(tmp_path) -> None:
+def test_prompt_usage_snapshot_tracks_avg_response_chars(tmp_path: Path) -> None:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
     signature = build_prompt_usage_signature(
         prompt="Question: {{Front}}",
@@ -207,8 +213,8 @@ def test_prompt_usage_snapshot_tracks_avg_response_chars(tmp_path) -> None:
     assert snapshot.avg_response_chars == 80
 
 
-def test_openai_daily_usage_resets_on_utc_rollover(tmp_path) -> None:
-    clock = Clock(datetime(2026, 3, 22, 23, 59, tzinfo=timezone.utc))
+def test_openai_daily_usage_resets_on_utc_rollover(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 3, 22, 23, 59, tzinfo=UTC))
     tracker = ChatUsageTracker(
         state_path=str(tmp_path / "chat_usage.json"),
         now_fn=clock.now,
@@ -236,9 +242,9 @@ def test_openai_daily_usage_resets_on_utc_rollover(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_openai_budget_waits_for_active_turns_before_rejecting(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
-    clock = Clock(datetime(2026, 3, 22, tzinfo=timezone.utc))
+    clock = Clock(datetime(2026, 3, 22, tzinfo=UTC))
     tracker = ChatUsageTracker(
         state_path=str(tmp_path / "chat_usage.json"),
         now_fn=clock.now,
@@ -290,7 +296,7 @@ async def test_openai_budget_waits_for_active_turns_before_rejecting(
 
 
 @pytest.mark.asyncio
-async def test_openai_budget_respects_transport_window(tmp_path) -> None:
+async def test_openai_budget_respects_transport_window(tmp_path: Path) -> None:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
 
     first_permit = await tracker.acquire_openai_turn_permit(
@@ -331,7 +337,7 @@ async def test_openai_budget_respects_transport_window(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_openai_budget_uses_max_observed_output_tokens(tmp_path) -> None:
+async def test_openai_budget_uses_max_observed_output_tokens(tmp_path: Path) -> None:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
     prompt_key = build_prompt_usage_key("Basic", 1, "Front")
     prompt_signature = build_prompt_usage_signature(
@@ -374,7 +380,7 @@ async def test_openai_budget_uses_max_observed_output_tokens(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_openai_budget_uses_utf8_bytes_for_cjk_prompts(tmp_path) -> None:
+async def test_openai_budget_uses_utf8_bytes_for_cjk_prompts(tmp_path: Path) -> None:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
     prompt = "漢" * 12
 
@@ -395,7 +401,7 @@ async def test_openai_budget_uses_utf8_bytes_for_cjk_prompts(tmp_path) -> None:
     await tracker.release_openai_turn_permit(permit)
 
 
-def test_finalize_request_can_skip_openai_daily_ledger(tmp_path) -> None:
+def test_finalize_request_can_skip_openai_daily_ledger(tmp_path: Path) -> None:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
 
     tracker.finalize_request(
@@ -413,7 +419,7 @@ def test_finalize_request_can_skip_openai_daily_ledger(tmp_path) -> None:
     assert daily_usage.request_count == 0
 
 
-def test_finalize_request_updates_scope_and_provider_breakdown(tmp_path) -> None:
+def test_finalize_request_updates_scope_and_provider_breakdown(tmp_path: Path) -> None:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
     scope_id = tracker.open_scope()
 
@@ -450,7 +456,7 @@ def test_finalize_request_updates_scope_and_provider_breakdown(tmp_path) -> None
 
 
 def test_planning_estimate_prefers_prompt_history_over_runtime_average(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
     prompt_key = build_prompt_usage_key("Basic", 1, "Front")

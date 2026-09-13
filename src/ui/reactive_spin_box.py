@@ -40,8 +40,7 @@ class ReactiveSpinBox(ReactiveWidget[T], QSpinBox, Generic[T]):
         self.on_change.connect(lambda val: state.update({key: val}))
 
     def _update_from_state(self, updates: dict[str, Any]) -> None:
-        if val := updates.get(self._key):
-            self.setValue(val)
+        self.setValue(updates[self._key])
 
     def _on_state_changed(self, value: int) -> None:
         if self._state.updating:
@@ -65,8 +64,8 @@ class ReactiveDoubleSpinBox(ReactiveWidget[T], QDoubleSpinBox, Generic[T]):
     def _update_from_state(self, updates: dict[str, Any]) -> None:
         self.setValue(updates[self._key])
 
-    def _on_state_changed(self, state: T) -> None:
+    def _on_state_changed(self, value: float) -> None:
         if self._state.updating:
             return
 
-        self.on_change.emit(state)
+        self.on_change.emit(value)

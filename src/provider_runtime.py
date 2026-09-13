@@ -23,14 +23,15 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 
 from .constants import MAX_RETRIES, MAX_RETRY_WAIT_SECONDS, RETRY_BASE_SECONDS
-from .logger import logger
+from .logger import logger, redact_text
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
@@ -59,11 +60,11 @@ class ProviderHTTPError(Exception):
         url: str,
         headers: Mapping[str, str] | None = None,
     ) -> None:
-        super().__init__(message)
+        super().__init__(redact_text(message))
         self.status = status
-        self.message = message
+        self.message = redact_text(message)
         self.body = body
-        self.url = url
+        self.url = redact_text(url)
         self.headers = dict(headers or {})
 
 
@@ -89,11 +90,11 @@ class ProviderTimeoutError(TimeoutError):
             detail += f" after {timeout_sec:.0f}s"
         if last_event_type is not None:
             detail += f" (last event: {last_event_type})"
-        detail += f" [{url}]"
+        detail += f" [{redact_text(url)}]"
         super().__init__(detail)
         self.provider = provider
         self.model = model
-        self.url = url
+        self.url = redact_text(url)
         self.phase = phase
         self.timeout_sec = timeout_sec
         self.attempt = attempt
@@ -402,7 +403,7 @@ PROVIDER_TRACE_HEADER_NAMES = (
 def normalize_log_text(
     value: str, *, limit: int = PROVIDER_ERROR_DETAIL_LOG_LIMIT
 ) -> str:
-    compact = " ".join(value.split())
+    compact = " ".join(redact_text(value).split())
     if not compact:
         return ""
     if len(compact) <= limit:
@@ -533,6 +534,38 @@ def is_non_retryable_custom_provider_timeout(error: ProviderTimeoutError) -> boo
     return error.provider not in OFFICIAL_PROVIDER_NAMES and error.phase == "read_idle"
 
 
+@dataclass
+class RequestAccounting:
+    dispatched: bool = False
+    usage: dict[str, Any] | None = None
+    previous_usages: list[dict[str, Any] | None] = field(default_factory=list)
+
+    def start_request(self) -> None:
+        if self.dispatched:
+            self.previous_usages.append(self.usage)
+        self.usage = None
+        self.dispatched = True
+
+    def observe(self, payload: Any) -> None:
+        if isinstance(payload, (str, bytes)):
+            try:
+                payload = json.loads(payload)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
+        if not isinstance(payload, dict):
+            return
+        response = payload.get("response", payload)
+        if isinstance(response, dict):
+            usage = response.get("usage") or response.get("usageMetadata")
+            if isinstance(usage, dict):
+                self.usage = usage
+
+
+request_accounting: ContextVar[RequestAccounting | None] = ContextVar(
+    "provider_request_accounting", default=None
+)
+
+
 class ProviderRuntime:
     def __init__(self) -> None:
         self._controllers: dict[
@@ -598,10 +631,14 @@ class ProviderRuntime:
         )
 
         try:
-            return json.loads(response_bytes)
+            payload = json.loads(response_bytes)
+            accounting = request_accounting.get()
+            if accounting is not None:
+                accounting.observe(payload)
+            return payload
         except json.JSONDecodeError as exc:
             raise ResponseFormatError(
-                f"{provider}:{model} returned non-JSON content from {url}"
+                f"{provider}:{model} returned non-JSON content from {redact_text(url)}"
             ) from exc
 
     async def request_bytes(
@@ -629,6 +666,9 @@ class ProviderRuntime:
             queue_time = time.perf_counter() - queued_at
             request_started_at = time.perf_counter()
             try:
+                accounting = request_accounting.get()
+                if accounting is not None:
+                    accounting.start_request()
                 response = await client.request(
                     method=method,
                     url=url,
@@ -722,6 +762,9 @@ class ProviderRuntime:
             queue_time = time.perf_counter() - queued_at
             request_started_at = time.perf_counter()
             try:
+                accounting = request_accounting.get()
+                if accounting is not None:
+                    accounting.start_request()
                 async with client.stream(
                     method=method,
                     url=url,
@@ -758,7 +801,7 @@ class ProviderRuntime:
                             )
                         except StopAsyncIteration:
                             break
-                        except asyncio.TimeoutError as exc:
+                        except TimeoutError as exc:
                             raise ProviderTimeoutError(
                                 provider=provider,
                                 model=model,
@@ -783,6 +826,8 @@ class ProviderRuntime:
                                     time.perf_counter() - request_started_at
                                 )
                             last_event_type = str(payload.get("type", "unknown"))
+                            if accounting is not None:
+                                accounting.observe(payload)
                             yield payload
                             continue
 
@@ -795,6 +840,8 @@ class ProviderRuntime:
                         if first_event_time is None:
                             first_event_time = time.perf_counter() - request_started_at
                         last_event_type = str(payload.get("type", "unknown"))
+                        if accounting is not None:
+                            accounting.observe(payload)
                         yield payload
 
                     self._log_stream_timing(
@@ -1110,6 +1157,9 @@ class ProviderRuntime:
     @staticmethod
     def _http_error_from_response(response: httpx.Response) -> ProviderHTTPError:
         body_text = response.text
+        accounting = request_accounting.get()
+        if accounting is not None:
+            accounting.observe(body_text)
         return ProviderHTTPError(
             response.status_code,
             response.reason_phrase or body_text[:200],
@@ -1121,14 +1171,8 @@ class ProviderRuntime:
     async def _stream_http_error_from_response(
         self, response: httpx.Response
     ) -> ProviderHTTPError:
-        body_text = await self._read_stream_response_text(response)
-        return ProviderHTTPError(
-            response.status_code,
-            response.reason_phrase or body_text[:200],
-            body_text,
-            str(response.url),
-            dict(response.headers),
-        )
+        await response.aread()
+        return self._http_error_from_response(response)
 
     @staticmethod
     async def _read_stream_response_text(response: httpx.Response) -> str:

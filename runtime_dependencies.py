@@ -34,7 +34,8 @@ REQUIRED_RUNTIME_IMPORTS = (
     "httpcore",
     "httpx",
     "idna",
-    "sniffio",
+    "markdown_it",
+    "mdurl",
     "typing_extensions",
 )
 

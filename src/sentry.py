@@ -17,17 +17,20 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from aqt import mw
+from aqt.qt import QWidget
 
+from .job_context import JobCancelledError
 from .logger import logger
 from .provider_runtime import (
     ProviderHTTPError,
     ProviderTimeoutError,
     format_provider_http_error_for_log,
 )
-from .tasks import run_async_in_background
+from .tasks import JobHandle, run_async_in_background
 from .ui.ui_utils import show_message_box
 
 
@@ -72,20 +75,37 @@ def log_async_failure(error: Exception) -> None:
 def run_async_in_background_with_sentry(
     op: Callable[[], Any],
     on_success: Callable[[Any], None],
-    on_failure: Optional[Callable[[Exception], None]] = None,
-) -> None:
+    on_failure: Callable[[Exception], None] | None = None,
+    *,
+    owner_alive: Callable[[], bool] | None = None,
+    owner: QWidget | None = None,
+    on_finished: Callable[[], None] | None = None,
+    show_error: bool = True,
+) -> JobHandle:
     """Run collection-independent async work with consistent error handling."""
 
     if not mw:
         raise Exception("Error: mw not found in run_async_in_background")
 
     def wrapped_on_failure(e: Exception) -> None:
+        if isinstance(e, JobCancelledError):
+            if on_failure:
+                on_failure(e)
+            return
         log_async_failure(e)
-        show_message_box("Smart Notes Error", str(e))
+        if show_error:
+            show_message_box("Smart Notes Error", str(e))
         if on_failure:
             on_failure(e)
 
-    run_async_in_background(op, on_success, wrapped_on_failure)
+    return run_async_in_background(
+        op,
+        on_success,
+        wrapped_on_failure,
+        owner_alive=owner_alive,
+        owner=owner,
+        on_finished=on_finished,
+    )
 
 
 def pinger(event: str) -> Callable[[], Any]:

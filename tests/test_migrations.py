@@ -1,5 +1,3 @@
-# type: ignore
-
 """
 Copyright (C) 2024 Michael Piazza
 
@@ -19,191 +17,56 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+from copy import deepcopy
 
-def test_migrate_chat_models_global(mock_config, mock_logger):
-    from src.migrations import migrate_models
+import pytest
 
-    mock_config.chat_model = "gpt-4o"
-    migrate_models()
-
-    assert mock_config.chat_model == "gpt-5.6-sol"
+from src.migrations import migrate_models
+from tests.mocks import MockConfig
 
 
-def test_migrate_tts_models_global(mock_config, mock_logger):
-    from src.migrations import migrate_models
-
-    mock_config.tts_model = "eleven_turbo_v2_5"
-    migrate_models()
-
-    assert mock_config.tts_model == "eleven_flash_v2_5"
-
-
-def test_migrate_chat_models_custom_prompts(mock_config, mock_logger):
-    from src.migrations import migrate_models
-
-    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
-        "chat_model"
-    ] = "o1-mini"
-
-    migrate_models()
-
-    assert (
-        mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
-            "chat_model"
-        ]
-        == "gpt-5.6-terra"
-    )
-
-
-def test_migrate_tts_models_custom_prompts(mock_config, mock_logger):
-    from src.migrations import migrate_models
-
-    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
-        "tts_model"
-    ] = "eleven_turbo_v2_5"
-
-    migrate_models()
-
-    assert (
-        mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
-            "tts_model"
-        ]
-        == "eleven_flash_v2_5"
-    )
-
-
-def test_migrate_multiple_models(mock_config, mock_logger):
-    from src.migrations import migrate_models
-
-    mock_config.chat_model = "gpt-4"
-    mock_config.tts_model = "eleven_turbo_v2_5"
-    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
-        "chat_model"
-    ] = "o3-mini"
-    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
-        "tts_model"
-    ] = "eleven_turbo_v2_5"
-
-    migrate_models()
-
-    assert mock_config.chat_model == "gpt-5.6-sol"
-    assert mock_config.tts_model == "eleven_flash_v2_5"
-    assert (
-        mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
-            "chat_model"
-        ]
-        == "gpt-5.6-terra"
-    )
-    assert (
-        mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
-            "tts_model"
-        ]
-        == "eleven_flash_v2_5"
-    )
-
-
-def test_no_migration_needed(mock_config, mock_logger):
-    from src.migrations import migrate_models
-
-    mock_config.chat_model = "gpt-5-mini"
-    mock_config.tts_model = "eleven_flash_v2_5"
-
-    migrate_models()
-
-    assert mock_config.chat_model == "gpt-5-mini"
-    assert mock_config.tts_model == "eleven_flash_v2_5"
-
-
-def test_available_openai_model_is_not_reset(mock_config, mock_logger):
-    from src.migrations import migrate_models
-
-    mock_config.chat_model = "gpt-5.5-pro"
-    migrate_models()
-
-    assert mock_config.chat_model == "gpt-5.5-pro"
-
-
-def test_migrate_deprecated_gpt_5_4_family(mock_config, mock_logger):
-    from src.migrations import migrate_models
-
-    mock_config.chat_model = "gpt-5.4-mini"
-    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
-        "chat_model"
-    ] = "gpt-5.4-nano"
-
-    migrate_models()
-
-    assert mock_config.chat_model == "gpt-5.6-terra"
-    assert (
-        mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"][
-            "chat_model"
-        ]
-        == "gpt-5.6-luna"
-    )
-
-
-def test_migrate_tts_voice_global(mock_config, mock_logger):
-    from src.migrations import migrate_models, migration_map
-
-    migration_map["tts"]["voices"]["old_voice_id"] = "new_voice_id"  # type: ignore
-
-    mock_config.tts_voice = "old_voice_id"
-    migrate_models()
-
-    assert mock_config.tts_voice == "new_voice_id"
-
-
-def test_migrate_tts_voice_custom_prompts(mock_config, mock_logger):
-    from src.migrations import migrate_models, migration_map
-
-    migration_map["tts"]["voices"]["old_voice_id"] = "new_voice_id"  # type: ignore
-
-    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
-        "tts_voice"
-    ] = "old_voice_id"
-
-    migrate_models()
-
-    assert (
-        mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
-            "tts_voice"
-        ]
-        == "new_voice_id"
-    )
-
-
-def test_migrate_tts_voice_pool_global_and_custom(mock_config, mock_logger):
-    from src.migrations import migrate_models, migration_map
-
-    migration_map["tts"]["models"]["old-model"] = "new-model"  # type: ignore
-    migration_map["tts"]["voices"]["old-pool-voice"] = "new-pool-voice"  # type: ignore
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        ("openai", "gpt-4o"),
+        ("openai", "gpt-5.4-mini"),
+        ("openai", "gpt-5.5-pro"),
+        ("Local Gateway", "gpt-4o"),
+        ("anthropic", "claude-custom-model"),
+        ("elevenLabs", "eleven_turbo_v2_5"),
+        ("fish", "eleven_turbo_v2_5"),
+        ("azure", "unavailable-model"),
+    ],
+)
+def test_upgrade_preserves_global_and_field_model_and_voice_ids(
+    mock_config: MockConfig, provider: str, model: str
+) -> None:
     target = {
-        "provider": "fish",
-        "model": "old-model",
-        "voice": "old-pool-voice",
-        "language": "ja",
+        "provider": provider,
+        "model": model,
+        "voice": "saved-voice-id",
         "enabled": True,
+        "language": "ja",
     }
+    mock_config.chat_provider = provider
+    mock_config.chat_model = model
+    mock_config.tts_provider = provider
+    mock_config.tts_model = model
+    mock_config.tts_voice = "saved-voice-id"
     mock_config.tts_voice_pool = [target]
-    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
-        "tts_voice_pool"
-    ] = [target]
+    mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Front"].update(
+        {
+            "chat_provider": provider,
+            "chat_model": model,
+            "tts_provider": provider,
+            "tts_model": model,
+            "tts_voice": "saved-voice-id",
+            "tts_voice_pool": [target],
+        }
+    )
+    before = deepcopy(vars(mock_config))
 
     migrate_models()
+    migrate_models()
 
-    expected = [
-        {
-            "provider": "fish",
-            "model": "new-model",
-            "voice": "new-pool-voice",
-            "language": "ja",
-            "enabled": True,
-        }
-    ]
-    assert mock_config.tts_voice_pool == expected
-    assert (
-        mock_config.prompts_map["note_types"]["Basic"]["All"]["extras"]["Back"][
-            "tts_voice_pool"
-        ]
-        == expected
-    )
+    assert vars(mock_config) == before

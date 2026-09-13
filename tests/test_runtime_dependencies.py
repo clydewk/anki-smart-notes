@@ -19,7 +19,13 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -28,9 +34,6 @@ from runtime_dependencies import (
     add_runtime_dependency_path,
     resolve_dependency_dir,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def write_runtime_modules(
@@ -89,3 +92,129 @@ def test_add_runtime_dependency_path_raises_clear_error_for_incomplete_dirs(
     assert str(stale_vendor.resolve()) in error_message
     assert "missing httpcore, httpx" in error_message
     assert ".venv" in error_message
+
+
+def copy_build_project(tmp_path: Path) -> Path:
+    source = Path(__file__).resolve().parents[1]
+    project = tmp_path / "project"
+    (project / "scripts").mkdir(parents=True)
+    shutil.copy2(source / "scripts/build.sh", project / "scripts/build.sh")
+    for name in (
+        "runtime_dependencies.py",
+        "__init__.py",
+        "manifest.json",
+        "license",
+        "changelog.md",
+        "eleven_voices.json",
+        "google_voices.json",
+        "azure_voices.json",
+    ):
+        shutil.copy2(source / name, project / name)
+    (project / "src").mkdir()
+    (project / "src/env.py").write_text('environment: str = "DEV"\n', encoding="utf-8")
+    return project
+
+
+def run_build(project: Path, command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(project / "scripts/build.sh"), command],
+        cwd=project.parent,
+        env={
+            **os.environ,
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Creating symlinks needs Windows developer privileges",
+)
+def test_clean_refuses_staging_symlinks(tmp_path: Path) -> None:
+    project = copy_build_project(tmp_path)
+    installed = tmp_path / "installed-addon"
+    installed.mkdir()
+    sentinel = installed / "keep.txt"
+    sentinel.write_text("installed settings", encoding="utf-8")
+    (project / "dist").symlink_to(installed, target_is_directory=True)
+    result = run_build(project, "clean")
+    assert result.returncode != 0
+    assert "Refusing to clean" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "installed settings"
+
+
+def test_build_excludes_runtime_state_and_bundles_rendering_dependencies(
+    tmp_path: Path,
+) -> None:
+    project = copy_build_project(tmp_path)
+    defaults = {
+        "openai_api_key": "",
+        "chat_model": "example-model",
+        "prompts_map": {"note_types": {}},
+    }
+    (project / "config.json").write_text(json.dumps(defaults), encoding="utf-8")
+    for args in (
+        ["init", "--quiet"],
+        ["add", "config.json"],
+        [
+            "-c",
+            "user.name=Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "defaults",
+        ],
+    ):
+        subprocess.run(["git", *args], cwd=project, check=True, capture_output=True)
+    (project / "config.json").write_text(
+        '{"openai_api_key": "private-key", "prompts_map": {"secret": "prompt"}}',
+        encoding="utf-8",
+    )
+    for name in (
+        "meta.json",
+        "config_backup.json",
+        "chat_usage.json",
+        "debug.log",
+        ".env",
+        "src/chat_usage.json",
+        "src/debug.log",
+    ):
+        (project / name).write_text("private-state", encoding="utf-8")
+    result = run_build(project, "build")
+    assert result.returncode == 0, result.stderr
+    with ZipFile(project / "dist/smart-notes.ankiaddon") as archive:
+        names = archive.namelist()
+        assert "vendor/markdown_it/__init__.py" in names
+        assert "vendor/mdurl/__init__.py" in names
+        assert not any(
+            "private-state" in archive.read(name).decode("utf-8", errors="ignore")
+            for name in names
+        )
+        assert not any(
+            name.endswith((".log", ".pyc", ".ankiaddon")) or "__pycache__" in name
+            for name in names
+        )
+        packaged_defaults = json.loads(archive.read("config.json"))
+        assert not packaged_defaults["openai_api_key"]
+        assert packaged_defaults["prompts_map"] == {"note_types": {}}
+        assert packaged_defaults["chat_model"] == "example-model"
+        assert '"PROD"' in archive.read("src/env.py").decode()
+    isolated = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); import httpx; from markdown_it import MarkdownIt; assert '<strong>safe</strong>' in MarkdownIt('commonmark', {'html': False}).render('**safe**')",
+            str(project / "dist/vendor"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert isolated.returncode == 0, isolated.stderr

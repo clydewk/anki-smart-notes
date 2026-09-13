@@ -18,187 +18,340 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import asyncio
-import inspect
+import concurrent.futures
+import queue
+import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from src import collection_ops, tasks
+from src.job_context import current_job
+from src.mcp_runtime import McpRuntime
+from src.provider_runtime import ProviderRuntime
+from tests.test_mcp import make_mcp_config, make_stdio_server_script
 
 
-def test_background_helper_is_always_collection_independent(
+@pytest.fixture
+def profile_worker(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    query = MagicMock()
-    query.without_collection.return_value = query
-    query_type = MagicMock(return_value=query)
+) -> Iterator[tuple[tasks.ProfileWorker, queue.Queue[Callable[[], None]], Any]]:
+    callbacks: queue.Queue[Callable[[], None]] = queue.Queue()
+    window = SimpleNamespace(
+        col=object(), taskman=SimpleNamespace(run_on_main=callbacks.put)
+    )
+    monkeypatch.setattr(tasks, "mw", window)
+    monkeypatch.setattr(tasks.config, "snapshot", lambda: {})
+    monkeypatch.setattr(tasks.mcp_runtime, "close_current_session", AsyncMock())
+    monkeypatch.setattr(tasks.provider_runtime, "close_current_session", AsyncMock())
+    tasks.open_profile_worker()
+    assert tasks.worker is not None
+    yield tasks.worker, callbacks, window
+    tasks.close_profile_worker()
 
-    monkeypatch.setattr(tasks, "mw", MagicMock())
-    monkeypatch.setattr(tasks, "QueryOp", query_type)
+
+def test_jobs_share_loop_and_snapshot_origin(profile_worker: Any) -> None:
+    worker, callbacks, window = profile_worker
+    loops: list[asyncio.AbstractEventLoop] = []
+    outputs: list[str] = []
 
     async def operation() -> str:
+        context = current_job.get()
+        assert context is not None and context.collection is window.col
+        loops.append(asyncio.get_running_loop())
         return "done"
 
-    on_success = MagicMock()
-    on_failure = MagicMock()
-    tasks.run_async_in_background(operation, on_success, on_failure)
-
-    query.without_collection.assert_called_once_with()
-    query.failure.assert_called_once_with(on_failure)
-    query.run_in_background.assert_called_once_with()
-
-    parameters = inspect.signature(tasks.run_async_in_background).parameters
-    assert "use_collection" not in parameters
-    assert "with_progress" not in parameters
+    first = tasks.run_async_in_background(operation, outputs.append)
+    assert first.future.result(timeout=1) == "done"
+    callbacks.get(timeout=1)()
+    second = tasks.run_async_in_background(operation, outputs.append)
+    assert second.future.result(timeout=1) == "done"
+    callbacks.get(timeout=1)()
+    assert loops == [worker.loop, worker.loop]
+    assert outputs == ["done", "done"]
 
 
-@pytest.mark.parametrize("should_fail", [False, True])
-def test_background_helper_closes_loop_scoped_sessions(
-    monkeypatch: pytest.MonkeyPatch,
-    should_fail: bool,
-) -> None:
-    query = MagicMock()
-    query.without_collection.return_value = query
-    query_type = MagicMock(return_value=query)
-    close_mcp = AsyncMock()
-    close_provider = AsyncMock()
-
-    monkeypatch.setattr(tasks, "mw", MagicMock())
-    monkeypatch.setattr(tasks, "QueryOp", query_type)
-    monkeypatch.setattr(tasks.mcp_runtime, "close_current_session", close_mcp)
-    monkeypatch.setattr(tasks.provider_runtime, "close_current_session", close_provider)
+def test_late_callback_is_discarded_after_profile_close(profile_worker: Any) -> None:
+    _, callbacks, window = profile_worker
+    outputs: list[str] = []
 
     async def operation() -> str:
-        if should_fail:
-            raise RuntimeError("failed")
-        return "done"
+        return "old profile"
 
-    tasks.run_async_in_background(operation)
-    background_op = query_type.call_args.kwargs["op"]
-
-    if should_fail:
-        with pytest.raises(RuntimeError, match="failed"):
-            background_op(None)
-    else:
-        assert background_op(None) == "done"
-
-    close_mcp.assert_awaited_once_with()
-    close_provider.assert_awaited_once_with()
+    handle = tasks.run_async_in_background(operation, outputs.append)
+    assert handle.future.result(timeout=1) == "old profile"
+    callback = callbacks.get(timeout=1)
+    tasks.close_profile_worker()
+    window.col = object()
+    callback()
+    assert outputs == []
 
 
-@pytest.mark.asyncio
-async def test_collection_query_runs_while_provider_job_is_active(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider_started = threading.Event()
-    provider_finished = threading.Event()
-    release_provider = threading.Event()
-    provider_thread_id: Optional[int] = None
-    collection_thread_id: Optional[int] = None
-
-    with (
-        ThreadPoolExecutor(max_workers=1) as detached_executor,
-        ThreadPoolExecutor(max_workers=1) as collection_executor,
-    ):
-
-        class TaskManager:
-            def run_on_main(self, operation: Any) -> None:
-                operation()
-
-        class ExecutorQueryOp:
-            collection = object()
-
-            def __init__(self, *, parent: Any, op: Any, success: Any) -> None:
-                self.operation = op
-                self.on_success = success
-                self.on_failure = None
-                self.detached = False
-
-            def without_collection(self) -> "ExecutorQueryOp":
-                self.detached = True
-                return self
-
-            def failure(self, callback: Any) -> "ExecutorQueryOp":
-                self.on_failure = callback
-                return self
-
-            def run_in_background(self) -> None:
-                executor = detached_executor if self.detached else collection_executor
-                argument = None if self.detached else self.collection
-                future = executor.submit(self.operation, argument)
-
-                def done(completed: Any) -> None:
-                    try:
-                        result = completed.result()
-                    except Exception as error:
-                        assert self.on_failure is not None
-                        self.on_failure(error)
-                    else:
-                        self.on_success(result)
-
-                future.add_done_callback(done)
-
-        main_window = SimpleNamespace(taskman=TaskManager())
-        monkeypatch.setattr(tasks, "mw", main_window)
-        monkeypatch.setattr(collection_ops, "mw", main_window)
-        monkeypatch.setattr(tasks, "QueryOp", ExecutorQueryOp)
-        monkeypatch.setattr(collection_ops, "QueryOp", ExecutorQueryOp)
-        monkeypatch.setattr(
-            tasks.mcp_runtime,
-            "close_current_session",
-            AsyncMock(),
-        )
-        monkeypatch.setattr(
-            tasks.provider_runtime,
-            "close_current_session",
-            AsyncMock(),
-        )
-
-        async def slow_provider_operation() -> str:
-            nonlocal provider_thread_id
-            provider_thread_id = threading.get_ident()
-            provider_started.set()
-            while not release_provider.is_set():
-                await asyncio.sleep(0.01)
-            provider_finished.set()
-            return "provider complete"
-
-        def backup_query(_: object) -> str:
-            nonlocal collection_thread_id
-            collection_thread_id = threading.get_ident()
-            assert not provider_finished.is_set()
-            return "backup complete"
-
-        try:
-            tasks.run_async_in_background(slow_provider_operation)
-            assert await asyncio.to_thread(provider_started.wait, 1)
-
-            assert (
-                await asyncio.wait_for(
-                    collection_ops.query_collection(backup_query),
-                    timeout=1,
-                )
-                == "backup complete"
-            )
-            assert provider_thread_id != collection_thread_id
-            assert not provider_finished.is_set()
-        finally:
-            release_provider.set()
-
-        assert await asyncio.to_thread(provider_finished.wait, 1)
-
-
-def test_background_helper_requires_anki_main_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(tasks, "mw", None)
+def test_shutdown_cancels_without_pumping_ui(profile_worker: Any) -> None:
+    worker, _, _ = profile_worker
+    started = threading.Event()
+    finished = threading.Event()
 
     async def operation() -> None:
-        return None
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            finished.set()
 
-    with pytest.raises(Exception, match="mw not found"):
-        tasks.run_async_in_background(operation)
+    handle = tasks.run_async_in_background(operation)
+    assert started.wait(1)
+    tasks.close_profile_worker()
+    assert finished.wait(1)
+    assert not worker.thread.is_alive()
+    assert handle.future.cancelled()
+
+
+def test_cancelled_job_releases_and_next_job_runs(profile_worker: Any) -> None:
+    async def operation() -> None:
+        await asyncio.Future()
+
+    handle = tasks.run_async_in_background(operation)
+    handle.cancel()
+    with pytest.raises(concurrent.futures.CancelledError):
+        handle.future.result(timeout=1)
+
+    async def next_operation() -> int:
+        return 42
+
+    assert tasks.run_async_in_background(next_operation).future.result(timeout=1) == 42
+
+
+def test_profile_reopen_with_matching_note_ids_rejects_old_completion(
+    profile_worker: Any,
+) -> None:
+    old_worker, callbacks, window = profile_worker
+    outputs: list[str] = []
+    finalized: list[int] = []
+
+    async def operation() -> str:
+        return "old result"
+
+    handle = tasks.run_async_in_background(
+        operation,
+        outputs.append,
+        on_finished=lambda: finalized.append(threading.get_ident()),
+    )
+    assert handle.future.result(timeout=1) == "old result"
+    late_callback = callbacks.get(timeout=1)
+    tasks.close_profile_worker()
+    window.col = SimpleNamespace(notes={1: "profile B"})
+    tasks.open_profile_worker()
+    assert tasks.worker is not None
+    assert tasks.worker.generation != old_worker.generation
+    late_callback()
+    assert outputs == []
+    assert finalized == [threading.get_ident()]
+    assert window.col.notes == {1: "profile B"}
+
+
+def test_owner_close_cancels_work_and_finalizes_once(profile_worker: Any) -> None:
+    worker, callbacks, _ = profile_worker
+    owner = MagicMock()
+    destroyed: list[Callable[..., None]] = []
+    finished: list[Callable[..., None]] = []
+    owner.destroyed.connect.side_effect = destroyed.append
+    owner.destroyed.disconnect.side_effect = destroyed.remove
+    owner.window().finished.connect.side_effect = finished.append
+    owner.window().finished.disconnect.side_effect = finished.remove
+    alive = True
+    started = threading.Event()
+    stopped = threading.Event()
+    finalized: list[int] = []
+    results: list[None] = []
+
+    async def operation() -> None:
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            stopped.set()
+
+    handle = tasks.run_async_in_background(
+        operation,
+        results.append,
+        owner=owner,
+        owner_alive=lambda: alive,
+        on_finished=lambda: finalized.append(threading.get_ident()),
+    )
+    assert started.wait(1)
+    alive = False
+    for callback in tuple(finished):
+        callback(0)
+    assert stopped.wait(1)
+    callbacks.get(timeout=1)()
+    assert handle.future.cancelled()
+    assert results == []
+    assert finalized == [threading.get_ident()]
+    assert not destroyed and not finished
+    assert not worker.jobs
+    tasks.close_profile_worker()
+    assert finalized == [threading.get_ident()]
+
+
+def test_shutdown_cancels_pending_collection_bridge_without_qt(
+    profile_worker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker, callbacks, window = profile_worker
+    monkeypatch.setattr(collection_ops, "mw", window)
+    started = threading.Event()
+    stopped = threading.Event()
+    writes: list[str] = []
+    finalized: list[str] = []
+
+    async def operation() -> None:
+        started.set()
+        try:
+            await collection_ops.query_collection(lambda _: writes.append("unexpected"))
+        finally:
+            stopped.set()
+
+    handle = tasks.run_async_in_background(
+        operation, on_finished=lambda: finalized.append("finished")
+    )
+    assert started.wait(1)
+    pending_schedule = callbacks.get(timeout=1)
+    tasks.close_profile_worker()
+    assert stopped.wait(1)
+    pending_schedule()
+    assert handle.future.cancelled()
+    assert not worker.thread.is_alive()
+    assert writes == []
+    assert finalized == ["finished"]
+
+
+def test_finalizer_runs_when_completion_callback_raises(profile_worker: Any) -> None:
+    worker, callbacks, _ = profile_worker
+    finalized: list[str] = []
+    errors: list[Exception] = []
+
+    async def operation() -> str:
+        return "done"
+
+    def failed_callback(_: str) -> None:
+        raise ValueError("callback failed")
+
+    handle = tasks.run_async_in_background(
+        operation,
+        failed_callback,
+        errors.append,
+        on_finished=lambda: finalized.append("finished"),
+    )
+    assert handle.future.result(timeout=1) == "done"
+    callbacks.get(timeout=1)()
+    assert len(errors) == 1 and str(errors[0]) == "callback failed"
+    assert not worker.jobs
+    assert finalized == ["finished"]
+
+
+def test_cancellation_stops_owned_children_and_preserves_sibling_job(
+    profile_worker: Any,
+) -> None:
+    child_started = threading.Event()
+    child_stopped = threading.Event()
+
+    async def child() -> None:
+        child_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            child_stopped.set()
+
+    async def parent() -> None:
+        asyncio.create_task(child())
+        await asyncio.Future()
+
+    async def sibling() -> int:
+        await asyncio.sleep(0.05)
+        return 42
+
+    first = tasks.run_async_in_background(parent)
+    second = tasks.run_async_in_background(sibling)
+    assert child_started.wait(1)
+    first.cancel()
+    assert child_stopped.wait(1)
+    assert first.future.cancelled()
+    assert second.future.result(timeout=1) == 42
+
+
+def test_shutdown_bounds_resource_cleanup(
+    profile_worker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker, _, _ = profile_worker
+    cancelled = threading.Event()
+
+    async def stalled_close() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(tasks.mcp_runtime, "close_current_session", stalled_close)
+    monkeypatch.setattr(tasks, "RESOURCE_CLOSE_TIMEOUT_SEC", 0.02)
+    tasks.close_profile_worker()
+    assert cancelled.wait(1)
+    assert not worker.thread.is_alive()
+    assert tasks.profile_generation > worker.generation
+
+
+def test_shutdown_closes_mcp_before_its_shared_http_client(
+    profile_worker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, callbacks, _ = profile_worker
+    runtime = ProviderRuntime()
+    clients = []
+
+    async def use_client() -> None:
+        clients.append(await runtime.get_http_client())
+
+    async def close_mcp() -> None:
+        # MCP closes its individual sessions in child tasks, each needing HTTP.
+        await asyncio.gather(use_client())
+
+    monkeypatch.setattr(tasks, "provider_runtime", runtime)
+    monkeypatch.setattr(tasks.mcp_runtime, "close_current_session", close_mcp)
+    tasks.run_async_in_background(use_client).future.result(timeout=1)
+    callbacks.get(timeout=1)()
+    tasks.close_profile_worker()
+    assert len(clients) == 2 and clients[0] is clients[1]
+    assert all(client.is_closed for client in clients)
+
+
+def test_cancelled_caller_does_not_stop_shared_mcp_stderr_drain(
+    profile_worker: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    script = tmp_path / "stdio_server.py"
+    make_stdio_server_script(script)
+    server = make_mcp_config(sys.executable, [str(script)])
+    runtime = McpRuntime()
+    monkeypatch.setattr(tasks, "mcp_runtime", runtime)
+    monkeypatch.setattr("src.mcp_runtime.get_version", lambda: "test-version")
+    monkeypatch.setattr("src.mcp_runtime.MCP_DEFAULT_READ_TIMEOUT_SEC", 0.5)
+    first_call_finished = threading.Event()
+
+    async def first_job() -> None:
+        await runtime.call_tool(server, "echo", {"text": "first"})
+        first_call_finished.set()
+        await asyncio.Future()
+
+    async def second_job() -> str:
+        result = await runtime.call_tool(
+            server, "echo", {"text": "second", "noisy": True}
+        )
+        return result.text
+
+    first = tasks.run_async_in_background(first_job)
+    assert first_call_finished.wait(1)
+    first.cancel()
+    second = tasks.run_async_in_background(second_job)
+    assert second.future.result(timeout=2) == "second"

@@ -22,9 +22,11 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 # existing patterns in the codebase (making heavy use of inheritance, using StateManager in an adhoc-way, etc)
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Optional, TypedDict, cast
+from copy import deepcopy
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from anki.decks import DeckId
+from anki.errors import NotFoundError
 from anki.notes import Note
 from aqt import (
     QDialog,
@@ -37,16 +39,22 @@ from aqt import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    mw,
 )
+from PyQt6 import sip
 
+from .. import tasks
 from ..decks import deck_id_to_name_map
 from ..field_processor import field_processor
-from ..logger import logger
-from ..media_utils import get_media_path, write_media
-from ..note_processor import NoteSnapshot, snapshot_note
+from ..job_context import JobContext
+from ..logger import logger, redact_text
+from ..markdown import convert_markdown_to_html, convert_text_to_html
+from ..media_utils import get_media_path, image_preview_data
+from ..note_processor import NoteSnapshot, PendingMedia, ProcessedNote, snapshot_note
 from ..notes import get_note_type, get_valid_fields_for_prompt
 from ..prompts import get_prompts_for_note
 from ..sentry import run_async_in_background_with_sentry
+from ..settings import with_widget_settings
 from ..tts_routing import select_tts_target, tts_audio_extension
 from ..tts_utils import play_audio
 from .chat_options import ChatOptions
@@ -55,21 +63,21 @@ from .image_options import ImageOptions
 from .reactive_combo_box import ReactiveComboBox
 from .state_manager import StateManager
 from .tts_options import TTSOptions
-from .ui_utils import font_small, show_message_box
+from .ui_utils import bound_dialog, font_small, scroll_page, show_message_box
 
 if TYPE_CHECKING:
     from ..models import TTSModels, TTSProviders
 
 
 class CustomPrompt(QDialog):
-    _initial_prompt: Optional[str]
+    _initial_prompt: str | None
     _generate_button: QPushButton
     _save_button: QPushButton
     _loading: bool = False
     _prompt_window: QTextEdit
     _note: Note
     _deck_id: DeckId
-    _on_success: Callable[[Optional[str]], None]
+    _on_success: Callable[[ProcessedNote], None]
     _field_upper: str
 
     def __init__(
@@ -77,8 +85,8 @@ class CustomPrompt(QDialog):
         note: Note,
         deck_id: DeckId,
         field_upper: str,
-        on_success: Callable[[Optional[str]], None],
-        parent: Optional[QWidget] = None,
+        on_success: Callable[[ProcessedNote], None],
+        parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent=parent)
         all_prompts = get_prompts_for_note(
@@ -90,6 +98,14 @@ class CustomPrompt(QDialog):
         self._initial_prompt = (
             all_prompts.get(field_upper, None) if all_prompts else None
         )
+        self._origin = (
+            JobContext(
+                tasks.worker.collection, tasks.worker.generation, tasks.worker.active
+            )
+            if tasks.worker
+            else None
+        )
+        self._original = snapshot_note(note, deck_id)
         self._note = note
         self._deck_id = deck_id
         self._field_upper = field_upper
@@ -110,8 +126,11 @@ class CustomPrompt(QDialog):
     def render_custom_model(self) -> QWidget:
         raise Exception("Not implemented")
 
-    def render_to_text(self) -> Optional[str]:
+    def render_to_text(self) -> str | None:
         raise Exception("Not Implemented")
+
+    def pending_media(self) -> list[PendingMedia]:
+        return []
 
     def render_response_box(self) -> QWidget:
         raise Exception("Not Implemented")
@@ -139,7 +158,7 @@ class CustomPrompt(QDialog):
         self.left_layout = QVBoxLayout()
         left_container.setLayout(self.left_layout)
         self._prompt_window = QTextEdit()
-        self._prompt_window.setText(self._initial_prompt)
+        self._prompt_window.setPlainText(self._initial_prompt or "")
         self._prompt_window.textChanged.connect(self._on_prompt_changed)
         self._generate_button = QPushButton("Generate")
         self._generate_button.clicked.connect(self._on_generate)
@@ -180,9 +199,12 @@ class CustomPrompt(QDialog):
 
         # Custom model
 
-        container.addWidget(box)
-        container.addItem(QSpacerItem(0, 16))
-        container.addWidget(self._render_custom_model())
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.addWidget(box)
+        page_layout.addItem(QSpacerItem(0, 16))
+        page_layout.addWidget(self._render_custom_model())
+        container.addWidget(scroll_page(page))
 
         self._save_button = QPushButton("Save Result")
         self._save_button.setEnabled(False)
@@ -199,6 +221,7 @@ class CustomPrompt(QDialog):
 
         self.setLayout(container)
         self.setup_ui()
+        bound_dialog(self)
 
     def _render_custom_model(self) -> QWidget:
         container = QGroupBox("⚙️ Custom Settings")
@@ -209,9 +232,46 @@ class CustomPrompt(QDialog):
         return container
 
     def _on_save_result(self) -> None:
+        if self._origin is None:
+            return
+        try:
+            self._origin.check(mw.col if mw else None)
+        except Exception as error:
+            show_message_box(str(error))
+            return
+        try:
+            current = (
+                mw.col.get_note(self._note.id)
+                if self._note.id and mw and mw.col
+                else self._note
+            )
+        except NotFoundError:
+            show_message_box("The note was deleted. This result cannot be saved.")
+            return
+        if (
+            current.mid != self._original.note_type_id
+            or tuple(current.keys()) != self._original.field_order
+            or any(
+                current[key] != value for key, value in self._original.fields.items()
+            )
+        ):
+            show_message_box(
+                "The note changed while this palette was open. Generate again from the updated note."
+            )
+            return
         res = self.render_to_text()
         if res is not None:
-            self._on_success(res)
+            self._on_success(
+                ProcessedNote(
+                    note_id=self._original.note_id,
+                    original_values=self._original.fields,
+                    updates={self._field_upper: res},
+                    media=self.pending_media(),
+                    field_failures=[],
+                    note_type_id=self._original.note_type_id,
+                    field_order=self._original.field_order,
+                )
+            )
         self.accept()
 
     def _on_prompt_changed(self) -> None:
@@ -223,10 +283,20 @@ class CustomPrompt(QDialog):
         ):
             QDialog.reject(self)
 
+    @with_widget_settings
     def _on_generate(self) -> None:
         self._loading = True
         self._update_ui_states()
-        self.on_generate()
+        try:
+            self.on_generate()
+        except Exception as error:
+            self._finish_generation()
+            show_message_box(redact_text(str(error)))
+
+    def _finish_generation(self) -> None:
+        self._loading = False
+        if not sip.isdeleted(self):
+            self._update_ui_states()
 
     def _update_ui_states(self) -> None:
         self._save_button.setEnabled(not self._loading and self.has_output())
@@ -246,21 +316,24 @@ class CustomTextPrompt(CustomPrompt):
         return self._response_edit
 
     def on_generate(self) -> None:
+        self._response_edit.clear()
         prompt = self._prompt_window.toPlainText()
 
         def on_success(text: str):
             self._loading = False
-            self._response_edit.setText(text)
+            self._response_edit.setPlainText(text or "")
             self._update_ui_states()
 
         def on_error(error: Exception):
-            msg = f"Error generating text: {error}"
+            msg = f"Error generating text: {redact_text(str(error))}"
             logger.error(msg)
             show_message_box(msg)
             self._loading = False
             self._update_ui_states()
 
         snapshot = self._snapshot()
+
+        chat_settings = deepcopy(self._chat_options.state.s)
 
         async def generate_text():
             return await field_processor.get_chat_response(
@@ -272,15 +345,17 @@ class CustomTextPrompt(CustomPrompt):
                 deck_id=snapshot.deck_id,
                 prompt=prompt,
                 field_lower=self._field_upper.lower(),
-                temperature=self._chat_options.state.s["chat_temperature"],
-                model=self._chat_options.state.s["chat_model"],
-                provider=self._chat_options.state.s["chat_provider"],
-                should_convert_to_html=self._chat_options.state.s[
-                    "chat_markdown_to_html"
-                ],
+                temperature=chat_settings["chat_temperature"],
+                model=chat_settings["chat_model"],
+                provider=chat_settings["chat_provider"],
+                should_convert_to_html=False,
+                reasoning_effort=chat_settings.get("chat_reasoning_effort"),
+                use_tools=chat_settings.get("chat_use_tools", False),
             )
 
-        run_async_in_background_with_sentry(generate_text, on_success, on_error)
+        run_async_in_background_with_sentry(
+            generate_text, on_success, on_error, on_finished=self._finish_generation
+        )
 
     def render_custom_model(self) -> QWidget:
         self._chat_options = ChatOptions(show_text_processing=False)
@@ -289,11 +364,11 @@ class CustomTextPrompt(CustomPrompt):
     def has_output(self) -> bool:
         return bool(self._response_edit.toPlainText())
 
-    def render_to_text(self) -> Optional[str]:
+    def render_to_text(self) -> str | None:
         if self._chat_options.state.s["chat_markdown_to_html"]:
-            return self._response_edit.toHtml()
+            return convert_markdown_to_html(self._response_edit.toPlainText())
         else:
-            return self._response_edit.toPlainText()
+            return convert_text_to_html(self._response_edit.toPlainText())
 
     def update_ui_states(self) -> None:
         self._response_edit.setReadOnly(self._loading)
@@ -301,7 +376,8 @@ class CustomTextPrompt(CustomPrompt):
 
 class CustomImagePrompt(CustomPrompt):
     response_image: ImageDisplayer
-    raw_image: Optional[bytes] = None
+    raw_image: bytes | None = None
+    preview_image: bytes | None = None
     image_options: ImageOptions
 
     def render_response_box(self) -> QWidget:
@@ -309,32 +385,47 @@ class CustomImagePrompt(CustomPrompt):
         return self.response_image
 
     def on_generate(self) -> None:
+        self.raw_image = None
+        self.preview_image = None
+        self._update_ui_states()
         prompt = self._prompt_window.toPlainText()
 
-        def on_success(image: bytes):
-            logger.debug("Got image")
+        def on_success(images: tuple[bytes, bytes] | None) -> None:
             self._loading = False
-            self.raw_image = image
+            if images is not None:
+                self.raw_image, self.preview_image = images
             self._update_ui_states()
 
         def on_error(error: Exception):
             logger.error(f"Error generating image: {error}")
-            show_message_box("Error generating image: " + str(error))
+            show_message_box("Error generating image: " + redact_text(str(error)))
             self._loading = False
             self._update_ui_states()
 
         snapshot = self._snapshot()
 
-        async def generate_image():
-            return await field_processor.get_image_response(
+        image_settings = deepcopy(self.image_options.state.s)
+        self.image_format = image_settings["image_output_format"]
+
+        async def generate_image() -> tuple[bytes, bytes] | None:
+            image = await field_processor.get_image_response(
                 note_id=snapshot.note_id,
                 values=snapshot.lower_values(),
                 input_text=prompt,
-                model=self.image_options.state.s["image_model"],
-                provider=self.image_options.state.s["image_provider"],
+                model=image_settings["image_model"],
+                provider=image_settings["image_provider"],
+                aspect_ratio=image_settings["image_aspect_ratio"],
+                resolution=image_settings["image_resolution"],
+                output_format=image_settings["image_output_format"],
+                quality=image_settings["image_quality"],
+                generation_quality=image_settings["image_generation_quality"],
             )
 
-        run_async_in_background_with_sentry(generate_image, on_success, on_error)
+            return (image, await image_preview_data(image)) if image else None
+
+        run_async_in_background_with_sentry(
+            generate_image, on_success, on_error, on_finished=self._finish_generation
+        )
 
     def render_custom_model(self) -> QWidget:
         self.image_options = ImageOptions()
@@ -343,16 +434,28 @@ class CustomImagePrompt(CustomPrompt):
     def has_output(self) -> bool:
         return bool(self.raw_image)
 
-    def render_to_text(self) -> Optional[str]:
+    def render_to_text(self) -> str | None:
         if not self.raw_image:
             return None
-        file_name = get_media_path(self._note, self._field_upper, "webp")
-        path = write_media(file_name, self.raw_image)
-        return f'<img src="{path}"/>'
+        file_name = get_media_path(self._note, self._field_upper, self.image_format)
+        return f'<img src="{file_name}"/>'
+
+    def pending_media(self) -> list[PendingMedia]:
+        return (
+            [
+                PendingMedia(
+                    get_media_path(self._note, self._field_upper, self.image_format),
+                    self.raw_image,
+                )
+            ]
+            if self.raw_image
+            else []
+        )
 
     def update_ui_states(self) -> None:
-        if self.raw_image:
-            self.response_image.set_image(self.raw_image)
+        self.response_image.setVisible(bool(self.preview_image))
+        if self.preview_image:
+            self.response_image.set_image(self.preview_image)
 
 
 class TTSPromptState(TypedDict):
@@ -361,7 +464,7 @@ class TTSPromptState(TypedDict):
 
 
 class CustomTTSPrompt(CustomPrompt):
-    audio: Optional[bytes] = None
+    audio: bytes | None = None
     audio_extension = "mp3"
 
     def __init__(
@@ -369,7 +472,8 @@ class CustomTTSPrompt(CustomPrompt):
         note: Note,
         deck_id: DeckId,
         field_upper: str,
-        on_success: Callable[[Optional[str]], None],
+        on_success: Callable[[ProcessedNote], None],
+        parent: QWidget | None = None,
     ) -> None:
         self._note = note
         self._deck_id = deck_id
@@ -379,11 +483,18 @@ class CustomTTSPrompt(CustomPrompt):
             get_note_type(self._note), self._deck_id, self._field_upper
         )
         self.state = StateManager[TTSPromptState](
-            {"source_fields": source_fields, "source_field": source_fields[0]}
+            {
+                "source_fields": source_fields,
+                "source_field": source_fields[0] if source_fields else "",
+            }
         )
 
         super().__init__(
-            note=note, deck_id=deck_id, field_upper=field_upper, on_success=on_success
+            note=note,
+            deck_id=deck_id,
+            field_upper=field_upper,
+            on_success=on_success,
+            parent=parent,
         )
 
     def render_response_box(self) -> QWidget:
@@ -393,15 +504,19 @@ class CustomTTSPrompt(CustomPrompt):
         return self.play_button
 
     def on_generate(self) -> None:
+        self.audio = None
         prompt = self._prompt_window.toPlainText()
+        tts_settings = deepcopy(self.tts_options.state.s)
         snapshot = self._snapshot()
         try:
             target = select_tts_target(
-                self.tts_options.state.s["tts_voice_pool"],
+                tts_settings["tts_voice_pool"],
                 language=None,
                 selection_key=f"{snapshot.note_id}:{self._field_upper.lower()}",
             )
         except ValueError as error:
+            self._loading = False
+            self._update_ui_states()
             show_message_box(str(error))
             return
         self.audio_extension = tts_audio_extension(target)
@@ -414,10 +529,10 @@ class CustomTTSPrompt(CustomPrompt):
                 model=cast("TTSModels", target["model"]),
                 provider=cast("TTSProviders", target["provider"]),
                 voice=target["voice"],
-                strip_html=True,
+                strip_html=tts_settings["tts_strip_html"],
             )
 
-        def on_success(audio: Optional[bytes]):
+        def on_success(audio: bytes | None):
             self._loading = False
             self.audio = audio
 
@@ -434,7 +549,10 @@ class CustomTTSPrompt(CustomPrompt):
             self._update_ui_states()
 
         run_async_in_background_with_sentry(
-            get_tts_response, on_success=on_success, on_failure=on_failure
+            get_tts_response,
+            on_success=on_success,
+            on_failure=on_failure,
+            on_finished=self._finish_generation,
         )
 
     def render_custom_model(self) -> QWidget:
@@ -444,12 +562,23 @@ class CustomTTSPrompt(CustomPrompt):
     def has_output(self) -> bool:
         return bool(self.audio)
 
-    def render_to_text(self) -> Optional[str]:
+    def render_to_text(self) -> str | None:
         if not self.audio:
             return None
         file_name = get_media_path(self._note, self._field_upper, self.audio_extension)
-        path = write_media(file_name, self.audio)
-        return f"[sound: {path}]"
+        return f"[sound:{file_name}]"
+
+    def pending_media(self) -> list[PendingMedia]:
+        return (
+            [
+                PendingMedia(
+                    get_media_path(self._note, self._field_upper, self.audio_extension),
+                    self.audio,
+                )
+            ]
+            if self.audio
+            else []
+        )
 
     def update_ui_states(self) -> None:
         self.play_button.setEnabled(not self._loading and self.has_output())
@@ -460,7 +589,7 @@ class CustomTTSPrompt(CustomPrompt):
         )
 
         def update_source_combo(pick: str):
-            self._prompt_window.setText(f"{{{{{pick}}}}}")
+            self._prompt_window.setPlainText(f"{{{{{pick}}}}}" if pick else "")
 
         update_source_combo(self.state.s["source_field"])
 

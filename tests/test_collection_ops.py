@@ -17,13 +17,23 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+from __future__ import annotations
+
+import asyncio
 from dataclasses import dataclass
+from threading import Event
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from src import collection_ops
+from src.job_context import JobCancelledError, JobContext, current_job
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from anki.collection import OpChanges
 
 
 class ImmediateTaskManager:
@@ -43,7 +53,7 @@ class ImmediateQueryOp:
         self.on_success = success
         self.on_failure = None
 
-    def failure(self, callback: Any) -> "ImmediateQueryOp":
+    def failure(self, callback: Any) -> ImmediateQueryOp:
         self.on_failure = callback
         return self
 
@@ -63,11 +73,11 @@ class ImmediateCollectionOp:
         self.on_success = None
         self.on_failure = None
 
-    def success(self, callback: Any) -> "ImmediateCollectionOp":
+    def success(self, callback: Any) -> ImmediateCollectionOp:
         self.on_success = callback
         return self
 
-    def failure(self, callback: Any) -> "ImmediateCollectionOp":
+    def failure(self, callback: Any) -> ImmediateCollectionOp:
         self.on_failure = callback
         return self
 
@@ -80,19 +90,29 @@ class ImmediateCollectionOp:
             self.on_failure(error)
 
 
-@dataclass(frozen=True)
+@dataclass
 class MutationResult:
     value: str
-    changes: object
+    changes: OpChanges
 
 
 @pytest.fixture
-def immediate_anki(monkeypatch: pytest.MonkeyPatch) -> ImmediateTaskManager:
+def immediate_anki(monkeypatch: pytest.MonkeyPatch) -> Any:
     taskman = ImmediateTaskManager()
-    monkeypatch.setattr(collection_ops, "mw", SimpleNamespace(taskman=taskman))
+    monkeypatch.setattr(
+        collection_ops,
+        "mw",
+        SimpleNamespace(taskman=taskman, col=ImmediateQueryOp.collection),
+    )
     monkeypatch.setattr(collection_ops, "QueryOp", ImmediateQueryOp)
     monkeypatch.setattr(collection_ops, "CollectionOp", ImmediateCollectionOp)
-    return taskman
+    active = Event()
+    active.set()
+    context = JobContext(ImmediateQueryOp.collection, 1, active)
+    ImmediateCollectionOp.collection = ImmediateQueryOp.collection
+    token = current_job.set(context)
+    yield taskman
+    current_job.reset(token)
 
 
 @pytest.mark.asyncio
@@ -126,7 +146,7 @@ async def test_query_collection_propagates_failure(
 async def test_mutate_collection_runs_collection_op(
     immediate_anki: ImmediateTaskManager,
 ) -> None:
-    result = MutationResult(value="saved", changes=object())
+    result = MutationResult(value="saved", changes=cast("OpChanges", object()))
     observed_collection = None
 
     def operation(collection: object) -> MutationResult:
@@ -179,6 +199,63 @@ async def test_collection_operation_propagates_scheduling_failure(
         SimpleNamespace(taskman=BrokenTaskManager()),
     )
     operation = getattr(collection_ops, operation_name)
+    active = Event()
+    active.set()
+    token = current_job.set(JobContext(object(), 1, active))
 
     with pytest.raises(RuntimeError, match="scheduling failed"):
         await operation(lambda _: None)
+    current_job.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["cancel", "profile", "owner", "collection_closed"])
+async def test_queued_bridge_cannot_start_after_origin_changes(
+    immediate_anki: ImmediateTaskManager, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    pending: list[Callable[[], None]] = []
+    monkeypatch.setattr(immediate_anki, "run_on_main", pending.append)
+    context = current_job.get()
+    assert context is not None
+    calls: list[str] = []
+    task = asyncio.create_task(
+        collection_ops.query_collection(lambda _: calls.append("query"))
+    )
+    await asyncio.sleep(0)
+    assert len(pending) == 1
+    if reason == "cancel":
+        context.cancel()
+    elif reason == "owner":
+        context.owner_alive = lambda: False
+    elif reason == "collection_closed":
+        monkeypatch.setattr(collection_ops.mw, "col", None)
+    else:
+        monkeypatch.setattr(
+            collection_ops.mw, "col", SimpleNamespace(notes={1: "another profile"})
+        )
+    pending.pop()()
+    with pytest.raises((asyncio.CancelledError, JobCancelledError)):
+        await task
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejects_late_result_after_owner_closes(
+    immediate_anki: ImmediateTaskManager,
+) -> None:
+    successes: list[Callable[[str], None]] = []
+    context = current_job.get()
+    assert context is not None
+
+    def start(
+        success: Callable[[str], None], failure: Callable[[Exception], None]
+    ) -> None:
+        del failure
+        successes.append(success)
+
+    task = asyncio.create_task(collection_ops.await_collection_operation(start))
+    await asyncio.sleep(0)
+    context.owner_alive = lambda: False
+    successes[0]("stale result")
+    with pytest.raises(asyncio.CancelledError):
+        await task

@@ -18,13 +18,23 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 from collections.abc import Callable
-from typing import Optional
 
 from anki.cards import Card
 from aqt import QAction, QMenu, browser, editor, mw
 
-from ..note_processor import NoteProcessor
+from .. import tasks
+from ..collection_ops import mutate_collection
+from ..job_context import JobContext
+from ..note_processor import (
+    NoteProcessor,
+    ProcessedNote,
+    apply_note_result,
+    commit_processed_notes,
+    note_matches_result,
+)
+from ..sentry import run_async_in_background_with_sentry
 from .custom_prompt import CustomImagePrompt, CustomTextPrompt, CustomTTSPrompt
+from .ui_utils import editor_is_current
 
 
 class FieldMenu:
@@ -87,6 +97,8 @@ class FieldMenu:
                 target_field=self.field_upper,
                 on_success=on_success,
                 show_progress=False,
+                editor_alive=lambda: editor_is_current(self.editor, self.card.note()),
+                editor_owner=self.editor.web,
             )
 
         generate_item.triggered.connect(wrapped)
@@ -111,27 +123,44 @@ class FieldMenu:
 
     # --------------------- callbacks ----------------------------
 
-    def _make_custom_field_success(self) -> Callable[[Optional[str]], None]:
-        def _on_success(res: Optional[str]) -> None:
-            if res is None:
-                return
+    def _make_custom_field_success(self) -> Callable[[ProcessedNote], None]:
+        note = self.card.note()
+        origin = (
+            JobContext(
+                tasks.worker.collection, tasks.worker.generation, tasks.worker.active
+            )
+            if tasks.worker
+            else None
+        )
 
-            note = self.card.note()
-            note[self.field_upper] = res
-
-            # Persist only if already in collection
+        def refresh(_: object = None) -> None:
             if note.id:
-                mw.col.update_note(note)  # type: ignore
-
+                note.load()
             self.editor.loadNote()
 
-            parent = self.editor.parentWindow
-            if isinstance(parent, browser.Browser) and getattr(  # type: ignore
-                parent, "_previewer", None
-            ):  # type: ignore
-                parent._previewer.render_card()  # type: ignore
+        def on_success(result: ProcessedNote) -> None:
+            if origin is None or not editor_is_current(self.editor, note):
+                return
+            origin.check(mw.col if mw else None)
+            if not result.note_id:
+                if mw and mw.col and note_matches_result(note, result):
+                    apply_note_result(mw.col, note, result)
+                    refresh()
+                return
 
-        return _on_success
+            async def commit() -> object:
+                return await mutate_collection(
+                    lambda collection: commit_processed_notes(collection, [result])
+                )
+
+            run_async_in_background_with_sentry(
+                commit,
+                refresh,
+                owner=self.editor.web,
+                owner_alive=lambda: editor_is_current(self.editor, note),
+            )
+
+        return on_success
 
     def _on_custom_text(self, _: bool) -> None:
         CustomTextPrompt(
@@ -139,12 +168,10 @@ class FieldMenu:
             deck_id=self.card.did,
             field_upper=self.field_upper,
             on_success=self._make_custom_field_success(),
+            parent=self.editor.parentWindow,
         ).exec()
 
     def _on_custom_image(self, _: bool) -> None:
-        # This should be called with exec instead of show, but
-        # for some reason having a webview inside of this dialog
-        # causes UI bugs when using exec
         CustomImagePrompt(
             note=self.card.note(),
             deck_id=self.card.did,
@@ -159,4 +186,5 @@ class FieldMenu:
             deck_id=self.card.did,
             field_upper=self.field_upper,
             on_success=self._make_custom_field_success(),
+            parent=self.editor.parentWindow,
         ).exec()

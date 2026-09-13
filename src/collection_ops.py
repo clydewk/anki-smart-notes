@@ -17,14 +17,16 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-# pyright: reportMissingImports=false
+from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
 from typing import Any, TypeVar
 
 from aqt import mw
-from aqt.operations import CollectionOp, QueryOp
+from aqt.operations import CollectionOp, QueryOp, ResultWithChanges
+
+from .job_context import deliver_future, require_job
 
 T = TypeVar("T")
 StartOperation = Callable[
@@ -33,35 +35,49 @@ StartOperation = Callable[
 ]
 
 
-async def _await_collection_operation(start: StartOperation[T]) -> T:
+async def await_collection_operation(start: StartOperation[T]) -> T:
     if not mw:
         raise RuntimeError("Anki main window is not available")
 
+    window = mw
+    context = require_job()
     loop = asyncio.get_running_loop()
     future: asyncio.Future[T] = loop.create_future()
+    context.track_bridge(future)
 
     def resolve(result: T) -> None:
+        if window.col is not context.collection or not context.ui_valid():
+            context.cancel()
+            return
+
         def set_result() -> None:
             if not future.done():
-                future.set_result(result)
+                if context.valid():
+                    future.set_result(result)
+                else:
+                    future.cancel()
 
-        loop.call_soon_threadsafe(set_result)
+        deliver_future(loop, set_result)
 
     def reject(error: Exception) -> None:
         def set_exception() -> None:
             if not future.done():
                 future.set_exception(error)
 
-        loop.call_soon_threadsafe(set_exception)
+        deliver_future(loop, set_exception)
 
     def schedule() -> None:
         try:
-            start(resolve, reject)
+            context.check(window.col)
+            if not context.ui_valid():
+                context.cancel()
+            if context.valid() and not future.done():
+                start(resolve, reject)
         except Exception as error:
             reject(error)
 
     try:
-        mw.taskman.run_on_main(schedule)
+        window.taskman.run_on_main(schedule)
     except Exception as error:
         reject(error)
 
@@ -71,30 +87,48 @@ async def _await_collection_operation(start: StartOperation[T]) -> T:
 async def query_collection(operation: Callable[[Any], T]) -> T:
     """Run a short read operation on Anki's serialized collection worker."""
 
+    if not mw:
+        raise RuntimeError("Anki main window is not available")
+    context = require_job()
+
+    def guarded(collection: Any) -> T:
+        context.check(collection)
+        return operation(collection)
+
     def start(
         on_success: Callable[[T], None],
         on_failure: Callable[[Exception], None],
     ) -> None:
-        QueryOp(parent=mw, op=operation, success=on_success).failure(
+        QueryOp(parent=mw, op=guarded, success=on_success).failure(
             on_failure
         ).run_in_background()
 
-    return await _await_collection_operation(start)
+    return await await_collection_operation(start)
 
 
-async def mutate_collection(operation: Callable[[Any], T]) -> T:
+async def mutate_collection(
+    operation: Callable[[Any], ResultWithChanges],
+) -> ResultWithChanges:
     """Run a short undoable operation on Anki's serialized collection worker.
 
     The operation must return an Anki changes object, or an object with a
     ``changes`` attribute, so Anki can update undo state and refresh the UI.
     """
 
+    if not mw:
+        raise RuntimeError("Anki main window is not available")
+    context = require_job()
+
+    def guarded(collection: Any) -> ResultWithChanges:
+        context.check(collection)
+        return operation(collection)
+
     def start(
-        on_success: Callable[[T], None],
+        on_success: Callable[[ResultWithChanges], None],
         on_failure: Callable[[Exception], None],
     ) -> None:
-        CollectionOp(parent=mw, op=operation).success(on_success).failure(
+        CollectionOp(parent=mw, op=guarded).success(on_success).failure(
             on_failure
         ).run_in_background()
 
-    return await _await_collection_operation(start)
+    return await await_collection_operation(start)

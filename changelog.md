@@ -1,3 +1,19 @@
+# v3.0.0 — BYOK reliability refactor
+
+- Target Anki 26.5+ on Windows and macOS, with Python 3.13 for development.
+- Own generation jobs per profile; reject stale collection/editor results and shut down background work safely.
+- Validate field dependencies, isolate batch overwrite behavior, and capture effective settings for each job.
+- Save settings as one draft and migrate prompts/generation behavior to independent profile settings.
+- Reject incomplete provider output, retain conservative usage estimates, and bound media and tool operations.
+- Repair MCP stdio and Streamable HTTP interoperability, limits, cancellation, and environment handling.
+- Render Markdown safely, redact secrets, and improve native settings and preview behavior.
+- Use available FFmpeg encoders for AVIF and preserve AVIF originals while displaying native PNG previews.
+- Start model discovery when settings are shown; preserve draft credentials and cancel discovery when the dialog closes.
+- Revamp all seven settings pages with responsive native layouts, clear profile/shared scope, readable help and a fixed Save/Cancel footer.
+- Simplify voice selection, field inheritance and sample previews; show truthful model/image capabilities and inline discovery/probe errors.
+- Replace the MCP server table with a native selector to avoid the macOS Qt table-accessibility crash; preserve table items elsewhere and repair stale field targets.
+- Bundle only required runtime modules; build/clean operate solely on repository staging, preserving live Anki installations.
+
 
 # v2.14.1
 - Add support for new reasoning model **gpt-5.4**; behaves like gpt-5.2 in temperature/effort UI and rate limits.

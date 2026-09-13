@@ -19,7 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import cast
 
 from anki.decks import DeckId
 
@@ -40,7 +40,7 @@ from .config import config, key_or_config_val
 from .constants import API_KEY_MISSING_MESSAGE, GLOBAL_DECK_ID
 from .image_provider import ImageProvider, image_provider
 from .logger import logger
-from .markdown import convert_markdown_to_html
+from .markdown import convert_markdown_to_html, convert_text_to_html
 from .media_utils import build_media_filename, convert_image_data
 from .models import (
     DEFAULT_EXTRAS,
@@ -62,6 +62,7 @@ from .models import (
 from .nodes import FieldNode
 from .note_processor import PendingMedia, ResolvedField
 from .prompts import get_extras, interpolate_prompt_with_values
+from .settings import resolve_field_settings
 from .tool_registry import ToolRegistry
 from .tts_provider import TTSProvider, tts_provider
 from .tts_routing import select_tts_target, tts_audio_extension
@@ -96,7 +97,7 @@ class FieldProcessor:
         field_order: Sequence[str],
         values: Mapping[str, str],
         show_error_box: bool = False,
-        usage_scope_id: Optional[str] = None,
+        usage_scope_id: str | None = None,
     ) -> ResolvedField:
         input_text = node.input
         field_type: SmartFieldType = node.field_type
@@ -110,9 +111,11 @@ class FieldProcessor:
             or DEFAULT_EXTRAS
         )
 
+        settings = resolve_field_settings(config.snapshot(), extras)
+
         if field_type == "tts":
-            should_strip_html: bool = key_or_config_val(extras, "tts_strip_html")
-            pool: list[TTSVoiceTarget] = key_or_config_val(extras, "tts_voice_pool")
+            should_strip_html: bool = key_or_config_val(settings, "tts_strip_html")
+            pool: list[TTSVoiceTarget] = key_or_config_val(settings, "tts_voice_pool")
             target = select_tts_target(
                 pool,
                 language=extras.get("tts_language"),
@@ -157,14 +160,14 @@ class FieldProcessor:
             )
 
         if field_type == "chat":
-            chat_model: ChatModels = key_or_config_val(extras, "chat_model")
-            chat_provider: ChatProviders = key_or_config_val(extras, "chat_provider")
-            temperature: float = key_or_config_val(extras, "chat_temperature")
-            reasoning_effort: Optional[OpenAIReasoningEffort] = key_or_config_val(
-                extras, "chat_reasoning_effort"
+            chat_model: ChatModels = key_or_config_val(settings, "chat_model")
+            chat_provider: ChatProviders = key_or_config_val(settings, "chat_provider")
+            temperature: float = key_or_config_val(settings, "chat_temperature")
+            reasoning_effort: OpenAIReasoningEffort | None = key_or_config_val(
+                settings, "chat_reasoning_effort"
             )
-            should_convert: bool = key_or_config_val(extras, "chat_markdown_to_html")
-            use_tools: bool = key_or_config_val(extras, "chat_use_tools")
+            should_convert: bool = key_or_config_val(settings, "chat_markdown_to_html")
+            use_tools: bool = key_or_config_val(settings, "chat_use_tools")
             prompt_usage_context = PromptUsageContext(
                 prompt_key=build_prompt_usage_key(
                     note_type=note_type,
@@ -198,21 +201,27 @@ class FieldProcessor:
                 prompt_usage_context=prompt_usage_context,
                 usage_scope_id=usage_scope_id,
             )
-            return ResolvedField(value)
+            return ResolvedField(
+                value
+                if should_convert or value is None
+                else convert_text_to_html(value)
+            )
 
         if field_type == "image":
-            image_model: ImageModels = key_or_config_val(extras, "image_model")
-            image_provider: ImageProviders = key_or_config_val(extras, "image_provider")
-            aspect_ratio: Optional[ImageAspectRatio] = key_or_config_val(
-                extras, "image_aspect_ratio"
+            image_model: ImageModels = key_or_config_val(settings, "image_model")
+            image_provider: ImageProviders = key_or_config_val(
+                settings, "image_provider"
             )
-            resolution: Optional[ImageResolution] = key_or_config_val(
-                extras, "image_resolution"
+            aspect_ratio: ImageAspectRatio | None = key_or_config_val(
+                settings, "image_aspect_ratio"
+            )
+            resolution: ImageResolution | None = key_or_config_val(
+                settings, "image_resolution"
             )
             output_format: ImageOutputFormat = (
-                key_or_config_val(extras, "image_output_format") or "webp"
+                key_or_config_val(settings, "image_output_format") or "webp"
             )
-            quality: int = key_or_config_val(extras, "image_quality") or -1
+            quality = settings.get("image_quality")
             data = await self.get_image_response(
                 note_id=note_id,
                 values=values,
@@ -224,14 +233,14 @@ class FieldProcessor:
                 output_format=output_format,
                 quality=quality,
                 generation_quality=key_or_config_val(
-                    extras, "image_generation_quality"
+                    settings, "image_generation_quality"
                 ),
                 show_error_box=show_error_box,
             )
             if not data:
                 return ResolvedField(None)
 
-            extension = output_format if output_format != "jpeg" else "jpg"
+            extension = {"jpeg": "jpg"}.get(output_format, output_format)
             filename = build_media_filename(
                 note_type,
                 note_id,
@@ -256,16 +265,16 @@ class FieldProcessor:
         deck_id: DeckId,
         prompt: str,
         model: ChatModels,
-        provider: ChatProviders,
+        provider: str,
         field_lower: str,
         temperature: float,
         should_convert_to_html: bool,
-        reasoning_effort: Optional[OpenAIReasoningEffort] = None,
+        reasoning_effort: OpenAIReasoningEffort | None = None,
         use_tools: bool = False,
         show_error_box: bool = True,
-        prompt_usage_context: Optional[PromptUsageContext] = None,
-        usage_scope_id: Optional[str] = None,
-    ) -> Optional[str]:
+        prompt_usage_context: PromptUsageContext | None = None,
+        usage_scope_id: str | None = None,
+    ) -> str | None:
         interpolated_prompt = interpolate_prompt_with_values(
             prompt,
             values,
@@ -274,7 +283,7 @@ class FieldProcessor:
         if not interpolated_prompt or not self._check_api_key(provider, show_error_box):
             return None
 
-        tools: Optional[list[TextToolDefinition]] = None
+        tools: list[TextToolDefinition] | None = None
         tool_executor = None
         if use_tools:
             registry = ToolRegistry(
@@ -317,6 +326,7 @@ class FieldProcessor:
                 prompt_usage_signature=prompt_usage_context.signature
                 if prompt_usage_context
                 else None,
+                usage_scope_id=usage_scope_id,
             )
         except OpenAITokenBudgetExceededError as error:
             if show_error_box:
@@ -358,8 +368,8 @@ class FieldProcessor:
         voice: str,
         strip_html: bool,
         show_error_box: bool = True,
-        instructions: Optional[str] = None,
-    ) -> Optional[bytes]:
+        instructions: str | None = None,
+    ) -> bytes | None:
         interpolated_prompt = interpolate_prompt_with_values(
             input_text,
             values,
@@ -386,13 +396,13 @@ class FieldProcessor:
         input_text: str,
         model: ImageModels,
         provider: ImageProviders,
-        aspect_ratio: Optional[ImageAspectRatio] = None,
-        resolution: Optional[ImageResolution] = None,
-        output_format: Optional[str] = None,
-        quality: Optional[int] = None,
-        generation_quality: Optional[ImageGenerationQuality] = None,
+        aspect_ratio: ImageAspectRatio | None = None,
+        resolution: ImageResolution | None = None,
+        output_format: str | None = None,
+        quality: int | None = None,
+        generation_quality: ImageGenerationQuality | None = None,
         show_error_box: bool = True,
-    ) -> Optional[bytes]:
+    ) -> bytes | None:
         interpolated_prompt = interpolate_prompt_with_values(
             input_text,
             values,
@@ -416,19 +426,11 @@ class FieldProcessor:
         if not raw_bytes:
             return None
 
-        # Ensure format and quality
-        try:
-            return convert_image_data(
-                raw_bytes,
-                format=output_format or "webp",
-                quality=quality if quality is not None else -1,
-            )
-        except Exception as e:
-            logger.error(f"Failed to convert image: {e}")
-            if show_error_box:
-                error_msg = f"Failed to convert image: {e}"
-                run_on_main(lambda: show_message_box(error_msg))
-            return None
+        return await convert_image_data(
+            raw_bytes,
+            format=output_format or "webp",
+            quality=quality if quality is not None else -1,
+        )
 
     def _check_api_key(self, provider: str, show_error_box: bool) -> bool:
         # First check if this matches a custom provider

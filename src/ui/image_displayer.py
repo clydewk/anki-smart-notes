@@ -17,41 +17,46 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import base64
-from typing import Optional
-
-from aqt import QHBoxLayout, QWebEngineView, QWidget
-from PyQt6.QtCore import Qt
+from aqt.qt import QLabel, QPixmap, QResizeEvent, QSizePolicy, Qt, QVBoxLayout, QWidget
 
 
 class ImageDisplayer(QWidget):
-    webview: QWebEngineView
-
     def __init__(
         self,
-        image: Optional[bytes] = None,
+        image: bytes | None = None,
         height: int = 500,
         width: int = 500,
-        parent: Optional[QWidget] = None,
+        parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
 
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)  # Remove padding
-        self.setContentsMargins(0, 0, 0, 0)  # Remove padding
-        self.setLayout(layout)
-        self.webview = QWebEngineView()
-        self.webview.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # No focus
-        layout.addWidget(self.webview)
-        self.setFixedHeight(height)
-        self.setFixedWidth(width)
-        self.webview.setContentsMargins(0, 0, 0, 0)  # Remove padding
-        # self.webview.show()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel(self)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        layout.addWidget(self.label)
+        self._pixmap = QPixmap()
+        self.resize(width, height)
         if image:
             self.set_image(image)
 
     def set_image(self, image: bytes) -> None:
-        b64_image = base64.b64encode(image).decode("utf-8")
-        html = f'<img src="data:image/png;base64,{b64_image}" height="100%" width="100%" />'
-        self.webview.setHtml(html)
-        self.webview.show()
+        if not self._pixmap.loadFromData(image):
+            self.label.clear()
+            raise ValueError("Unable to display the generated image.")
+        self._resize_image()
+
+    def resizeEvent(self, a0: QResizeEvent | None) -> None:
+        super().resizeEvent(a0)
+        self._resize_image()
+
+    def _resize_image(self) -> None:
+        if not self._pixmap.isNull():
+            self.label.setPixmap(
+                self._pixmap.scaled(
+                    self.label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )

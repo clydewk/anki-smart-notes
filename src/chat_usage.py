@@ -25,13 +25,16 @@ import math
 import os
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Any, Callable, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 from uuid import uuid4
 
 from .logger import logger
 from .utils import get_file_path
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 DEFAULT_STANDARD_OUTPUT_ESTIMATE = 512
 DEFAULT_STANDARD_TOOLS_OUTPUT_ESTIMATE = 768
@@ -60,6 +63,7 @@ class StoredPromptUsageStats(StoredUsageStats):
 
 
 class StoredOpenAIDailyUsage(TypedDict):
+    estimated_total_tokens: int
     day_utc: str
     used_input_tokens: int
     used_output_tokens: int
@@ -96,6 +100,7 @@ class OpenAIDailyUsageSnapshot:
     used_output_tokens: int
     used_total_tokens: int
     request_count: int
+    estimated_total_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -188,7 +193,7 @@ def format_token_count(count: int) -> str:
 
 def is_reasoning_model_name(model: str) -> bool:
     lowered = model.lower()
-    return lowered.startswith(("o", "gpt-5"))
+    return lowered.startswith(("o", "gpt-5", "gpt-6"))
 
 
 def build_prompt_usage_key(note_type: str, deck_id: int, field_lower: str) -> str:
@@ -318,7 +323,7 @@ class ChatUsageTracker:
 
         self._persist_state = persist_state
         self._explicit_state_path = state_path
-        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self._now_fn = now_fn or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
         self._loaded = False
         self._state: StoredChatUsageState = self.default_state()
@@ -429,6 +434,7 @@ class ChatUsageTracker:
             usage = self._state["openai_daily_usage"]
             return OpenAIDailyUsageSnapshot(
                 day_utc=usage["day_utc"],
+                estimated_total_tokens=usage["estimated_total_tokens"],
                 used_input_tokens=usage["used_input_tokens"],
                 used_output_tokens=usage["used_output_tokens"],
                 used_total_tokens=usage["used_total_tokens"],
@@ -566,13 +572,17 @@ class ChatUsageTracker:
         provider: str,
         raw_usage: dict[str, Any] | None,
         permit: OpenAITurnPermit | None,
+        estimated_usage: NormalizedChatUsage | None = None,
     ) -> NormalizedChatUsage | None:
         if provider.lower() != "openai":
             return normalize_chat_usage(raw_usage)
 
         normalized_usage = normalize_chat_usage(raw_usage)
-        if normalized_usage is None and permit is not None:
-            normalized_usage = permit.estimated_usage
+        estimated = normalized_usage is None
+        if normalized_usage is None:
+            normalized_usage = (
+                permit.estimated_usage if permit is not None else estimated_usage
+            )
 
         condition = self.turn_permit_condition()
         async with condition:
@@ -594,6 +604,8 @@ class ChatUsageTracker:
                 ledger["used_output_tokens"] += normalized_usage.output_tokens
                 ledger["used_total_tokens"] += normalized_usage.total_tokens
                 ledger["request_count"] += 1
+                if estimated:
+                    ledger["estimated_total_tokens"] += normalized_usage.total_tokens
 
                 self.save_locked()
 
@@ -672,10 +684,8 @@ class ChatUsageTracker:
 
             if scope_id:
                 scope = self._scopes.get(scope_id)
-                if scope is None:
-                    scope = MutableUsageScope()
-                    self._scopes[scope_id] = scope
-                scope.add(provider, normalized_usage)
+                if scope is not None:
+                    scope.add(provider, normalized_usage)
 
             if changed:
                 self.save_locked()
@@ -710,6 +720,7 @@ class ChatUsageTracker:
     def new_openai_daily_usage(self, day_utc: str) -> StoredOpenAIDailyUsage:
         return {
             "day_utc": day_utc,
+            "estimated_total_tokens": 0,
             "used_input_tokens": 0,
             "used_output_tokens": 0,
             "used_total_tokens": 0,
@@ -1043,6 +1054,7 @@ class ChatUsageTracker:
             day_utc if isinstance(day_utc, str) and day_utc else self.current_day_utc()
         )
         for key in (
+            "estimated_total_tokens",
             "used_input_tokens",
             "used_output_tokens",
             "used_total_tokens",
@@ -1068,8 +1080,8 @@ class ChatUsageTracker:
     def utc_now(self) -> datetime:
         current = self._now_fn()
         if current.tzinfo is None:
-            return current.replace(tzinfo=timezone.utc)
-        return current.astimezone(timezone.utc)
+            return current.replace(tzinfo=UTC)
+        return current.astimezone(UTC)
 
     def format_openai_budget_error(
         self,

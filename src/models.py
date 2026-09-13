@@ -19,7 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, TypedDict, Union, cast
+from typing import Any, Literal, TypedDict, cast
 
 # Providers
 
@@ -63,11 +63,17 @@ class OpenAIChatModelSpec:
     model: str
     label: str
     reasoning_efforts: tuple[OpenAIReasoningEffort, ...]
+    temperature_without_reasoning: bool = True
+    chat_tools: bool = True
 
 
 OPENAI_CHAT_MODEL_CATALOG: tuple[OpenAIChatModelSpec, ...] = (
     OpenAIChatModelSpec(
-        "gpt-6-astra", "GPT-6 Astra", ("low", "medium", "high", "xhigh", "max")
+        "gpt-6-astra",
+        "GPT-6 Astra",
+        ("low", "medium", "high", "xhigh", "max"),
+        temperature_without_reasoning=False,
+        chat_tools=False,
     ),
     OpenAIChatModelSpec(
         "gpt-5.6-sol", "GPT-5.6 Sol", OPENAI_REASONING_EFFORTS_WITH_MAX
@@ -94,16 +100,16 @@ OPENAI_CHAT_MODEL_LABELS: dict[str, str] = {
 }
 
 anthropic_chat_models: list[ChatModels] = [
-    "claude-opus-4-1",
-    "claude-sonnet-4-0",
-    "claude-3-5-haiku-latest",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
 ]
 
-deepseek_chat_models: list[ChatModels] = ["deepseek-v3"]
+deepseek_chat_models: list[ChatModels] = ["deepseek-v4-flash", "deepseek-v4-pro"]
 
 google_chat_models: list[ChatModels] = [
     "gemini-3-flash-preview",
-    "gemini-3-pro-preview",
+    "gemini-3.1-pro-preview",
 ]
 
 provider_model_map: dict[ChatProviders, list[ChatModels]] = {
@@ -112,6 +118,28 @@ provider_model_map: dict[ChatProviders, list[ChatModels]] = {
     "deepseek": deepseek_chat_models,
     "google": google_chat_models,
 }
+
+
+RETIRED_PROVIDER_MODELS: set[tuple[str, str]] = {
+    ("anthropic", "claude-opus-4-1"),
+    ("anthropic", "claude-opus-4-1-20250805"),
+    ("anthropic", "claude-sonnet-4-0"),
+    ("anthropic", "claude-sonnet-4-20250514"),
+    ("anthropic", "claude-3-5-haiku-latest"),
+    ("anthropic", "claude-3-5-haiku-20241022"),
+    ("deepseek", "deepseek-v3"),
+    ("deepseek", "deepseek-chat"),
+    ("deepseek", "deepseek-reasoner"),
+    ("google", "gemini-3-pro-preview"),
+    ("google", "gemini-3-pro-image-preview"),
+}
+
+
+def validate_provider_model(provider: str, model: str) -> None:
+    if (provider, model) in RETIRED_PROVIDER_MODELS:
+        raise ValueError(
+            f"{provider} model {model} is unavailable. Choose a supported model in settings."
+        )
 
 
 legacy_openai_chat_models: list[str] = [
@@ -142,6 +170,24 @@ def openai_reasoning_efforts_for_model(model: str) -> list[OpenAIReasoningEffort
     return list(
         OPENAI_REASONING_EFFORTS_BY_MODEL.get(key, OPENAI_DEFAULT_REASONING_EFFORTS)
     )
+
+
+def openai_supports_temperature(model: str, reasoning_effort: str | None) -> bool:
+    spec = next(
+        (spec for spec in OPENAI_CHAT_MODEL_CATALOG if spec.model == model.lower()),
+        None,
+    )
+    return reasoning_effort in {None, "none"} and (
+        spec is None or spec.temperature_without_reasoning
+    )
+
+
+def openai_supports_chat_tools(model: str) -> bool:
+    spec = next(
+        (spec for spec in OPENAI_CHAT_MODEL_CATALOG if spec.model == model.lower()),
+        None,
+    )
+    return spec is None or spec.chat_tools
 
 
 def openai_model_label(model: str) -> str:
@@ -227,7 +273,7 @@ def openai_chat_models_for_display(
     available_models: list[str],
     *,
     include_available: bool = False,
-    current_model: Optional[str] = None,
+    current_model: str | None = None,
 ) -> list[ChatModels]:
     models = list(openai_chat_models)
 
@@ -256,9 +302,9 @@ GoogleModels = Literal[
     "gemini-2.5-pro-preview-tts",
 ]
 AzureModels = Literal["standard", "neural"]
-TTSModels = Union[
-    OpenAITTSModels, ElevenTTSModels, FishTTSModels, GoogleModels, AzureModels
-]
+TTSModels = (
+    OpenAITTSModels | ElevenTTSModels | FishTTSModels | GoogleModels | AzureModels
+)
 
 # TTS Voices
 
@@ -287,7 +333,7 @@ class TTSVoiceTarget(TypedDict):
     provider: str
     model: str
     voice: str
-    language: Optional[str]
+    language: str | None
     enabled: bool
 
 
@@ -296,7 +342,7 @@ SmartFieldType = Literal["chat", "tts", "image"]
 # Image Models
 
 ReplicateImageModels = Literal["flux-dev", "flux-schnell"]
-GoogleImageModels = Literal["gemini-3-pro-image-preview"]
+GoogleImageModels = Literal["gemini-3-pro-image", "gemini-3-pro-image-preview"]
 OpenAIImageModels = Literal[
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
@@ -306,7 +352,7 @@ OpenAIImageModels = Literal[
     "gpt-image-1-mini",
     "dall-e-3",
 ]
-ImageModels = Union[ReplicateImageModels, GoogleImageModels, OpenAIImageModels]
+ImageModels = ReplicateImageModels | GoogleImageModels | OpenAIImageModels
 
 ImageProviders = Literal["replicate", "google", "openai"]
 ImageAspectRatio = Literal["1:1", "16:9", "4:3", "3:4", "9:16"]
@@ -323,37 +369,92 @@ def image_generation_qualities(model: str) -> list[ImageGenerationQuality]:
     return ["auto"]
 
 
+def openai_image_size(
+    model: str,
+    aspect_ratio: ImageAspectRatio | None,
+    resolution: ImageResolution | None,
+) -> str:
+    if model == "gpt-image-2" or model.startswith("gpt-image-2.5-"):
+        return openai_image_2_size(aspect_ratio, resolution)
+
+    if "gpt-image" in model:
+        if aspect_ratio == "16:9" or aspect_ratio == "4:3":
+            return "1536x1024"
+        if aspect_ratio == "9:16" or aspect_ratio == "3:4":
+            return "1024x1536"
+        return "1024x1024"
+
+    if aspect_ratio == "16:9":
+        return "1792x1024"
+    if aspect_ratio == "9:16":
+        return "1024x1792"
+    return "1024x1024"
+
+
+def openai_image_2_size(
+    aspect_ratio: ImageAspectRatio | None,
+    resolution: ImageResolution | None,
+) -> str:
+    if resolution == "4096x4096":
+        if aspect_ratio == "16:9":
+            return "3840x2160"
+        if aspect_ratio == "4:3":
+            return "2736x2048"
+        if aspect_ratio == "9:16":
+            return "2160x3840"
+        if aspect_ratio == "3:4":
+            return "2048x2736"
+        return "2048x2048"
+
+    if resolution == "2048x2048":
+        if aspect_ratio == "16:9":
+            return "2048x1152"
+        if aspect_ratio == "4:3":
+            return "2048x1536"
+        if aspect_ratio == "9:16":
+            return "1152x2048"
+        if aspect_ratio == "3:4":
+            return "1536x2048"
+        return "2048x2048"
+
+    if aspect_ratio == "16:9" or aspect_ratio == "4:3":
+        return "1536x1024"
+    if aspect_ratio == "9:16" or aspect_ratio == "3:4":
+        return "1024x1536"
+    return "1024x1024"
+
+
 class FieldExtras(TypedDict):
     automatic: bool
     type: SmartFieldType
     use_custom_model: bool
 
     # Chat
-    chat_model: Optional[ChatModels]
-    chat_provider: Optional[ChatProviders]
-    chat_temperature: Optional[int]
-    chat_reasoning_effort: Optional[OpenAIReasoningEffort]
-    chat_markdown_to_html: Optional[bool]
-    chat_use_tools: Optional[bool]
+    chat_model: ChatModels | None
+    chat_provider: str | None
+    chat_temperature: float | None
+    chat_reasoning_effort: OpenAIReasoningEffort | None
+    chat_markdown_to_html: bool | None
+    chat_use_tools: bool | None
 
     # TTS
-    tts_voice_pool: Optional[list[TTSVoiceTarget]]
-    tts_language: Optional[str]
-    tts_strip_html: Optional[bool]
-    tts_style: Optional[str]
+    tts_voice_pool: list[TTSVoiceTarget] | None
+    tts_language: str | None
+    tts_strip_html: bool | None
+    tts_style: str | None
     # Legacy single-voice settings retained for import/migration compatibility.
-    tts_provider: Optional[TTSProviders]
-    tts_model: Optional[TTSModels]
-    tts_voice: Optional[str]
+    tts_provider: TTSProviders | None
+    tts_model: TTSModels | None
+    tts_voice: str | None
 
     # Images
-    image_provider: Optional[ImageProviders]
-    image_model: Optional[ImageModels]
-    image_aspect_ratio: Optional[ImageAspectRatio]
-    image_resolution: Optional[ImageResolution]
-    image_output_format: Optional[ImageOutputFormat]
-    image_quality: Optional[int]  # 0-100, -1 for default/lossless if format supports it
-    image_generation_quality: Optional[ImageGenerationQuality]
+    image_provider: ImageProviders | None
+    image_model: ImageModels | None
+    image_aspect_ratio: ImageAspectRatio | None
+    image_resolution: ImageResolution | None
+    image_output_format: ImageOutputFormat | None
+    image_quality: int | None  # 0-100, -1 for default/lossless if format supports it
+    image_generation_quality: ImageGenerationQuality | None
     regenerate_when_batching: bool
 
 
@@ -401,12 +502,12 @@ class PromptMap(TypedDict):
 
 # Overridable Options
 
-OverridableChatOptions = Union[
-    Literal["chat_provider"],
-    Literal["chat_model"],
-    Literal["chat_temperature"],
-    Literal["chat_reasoning_effort"],
-    Literal["chat_markdown_to_html"],
+OverridableChatOptions = Literal[
+    "chat_provider",
+    "chat_model",
+    "chat_temperature",
+    "chat_reasoning_effort",
+    "chat_markdown_to_html",
 ]
 
 overridable_chat_options: list[OverridableChatOptions] = [
@@ -419,11 +520,11 @@ overridable_chat_options: list[OverridableChatOptions] = [
 
 
 class OverridableChatOptionsDict(TypedDict):
-    chat_provider: Optional[ChatProviders]
-    chat_model: Optional[ChatModels]
-    chat_temperature: Optional[int]
-    chat_reasoning_effort: Optional[OpenAIReasoningEffort]
-    chat_markdown_to_html: Optional[bool]
+    chat_provider: str | None
+    chat_model: ChatModels | None
+    chat_temperature: float | None
+    chat_reasoning_effort: OpenAIReasoningEffort | None
+    chat_markdown_to_html: bool | None
 
 
 McpServerTransport = Literal["stdio", "streamable_http"]
@@ -464,7 +565,7 @@ DEFAULT_BUILT_IN_TOOLS: BuiltInToolsConfig = {
 
 
 def normalize_built_in_tools_config(
-    built_in_tools: Optional[Union[dict[str, Any], BuiltInToolsConfig]],
+    built_in_tools: dict[str, Any] | BuiltInToolsConfig | None,
 ) -> BuiltInToolsConfig:
     normalized = dict(DEFAULT_BUILT_IN_TOOLS)
     if not built_in_tools:
@@ -483,9 +584,9 @@ def make_tts_voice_target(
     model: object,
     voice: object,
     *,
-    language: Optional[str] = None,
+    language: str | None = None,
     enabled: bool = True,
-) -> Optional[TTSVoiceTarget]:
+) -> TTSVoiceTarget | None:
     if not all(
         isinstance(value, str) and value.strip() for value in (provider, model, voice)
     ):
@@ -526,7 +627,7 @@ def normalize_tts_voice_pool(value: object) -> list[TTSVoiceTarget]:
 
 
 def normalize_field_extras(
-    extras: Optional[Union[dict[str, Any], FieldExtras]],
+    extras: dict[str, Any] | FieldExtras | None,
 ) -> FieldExtras:
     normalized = cast("FieldExtras", dict(DEFAULT_EXTRAS))
     if not extras:
@@ -561,10 +662,7 @@ def normalize_field_extras(
     return normalized
 
 
-OverridableTTSOptions = Union[
-    Literal["tts_voice_pool"],
-    Literal["tts_strip_html"],
-]
+OverridableTTSOptions = Literal["tts_voice_pool", "tts_strip_html"]
 
 overridable_tts_options: list[OverridableTTSOptions] = [
     "tts_voice_pool",
@@ -582,30 +680,30 @@ class CustomProvider(TypedDict):
     streaming_mode: Literal["auto", "enabled", "disabled"]
 
     # Granular capability lists
-    chat_models: Optional[list[str]]
-    tts_models: Optional[list[str]]
-    image_models: Optional[list[str]]
+    chat_models: list[str] | None
+    tts_models: list[str] | None
+    image_models: list[str] | None
 
 
 class ProviderSettings(TypedDict):
     model: str
     temperature: float
-    reasoning_effort: Optional[OpenAIReasoningEffort]
+    reasoning_effort: OpenAIReasoningEffort | None
 
 
 class OverrideableTTSOptionsDict(TypedDict):
-    tts_voice_pool: Optional[list[TTSVoiceTarget]]
-    tts_strip_html: Optional[bool]
+    tts_voice_pool: list[TTSVoiceTarget] | None
+    tts_strip_html: bool | None
 
 
-OverridableImageOptions = Union[
-    Literal["image_provider"],
-    Literal["image_model"],
-    Literal["image_aspect_ratio"],
-    Literal["image_resolution"],
-    Literal["image_output_format"],
-    Literal["image_quality"],
-    Literal["image_generation_quality"],
+OverridableImageOptions = Literal[
+    "image_provider",
+    "image_model",
+    "image_aspect_ratio",
+    "image_resolution",
+    "image_output_format",
+    "image_quality",
+    "image_generation_quality",
 ]
 
 overridable_image_options: list[OverridableImageOptions] = [
@@ -620,10 +718,10 @@ overridable_image_options: list[OverridableImageOptions] = [
 
 
 class OverridableImageOptionsDict(TypedDict):
-    image_model: Optional[ImageModels]
-    image_provider: Optional[ImageProviders]
-    image_aspect_ratio: Optional[ImageAspectRatio]
-    image_resolution: Optional[ImageResolution]
-    image_output_format: Optional[ImageOutputFormat]
-    image_quality: Optional[int]
-    image_generation_quality: Optional[ImageGenerationQuality]
+    image_model: ImageModels | None
+    image_provider: ImageProviders | None
+    image_aspect_ratio: ImageAspectRatio | None
+    image_resolution: ImageResolution | None
+    image_output_format: ImageOutputFormat | None
+    image_quality: int | None
+    image_generation_quality: ImageGenerationQuality | None

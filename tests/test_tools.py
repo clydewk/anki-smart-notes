@@ -18,8 +18,9 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -37,6 +38,9 @@ from src.mcp_runtime import (
 from src.nodes import FieldNode
 from src.tool_registry import ToolRegistry
 from tests.mocks import MockConfig
+
+if TYPE_CHECKING:
+    from anki.decks import DeckId
 
 
 class FakeNote:
@@ -79,7 +83,7 @@ class FakeCollection:
         *,
         notes: list[FakeNote],
         note_queries: list[tuple[str, list[int]]],
-        card_queries: Optional[list[tuple[str, list[int]]]] = None,
+        card_queries: list[tuple[str, list[int]]] | None = None,
     ) -> None:
         self._notes = {note.id: note for note in notes}
         self._note_queries = note_queries
@@ -93,6 +97,7 @@ class FakeCollection:
         self.models = FakeModels(fields_by_note_type)
         self.recorded_note_queries: list[str] = []
         self.recorded_card_queries: list[str] = []
+        self.read_note_ids: list[int] = []
 
     def find_notes(self, query: str) -> list[int]:
         self.recorded_note_queries.append(query)
@@ -109,6 +114,7 @@ class FakeCollection:
         return []
 
     def get_note(self, note_id: int) -> FakeNote:
+        self.read_note_ids.append(note_id)
         return self._notes[note_id]
 
 
@@ -131,6 +137,7 @@ def make_server_config(server_id: str = "server-1") -> dict[str, Any]:
 
 def test_config_cleanup_migrates_legacy_tools_settings(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     config_data: dict[str, Any] = {
         "chat_temperature": 1,
@@ -163,7 +170,10 @@ def test_config_cleanup_migrates_legacy_tools_settings(
 
     monkeypatch.setattr(
         "src.config.mw",
-        SimpleNamespace(addonManager=FakeAddonManager()),
+        SimpleNamespace(
+            addonManager=FakeAddonManager(),
+            pm=SimpleNamespace(name="Test", profileFolder=lambda: str(tmp_path)),
+        ),
     )
 
     cfg = Config()
@@ -175,12 +185,13 @@ def test_config_cleanup_migrates_legacy_tools_settings(
         "anki_search_notes": False,
         "anki_get_deck_overview": True,
     }
-    extras = config_data["prompts_map"]["note_types"]["Basic"]["1"]["extras"]["Back"]
+    extras = cfg.prompts_map["note_types"]["Basic"]["1"]["extras"]["Back"]
     assert extras["chat_use_tools"] is True
 
 
 def test_config_migrates_legacy_tts_voice_to_pool(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     config_data: dict[str, Any] = {
         "did_migrate_tts_voice_pool": False,
@@ -219,11 +230,14 @@ def test_config_migrates_legacy_tts_voice_to_pool(
 
     monkeypatch.setattr(
         "src.config.mw",
-        SimpleNamespace(addonManager=FakeAddonManager()),
+        SimpleNamespace(
+            addonManager=FakeAddonManager(),
+            pm=SimpleNamespace(name="Test", profileFolder=lambda: str(tmp_path)),
+        ),
     )
-    monkeypatch.setattr(Config, "_backup_config", lambda self: None)
 
-    Config().perform_tts_voice_pool_migration()
+    cfg = Config()
+    cfg.perform_tts_voice_pool_migration()
 
     assert config_data["tts_voice_pool"] == [
         {
@@ -234,7 +248,7 @@ def test_config_migrates_legacy_tts_voice_to_pool(
             "enabled": True,
         }
     ]
-    assert config_data["prompts_map"]["note_types"]["Basic"]["1"]["extras"]["Audio"][
+    assert cfg.prompts_map["note_types"]["Basic"]["1"]["extras"]["Audio"][
         "tts_voice_pool"
     ] == [
         {
@@ -345,7 +359,49 @@ async def test_built_in_search_notes_honors_all_decks_scope_and_limit(
     assert payload["scope"] == "all_decks"
     assert payload["limit"] == 2
     assert len(payload["results"]) == 2
-    assert payload["match_count"] == 3
+    assert payload["match_count"] == 2
+    assert payload["truncated"] is True
+    assert collection.read_note_ids == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_built_in_search_stops_after_one_thousand_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notes = [
+        FakeNote(note_id, "Basic", {"Front": "irrelevant"})
+        for note_id in range(1, 1002)
+    ]
+    collection = FakeCollection(
+        notes=notes, note_queries=[("meaning", list(range(1, 1002)))]
+    )
+    use_collection(monkeypatch, collection)
+    provider = BuiltInToolProvider(
+        BuiltInToolContext(
+            note_id=0,
+            deck_id=10,
+            deck_name="Japanese",
+            note_type="Basic",
+            note_type_fields=("Front", "Back"),
+            field_name="Back",
+        ),
+        {"anki_search_notes": True, "anki_get_deck_overview": False},
+    )
+    provider.build_tool_registry()
+    payload = json.loads(
+        await provider.execute_tool_call(
+            "anki_search_notes",
+            {
+                "query": "meaning",
+                "field_filters": [
+                    {"field": "Front", "value": "wanted", "match_mode": "exact"}
+                ],
+            },
+        )
+    )
+    assert len(collection.read_note_ids) == 1000
+    assert payload["results"] == []
+    assert payload["truncated"] is True
 
 
 @pytest.mark.asyncio
@@ -672,6 +728,7 @@ async def test_tool_registry_merges_built_in_and_mcp_tools(
         (
             "image",
             {
+                "use_custom_model": True,
                 "image_model": "gpt-image-1",
                 "image_provider": "openai",
                 "image_aspect_ratio": None,
@@ -707,7 +764,7 @@ async def test_field_processor_defers_media_writes(
         in_nodes=[],
         manual=False,
         overwrite=False,
-        deck_id=10,
+        deck_id=cast("DeckId", 10),
         input="{{Front}}",
         field_type=cast("Any", field_type),
     )
@@ -763,7 +820,7 @@ async def test_field_processor_does_not_register_tools_when_disabled(
         deck_name="Japanese",
         field_order=("Front", "Back"),
         values={"front": "hello", "back": ""},
-        deck_id=10,
+        deck_id=cast("DeckId", 10),
         prompt="Use {{Front}}",
         model="gpt-4o-mini",
         provider="openai",

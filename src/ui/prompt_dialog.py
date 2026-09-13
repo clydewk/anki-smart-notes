@@ -17,8 +17,9 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from collections.abc import Callable
-from typing import Any, Literal, Optional, TypedDict, Union, cast
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from typing import Any, Literal, TypedDict, cast
 
 from anki.decks import DeckId
 from anki.notes import Note
@@ -27,11 +28,11 @@ from aqt import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMenu,
+    QPlainTextEdit,
     QPushButton,
     Qt,
     QTabWidget,
@@ -43,6 +44,7 @@ from aqt import (
     mw,
 )
 from aqt.qt import QCursor
+from PyQt6 import sip
 
 from ..chat_usage import (
     build_prompt_usage_key,
@@ -55,7 +57,8 @@ from ..constants import API_KEY_MISSING_MESSAGE, GLOBAL_DECK_ID
 from ..dag import prompt_has_error
 from ..decks import deck_id_to_name_map, get_all_deck_ids
 from ..field_processor import PromptUsageContext
-from ..logger import logger
+from ..logger import logger, redact_text
+from ..media_utils import image_preview_data
 from ..models import (
     DEFAULT_EXTRAS,
     OverridableChatOptionsDict,
@@ -66,6 +69,7 @@ from ..models import (
     TTSModels,
     TTSProviders,
     TTSVoiceTarget,
+    openai_supports_temperature,
     overridable_chat_options,
     overridable_image_options,
     overridable_tts_options,
@@ -77,22 +81,30 @@ from ..prompts import (
     get_extras,
     get_prompt_fields,
     get_prompts_for_note,
-    interpolate_prompt,
+    interpolate_prompt_with_values,
+    remove_prompt,
 )
 from ..sentry import run_async_in_background_with_sentry
+from ..settings import resolve_field_settings, with_widget_settings
 from ..tts_routing import select_tts_target
 from ..tts_utils import play_audio
-from ..utils import get_fields, none_defaulting, to_lowercase_dict
-from .chat_options import ChatOptions
+from ..utils import get_fields
+from .chat_options import ChatOptions, all_chat_providers
 from .image_displayer import ImageDisplayer
-from .image_options import ImageOptions
+from .image_options import ImageOptions, image_output_summary
 from .reactive_check_box import ReactiveCheckBox
 from .reactive_combo_box import ReactiveComboBox
 from .reactive_edit_text import ReactiveEditText
 from .reactive_line_edit import ReactiveLineEdit
 from .state_manager import StateManager
 from .tts_options import TTSOptions
-from .ui_utils import default_form_layout, font_bold, font_small, show_message_box
+from .ui_utils import (
+    bound_dialog,
+    default_form_layout,
+    font_bold,
+    scroll_page,
+    show_message_box,
+)
 
 PROVIDER_API_KEY_ATTRS: dict[str, str] = {
     "openai": "openai_api_key",
@@ -109,7 +121,7 @@ explanation = """Write a prompt to help the chat model generate your Smart Field
 
 Your prompt may reference other fields via {{double curly braces}}. Valid fields are listed below for convenience.
 
-Test out your prompt with the test button before saving it!
+Use the Preview tab to inspect a sample and test the result.
 """
 
 tts_explanation = """Write text to be spoken, or include the field to speak.
@@ -175,10 +187,10 @@ class PromptDialog(QDialog):
         on_accept_callback: Callable[[PromptMap], None],
         field_type: SmartFieldType,
         deck_id: DeckId,
-        card_type: Optional[str] = None,
-        field: Optional[str] = None,
-        prompt: Optional[str] = None,
-        parent: Optional[QWidget] = None,
+        card_type: str | None = None,
+        field: str | None = None,
+        prompt: str | None = None,
+        parent: QWidget | None = None,
     ):
         super().__init__(parent)
 
@@ -187,8 +199,22 @@ class PromptDialog(QDialog):
         self.prompts_map = prompts_map
         self.mode = "edit" if card_type else "new"
         self.field_type = field_type
+        self.original_identity = (
+            (card_type, deck_id, field) if card_type and field else None
+        )
+        self.sample_note: Note | None = None
+        known_types = get_note_types()
+        self.repairing = bool(
+            card_type
+            and (
+                card_type not in known_types
+                or field not in get_fields(card_type)
+                or deck_id not in get_all_deck_ids()
+            )
+        )
         note_types = self._get_note_types(deck_id=deck_id)
-        selected_note_type = card_type or note_types[0]
+        if card_type in known_types and card_type not in note_types:
+            note_types.insert(0, card_type)
 
         # Ensure there are valid fields to select
         if not len(note_types):
@@ -198,15 +224,21 @@ class PromptDialog(QDialog):
             QTimer.singleShot(0, self.close)
             return
 
+        selected_note_type = card_type if card_type in note_types else note_types[0]
+        selected_deck = deck_id if deck_id in get_all_deck_ids() else GLOBAL_DECK_ID
         default_note_state = self._state_for_new_card_type(
-            selected_note_type, field_type, deck_id=deck_id
+            selected_note_type, field_type, deck_id=selected_deck
         )
-        selected_target_field = field or default_note_state["selected_note_field"]
+        selected_target_field = (
+            field
+            if field in get_fields(selected_note_type)
+            else default_note_state["selected_note_field"]
+        )
 
         extras = (
             get_extras(
-                note_type=selected_note_type,
-                field=selected_target_field,
+                note_type=card_type or selected_note_type,
+                field=field or selected_target_field,
                 prompts=self.prompts_map,
                 deck_id=deck_id,
             )
@@ -216,7 +248,7 @@ class PromptDialog(QDialog):
         # Only if it's a new card, we need to get the fields for the selected card type
         target_fields = (
             default_note_state["note_fields"]
-            if self.mode == "new"
+            if self.mode == "new" or self.repairing
             else get_fields(selected_note_type)
         )
 
@@ -243,7 +275,7 @@ class PromptDialog(QDialog):
             # other
             "is_loading_prompt": False,
             "decks": get_all_deck_ids(),
-            "selected_deck": deck_id,
+            "selected_deck": selected_deck,
             "type": field_type,
             "generate_automatically": extras["automatic"],
             "use_custom_model": extras["use_custom_model"],
@@ -257,20 +289,28 @@ class PromptDialog(QDialog):
         self.enabled_box = ReactiveCheckBox(
             self.state,
             "generate_automatically",
-            text="Enabled",
+            text="Generate this field automatically",
         )
         self.standard_buttons = self.create_buttons()
 
         tabs = QTabWidget()
-        tabs.addTab(self.render_main_tab(), "General")
-        tabs.addTab(self.render_options_tab(), "Options")
+        tabs.addTab(scroll_page(self.render_main_tab()), "Field")
+        tabs.addTab(scroll_page(self.render_options_tab()), "Options")
+        tabs.addTab(scroll_page(self.render_preview_tab()), "Preview")
 
         container = QVBoxLayout()
         container.addWidget(tabs)
 
+        scope = QLabel(
+            "Done updates the settings draft. Save in the main settings window to keep it."
+        )
+        scope.setWordWrap(True)
+        container.addWidget(scope)
         container.addWidget(self.standard_buttons)
         self.setLayout(container)
+        self.state.state_changed.connect(self.render_ui)
         self.setup_ui()
+        bound_dialog(self)
 
     def setup_ui(self) -> None:
         self.render_ui()
@@ -280,39 +320,29 @@ class PromptDialog(QDialog):
         self.render_automatic_button()
         if hasattr(self, "token_usage_label"):
             self.render_token_usage()
+        if hasattr(self, "effective_summary"):
+            self.render_effective_settings()
+        if hasattr(self, "sample_fields"):
+            self.render_sample()
 
     def render_main_tab(self) -> QWidget:
         layout = QVBoxLayout()
 
         field_type = self.state.s["type"]
-        text = {
-            "title": {
-                "chat": "💬 New Text Field",
-                "tts": "🔈️ New Text to Speech Field",
-                "image": " 🖼️ New Image Field",
-            },
-            "explanation": {
-                "chat": "The note that will have the Smart Field",
-                "tts": "The note type that will have the TTS field",
-                "image": "The note type that will have the image field",
-            },
-            "destination": {
-                "chat": "Target Field",
-                "tts": "Target Field",
-                "image": "Target Field",
-            },
-            "destination_explanation": {
-                "chat": "The AI generated Smart Field.",
-                "tts": "The field that will store and play the audio file.",
-                "image": "The field that will display the image.",
-            },
-        }
-
-        self.setWindowTitle(text["title"][field_type])
+        media_name = {"chat": "Text", "tts": "Speech", "image": "Image"}[field_type]
+        self.setWindowTitle(
+            f"{'Edit' if self.mode == 'edit' else 'New'} {media_name} Smart Field"
+        )
+        if self.repairing:
+            repair = QLabel(
+                "This Smart Field refers to a deleted target. Choose a current note type, deck, and field below. Your prompt and options are preserved."
+            )
+            repair.setWordWrap(True)
+            layout.addWidget(repair)
 
         # 1. Settings Area
         settings_group = QGroupBox("Settings")
-        form_layout = QFormLayout()
+        form_layout = default_form_layout()
 
         self.note_combo_box = ReactiveComboBox(
             self.state, "note_types", "selected_note_type"
@@ -352,19 +382,25 @@ class PromptDialog(QDialog):
         self.field_combo_box = ReactiveComboBox(
             self.state, "note_fields", "selected_note_field"
         )
-        self.field_combo_box.setToolTip(text["destination_explanation"][field_type])
+        self.field_combo_box.setToolTip(
+            {
+                "chat": "The field that stores generated text.",
+                "tts": "The field that stores and plays generated audio.",
+                "image": "The field that displays the generated image.",
+            }[field_type]
+        )
         form_layout.addRow("Target Field:", self.field_combo_box)
 
         settings_group.setLayout(form_layout)
         layout.addWidget(settings_group)
 
         # 2. Prompting Area
-        prompt_group = QGroupBox("Prompt Generation")
+        prompt_group = QGroupBox("Speech content" if field_type == "tts" else "Prompt")
         prompt_layout = QVBoxLayout()
 
         # Style Instructions for Gemini TTS
         if self.state.s["type"] == "tts":
-            style_label = QLabel("Style Instructions (OpenAI/Gemini):")
+            style_label = QLabel("Voice style (optional)")
             style_label.setFont(font_bold)
             self.tts_style_box = ReactiveEditText(self.state, "tts_style")
             self.tts_style_box.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -383,16 +419,26 @@ class PromptDialog(QDialog):
 
             prompt_layout.addWidget(style_label)
             prompt_layout.addWidget(self.tts_style_box)
-            prompt_layout.addSpacing(12)
+            style_help = QLabel(
+                "Style applies to Google Gemini voices and OpenAI gpt-4o-mini-tts. Other models speak the content without these instructions."
+            )
+            style_help.setWordWrap(True)
+            prompt_layout.addWidget(style_help)
 
         # Prompt Label + Insert Button
         prompt_label_layout = QHBoxLayout()
-        prompt_label = QLabel("Prompt / Text to Speak")
+        prompt_label = QLabel(
+            {
+                "chat": "Instructions",
+                "tts": "Text to speak",
+                "image": "Image description",
+            }[field_type]
+        )
         prompt_label.setFont(font_bold)
         prompt_label_layout.addWidget(prompt_label)
         prompt_label_layout.addStretch()
 
-        insert_btn = QPushButton("Insert Field ➕")
+        insert_btn = QPushButton("Insert field…")
         insert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         insert_btn.clicked.connect(self.show_insert_field_menu)
         prompt_label_layout.addWidget(insert_btn)
@@ -406,7 +452,13 @@ class PromptDialog(QDialog):
             QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
         )
 
-        current_explanation = tts_explanation if field_type == "tts" else explanation
+        current_explanation = (
+            tts_explanation
+            if field_type == "tts"
+            else "Describe the image to generate. Reference note fields using {{Front}} or another field name."
+            if field_type == "image"
+            else explanation
+        )
         self.prompt_text_box.setPlaceholderText(current_explanation)
         self.prompt_text_box.setMinimumHeight(120)
 
@@ -415,22 +467,20 @@ class PromptDialog(QDialog):
         layout.addWidget(prompt_group)
 
         # 3. Footer
-        self.test_button = QPushButton("✨ Test Smart Field ✨")
+        self.test_button = QPushButton("Generate preview")
         self.test_button.setCursor(Qt.CursorShape.PointingHandCursor)
 
         footer_layout = QHBoxLayout()
 
         # Enabled Box with tooltip explanation
         self.enabled_box.setToolTip(
-            "Enable or disable this field. Disabled fields can be generated via right clicking a field in the editor."
+            "When off, you can still generate this field manually from the editor. Automatic generation also follows this profile’s Generation settings."
         )
         footer_layout.addWidget(self.enabled_box)
         footer_layout.addStretch()
-        footer_layout.addWidget(self.test_button)
 
         layout.addLayout(footer_layout)
 
-        self.state.state_changed.connect(self.render_ui)
         self.note_combo_box.on_change.connect(self._on_new_card_type_selected)
         self.field_combo_box.on_change.connect(self.on_target_field_changed)
         self.deck_combo_box.on_change.connect(self.on_deck_selected)
@@ -441,17 +491,13 @@ class PromptDialog(QDialog):
         self.test_button.clicked.connect(self.on_test)
 
         # On small screens, make it a proportion of screen height. Otherwise set a fixed height
-        FIXED_HEIGHT = 800
-        screen = mw and mw.screen()
-        screen_height = FIXED_HEIGHT if not screen else screen.geometry().height()
 
-        min_height = min(FIXED_HEIGHT, int(screen_height * 0.8))
-        self.setMinimumHeight(min_height)
+        self.setMinimumHeight(400)
         container = QWidget()
         container.setLayout(layout)
 
         # Control visibility depending on mode
-        if self.mode == "edit":
+        if self.mode == "edit" and not self.repairing:
             self.note_combo_box.setEnabled(False)
             self.field_combo_box.setEnabled(False)
             self.deck_combo_box.setEnabled(False)
@@ -485,76 +531,184 @@ class PromptDialog(QDialog):
         self.prompt_text_box.setFocus()
 
     def render_options_tab(self) -> QWidget:
-        models_layout = default_form_layout()
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        self.effective_summary = QLabel()
+        self.effective_summary.setWordWrap(True)
+        self.effective_summary.setTextFormat(Qt.TextFormat.PlainText)
+        self.effective_summary.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.effective_summary)
+        self.custom_model = ReactiveCheckBox(
+            self.state,
+            "use_custom_model",
+            text="Customize model and output settings for this field",
+        )
+        layout.addWidget(self.custom_model)
         self.model_options = self.render_custom_model()
-        self.model_options.setEnabled(self.state.s["use_custom_model"])
-        self.custom_model = ReactiveCheckBox(self.state, "use_custom_model")
-        self.state.state_changed.connect(self.on_state_update)
-        override_box = QWidget()
-        override_layout = QHBoxLayout()
-        override_layout.setContentsMargins(0, 0, 0, 0)
-        override_box.setLayout(override_layout)
-        override_layout.addWidget(QLabel("Override Default Settings"))
-        override_layout.addWidget(self.custom_model)
-        models_layout.addWidget(override_box)
-        # Regenerate when batching
+        self.model_options.setVisible(self.state.s["use_custom_model"])
+        layout.addWidget(self.model_options)
         self.regenerate_batch_checkbox = ReactiveCheckBox(
-            self.state, "regenerate_when_batching"
+            self.state,
+            "regenerate_when_batching",
+            text="Overwrite this field during batch generation",
         )
-        batch_box = QWidget()
-        batch_layout = QHBoxLayout()
-        batch_layout.setContentsMargins(0, 0, 0, 0)
-        batch_box.setLayout(batch_layout)
-        batch_layout.addWidget(QLabel("Regenerate when batch processing:"))
-        batch_layout.addWidget(self.regenerate_batch_checkbox)
-        models_layout.addWidget(batch_box)
-
+        layout.addWidget(self.regenerate_batch_checkbox)
         batch_desc = QLabel(
-            "If checked, this field always overwrites its value during batch generation."
+            "This applies only to batches. Manual generation can replace a selected field; review generation follows the profile’s settings."
         )
-        batch_desc.setFont(font_small)
-        models_layout.addRow(batch_desc)
-
+        batch_desc.setWordWrap(True)
+        layout.addWidget(batch_desc)
         if self.state.s["type"] == "chat":
             self.chat_use_tools_checkbox = ReactiveCheckBox(
-                self.state, "chat_use_tools"
+                self.state,
+                "chat_use_tools",
+                text="Allow this field to use enabled tools",
             )
-            tools_box = QWidget()
-            tools_layout = QHBoxLayout()
-            tools_layout.setContentsMargins(0, 0, 0, 0)
-            tools_box.setLayout(tools_layout)
-            tools_layout.addWidget(QLabel("Use tools for this field:"))
-            tools_layout.addWidget(self.chat_use_tools_checkbox)
-            models_layout.addWidget(tools_box)
-
+            layout.addWidget(self.chat_use_tools_checkbox)
             tools_desc = QLabel(
-                "This setting is stored per field and does not depend on model overrides."
+                "Tool permission is stored separately from model overrides. Make tools available on the main Tools page."
             )
-            tools_desc.setFont(font_small)
-            models_layout.addRow(tools_desc)
-
-            token_group = QGroupBox("Token Usage")
-            token_layout = QVBoxLayout()
+            tools_desc.setWordWrap(True)
+            layout.addWidget(tools_desc)
+            token_group = QGroupBox("Estimated token usage")
+            token_layout = QVBoxLayout(token_group)
             self.token_usage_label = QLabel()
             self.token_usage_label.setWordWrap(True)
-            self.token_usage_label.setFont(font_small)
             token_layout.addWidget(self.token_usage_label)
-            token_group.setLayout(token_layout)
-            models_layout.addRow(token_group)
-
-        models_layout.addWidget(self.model_options)
-        model_box = QGroupBox("⚙️ Model Settings")
-        model_box.setEnabled(True)
-
-        model_box.setLayout(models_layout)
-        model_box.setContentsMargins(0, 24, 0, 24)
-
-        container_layout = default_form_layout()
-        container_layout.addRow(QLabel(""), None)
-        container_layout.addRow(model_box)
-        container = QWidget()
-        container.setLayout(container_layout)
+            layout.addWidget(token_group)
+        layout.addStretch()
+        self.state.state_changed.connect(self.on_state_update)
+        self.render_effective_settings()
         return container
+
+    @with_widget_settings
+    def render_effective_settings(self) -> None:
+        kind = self.state.s["type"]
+        options = self.model_options.state.s
+        settings = resolve_field_settings(
+            config.snapshot(), options if self.state.s["use_custom_model"] else {}
+        )
+        origin = (
+            "Custom settings"
+            if self.state.s["use_custom_model"]
+            else "Using the defaults from the main settings draft"
+        )
+        if kind == "tts":
+            voices = [
+                voice
+                for voice in settings["tts_voice_pool"]
+                if voice.get("enabled", True)
+            ]
+            details = "; ".join(
+                f"{voice['provider']} / {voice['model']} / {voice['voice']}"
+                for voice in voices[:3]
+            )
+            if len(voices) > 3:
+                details += f"; and {len(voices) - 3} more"
+            summary = f"{len(voices)} enabled voices: {details or 'Configure a voice on the Speech page.'}"
+        else:
+            summary = f"{settings[f'{kind}_provider']} / {settings[f'{kind}_model']}"
+            if kind == "chat":
+                provider = settings["chat_provider"]
+                effort = settings.get("chat_reasoning_effort")
+                supports_reasoning = (
+                    provider == "openai" or provider not in all_chat_providers
+                )
+                supports_temperature = (
+                    not supports_reasoning
+                    or openai_supports_temperature(settings["chat_model"], effort)
+                )
+                details = [
+                    f"Temperature: {settings.get('chat_temperature', 1)}"
+                    if supports_temperature
+                    else "Temperature: not used"
+                ]
+                if supports_reasoning:
+                    details.append(f"Reasoning: {effort or 'default'}")
+                summary += "\n" + " · ".join(details)
+                summary += f"\nMarkdown formatting: {'on' if settings['chat_markdown_to_html'] else 'off'}"
+            else:
+                summary += "\n" + image_output_summary(
+                    settings["image_provider"],
+                    settings["image_model"],
+                    settings["image_aspect_ratio"],
+                    settings["image_resolution"],
+                    settings.get("image_output_format") or "webp",
+                )
+        self.effective_summary.setText(f"{origin}\n{summary}")
+
+    def render_preview_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        help_text = QLabel(
+            "Load a sample to inspect the referenced note data and effective provider before generating. A preview sends this data to that provider and may incur charges. It does not change the note."
+        )
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+        self.load_sample_button = QPushButton("Load sample note")
+        self.load_sample_button.clicked.connect(self.load_sample)
+        layout.addWidget(self.load_sample_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.sample_description = QLabel("No sample loaded.")
+        self.sample_description.setWordWrap(True)
+        self.sample_description.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.sample_description)
+        self.sample_fields = QPlainTextEdit()
+        self.sample_fields.setReadOnly(True)
+        self.sample_fields.setAccessibleName("Referenced sample note data")
+        self.sample_fields.setPlaceholderText(
+            "Referenced note fields will appear here before anything is sent."
+        )
+        layout.addWidget(self.sample_fields, 1)
+        layout.addWidget(self.test_button, alignment=Qt.AlignmentFlag.AlignRight)
+        return page
+
+    def load_sample(self) -> None:
+        self.sample_note = get_random_note(
+            self.state.s["selected_note_type"], deck_id=self.state.s["selected_deck"]
+        )
+        self.render_sample()
+        self.render_buttons()
+
+    @with_widget_settings
+    def render_sample(self) -> None:
+        if self.sample_note is None:
+            self.sample_description.setText(
+                "No sample loaded. Load one to enable Generate preview."
+            )
+            self.sample_fields.clear()
+            return
+        kind = self.state.s["type"]
+        settings = resolve_field_settings(
+            config.snapshot(),
+            self.model_options.state.s if self.state.s["use_custom_model"] else {},
+        )
+        try:
+            if kind == "tts":
+                voice = self.get_effective_tts_target(
+                    f"{self.sample_note.id}:{self.state.s['selected_note_field'].lower()}"
+                )
+                destination = (
+                    f"{voice['provider']} / {voice['model']} / {voice['voice']}"
+                )
+            else:
+                destination = (
+                    f"{settings[f'{kind}_provider']} / {settings[f'{kind}_model']}"
+                )
+        except ValueError as error:
+            destination = str(error)
+        self.sample_description.setText(
+            f"Sample: {self.state.s['selected_note_type']} · note {self.sample_note.id}\nProvider: {destination}"
+        )
+        values = {name.lower(): value for name, value in self.sample_note.items()}
+        fields = get_prompt_fields(self.state.s["prompt"])
+        self.sample_fields.setPlainText(
+            "\n\n".join(
+                f"{name}:\n{values.get(name, '[Missing field]')}" for name in fields
+            )
+            or "This prompt references no note fields."
+        )
 
     def create_buttons(self) -> QWidget:
         standard_buttons = QDialogButtonBox(
@@ -562,21 +716,24 @@ class PromptDialog(QDialog):
             | QDialogButtonBox.StandardButton.Save
         )
 
+        done_button = standard_buttons.button(QDialogButtonBox.StandardButton.Save)
+        assert done_button is not None
+        done_button.setText("Done")
         standard_buttons.accepted.connect(self.on_accept)
         standard_buttons.rejected.connect(self.reject)
         return standard_buttons
 
-    def render_custom_model(self) -> QWidget:
-        # TODO: could use a refactor
-        # Setup the dummy options; only one will be used
-        self.tts_options = TTSOptions()
-        self.chat_options = ChatOptions(show_tools_toggle=False)
-        self.image_options = ImageOptions()
-
+    def render_custom_model(self) -> ChatOptions | TTSOptions | ImageOptions:
         extras = get_extras(
-            note_type=self.state.s["selected_note_type"],
-            field=self.state.s["selected_note_field"],
-            deck_id=self.state.s["selected_deck"],
+            note_type=self.original_identity[0]
+            if self.original_identity
+            else self.state.s["selected_note_type"],
+            field=self.original_identity[2]
+            if self.original_identity
+            else self.state.s["selected_note_field"],
+            deck_id=self.original_identity[1]
+            if self.original_identity
+            else self.state.s["selected_deck"],
             prompts=self.prompts_map,
             fallback_to_global_deck=False,
         )
@@ -584,62 +741,40 @@ class PromptDialog(QDialog):
         use_custom_model = extras and extras["use_custom_model"]
 
         if self.state.s["type"] == "tts":
-            if extras and use_custom_model:
-                self.tts_options = TTSOptions(
-                    {
-                        "tts_voice_pool": extras.get("tts_voice_pool"),
-                        "tts_strip_html": extras.get("tts_strip_html"),
-                    }
-                )
-            self.tts_options.state.state_changed.connect(self.on_state_update)
-            return self.tts_options
-
+            self.tts_options = TTSOptions(
+                {
+                    "tts_voice_pool": extras.get("tts_voice_pool"),
+                    "tts_strip_html": extras.get("tts_strip_html"),
+                }
+                if extras and use_custom_model
+                else None
+            )
+            options = self.tts_options
         elif self.state.s["type"] == "chat":
-            if extras and use_custom_model:
-                self.chat_options = ChatOptions(
-                    cast(
-                        "OverridableChatOptionsDict",
-                        {
-                            "chat_provider": extras.get("chat_provider"),
-                            "chat_model": extras.get("chat_model"),
-                            "chat_temperature": extras.get("chat_temperature"),
-                            "chat_reasoning_effort": extras.get(
-                                "chat_reasoning_effort"
-                            ),
-                            "chat_markdown_to_html": extras.get(
-                                "chat_markdown_to_html"
-                            ),
-                        },
-                    ),
-                    show_tools_toggle=False,
+            self.chat_options = ChatOptions(
+                cast(
+                    "OverridableChatOptionsDict",
+                    {key: extras.get(key) for key in overridable_chat_options},
                 )
-            self.chat_options.state.state_changed.connect(self.on_state_update)
-            return self.chat_options
-
-        elif self.state.s["type"] == "image":
-            if extras and use_custom_model:
-                self.image_options = ImageOptions(
-                    cast(
-                        "OverridableImageOptionsDict",
-                        {
-                            "image_model": extras.get("image_model"),
-                            "image_provider": extras.get("image_provider"),
-                            "image_aspect_ratio": extras.get("image_aspect_ratio"),
-                            "image_resolution": extras.get("image_resolution"),
-                            "image_generation_quality": extras.get(
-                                "image_generation_quality"
-                            ),
-                            "image_output_format": extras.get("image_output_format"),
-                            "image_quality": extras.get("image_quality"),
-                        },
-                    )
+                if extras and use_custom_model
+                else None,
+                show_tools_toggle=False,
+            )
+            options = self.chat_options
+        else:
+            self.image_options = ImageOptions(
+                cast(
+                    "OverridableImageOptionsDict",
+                    {key: extras.get(key) for key in overridable_image_options},
                 )
-            self.image_options.state.state_changed.connect(self.on_state_update)
-            return self.image_options
+                if extras and use_custom_model
+                else None
+            )
+            options = self.image_options
+        options.state.state_changed.connect(self.on_state_update)
+        return options
 
-        # Should never get here
-        return QWidget()
-
+    @with_widget_settings
     def _sync_regenerate_flag(self) -> None:
         extras = get_extras(
             note_type=self.state.s["selected_note_type"],
@@ -664,7 +799,10 @@ class PromptDialog(QDialog):
         self.state.update(updates)
 
     def on_state_update(self):
-        self.model_options.setEnabled(self.state.s["use_custom_model"])
+        self.model_options.setVisible(self.state.s["use_custom_model"])
+        self.render_effective_settings()
+        if hasattr(self, "sample_fields"):
+            self.render_sample()
         if hasattr(self, "token_usage_label"):
             self.render_token_usage()
 
@@ -708,12 +846,18 @@ class PromptDialog(QDialog):
 
     def _on_new_card_type_selected(self, note_type: str) -> None:
         new_state = self._state_for_new_card_type(
-            note_type=note_type, type=self.state.s["type"], deck_id=GLOBAL_DECK_ID
+            note_type=note_type,
+            type=self.state.s["type"],
+            deck_id=self.state.s["selected_deck"],
         )
+        if self.repairing:
+            new_state["prompt"] = self.state.s["prompt"]
+            new_state["tts_style"] = self.state.s["tts_style"]
+            new_state["tts_language"] = self.state.s["tts_language"]
+        self.sample_note = None
         self.state.update(cast("dict[str, Any]", new_state))
-        # Force re-layout every time
-        self.adjustSize()
-        self._sync_regenerate_flag()
+        if not self.repairing:
+            self._sync_regenerate_flag()
 
     def on_deck_selected(self, deck: str) -> None:
         # Dumb hack bc of leaky abstraction reactive combo box + int keys
@@ -723,8 +867,14 @@ class PromptDialog(QDialog):
             note_type=note_type, type=self.state.s["type"], deck_id=deck_id
         )
 
+        if self.repairing:
+            new_state["prompt"] = self.state.s["prompt"]
+            new_state["tts_style"] = self.state.s["tts_style"]
+            new_state["tts_language"] = self.state.s["tts_language"]
+        self.sample_note = None
         self.state.update(cast("dict[str, Any]", new_state))
-        self._sync_regenerate_flag()
+        if not self.repairing:
+            self._sync_regenerate_flag()
 
     def on_source_changed(self, source: str) -> None:
         self.state.update({"prompt": self.get_tts_prompt(source)})
@@ -732,42 +882,40 @@ class PromptDialog(QDialog):
     def get_tts_prompt(self, source: str) -> str:
         return f"{{{{{source}}}}}"
 
-    def on_target_field_changed(self, field: Optional[str]) -> None:
+    def on_target_field_changed(self, field: str | None) -> None:
         if not field:
             return
 
         self.state.update({"selected_note_field": field})
-        self._sync_regenerate_flag()
+        if not self.repairing:
+            self._sync_regenerate_flag()
 
     def render_buttons(self) -> None:
         is_enabled = (
             bool(self.state.s["prompt"]) and not self.state.s["is_loading_prompt"]
         )
 
-        self.test_button.setEnabled(is_enabled)
+        self.test_button.setEnabled(is_enabled and self.sample_note is not None)
+        if hasattr(self, "load_sample_button"):
+            self.load_sample_button.setEnabled(not self.state.s["is_loading_prompt"])
         self.standard_buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(  # type: ignore
             is_enabled
         )
 
         if self.state.s["is_loading_prompt"]:
-            self.test_button.setText("Loading...")
+            self.test_button.setText("Generating preview…")
         else:
-            self.test_button.setText("Test With Random Note✨")
+            self.test_button.setText("Generate preview")
 
-    def get_current_chat_settings(self) -> tuple[str, str, Optional[str], bool]:
-        use_custom_model = self.state.s["use_custom_model"]
-        provider = key_or_config_val(
-            self.chat_options.state.s if use_custom_model else None,
-            "chat_provider",
+    @with_widget_settings
+    def get_current_chat_settings(self) -> tuple[str, str, str | None, bool]:
+        settings = resolve_field_settings(
+            config.snapshot(),
+            self.chat_options.state.s if self.state.s["use_custom_model"] else {},
         )
-        model = key_or_config_val(
-            self.chat_options.state.s if use_custom_model else None,
-            "chat_model",
-        )
-        reasoning_effort = key_or_config_val(
-            self.chat_options.state.s if use_custom_model else None,
-            "chat_reasoning_effort",
-        )
+        provider = settings["chat_provider"]
+        model = settings["chat_model"]
+        reasoning_effort = settings.get("chat_reasoning_effort")
         use_tools = self.state.s["chat_use_tools"]
         return str(provider), str(model), reasoning_effort, use_tools
 
@@ -781,7 +929,8 @@ class PromptDialog(QDialog):
             use_tools=use_tools,
         )
 
-    def get_saved_prompt_signature(self) -> Optional[str]:
+    @with_widget_settings
+    def get_saved_prompt_signature(self) -> str | None:
         if self.mode != "edit" or self.state.s["type"] != "chat":
             return None
 
@@ -808,12 +957,11 @@ class PromptDialog(QDialog):
             )
             or DEFAULT_EXTRAS
         )
-        saved_provider = key_or_config_val(saved_extras, "chat_provider")
-        saved_model = key_or_config_val(saved_extras, "chat_model")
-        saved_reasoning_effort = key_or_config_val(
-            saved_extras, "chat_reasoning_effort"
-        )
-        saved_use_tools = key_or_config_val(saved_extras, "chat_use_tools")
+        saved_settings = resolve_field_settings(config.snapshot(), saved_extras)
+        saved_provider = saved_settings["chat_provider"]
+        saved_model = saved_settings["chat_model"]
+        saved_reasoning_effort = saved_settings.get("chat_reasoning_effort")
+        saved_use_tools = saved_settings["chat_use_tools"]
 
         return build_prompt_usage_signature(
             prompt=saved_prompt,
@@ -823,7 +971,7 @@ class PromptDialog(QDialog):
             use_tools=bool(saved_use_tools),
         )
 
-    def build_saved_prompt_usage_context(self) -> Optional[PromptUsageContext]:
+    def build_saved_prompt_usage_context(self) -> PromptUsageContext | None:
         saved_signature = self.get_saved_prompt_signature()
         if (
             not saved_signature
@@ -840,6 +988,7 @@ class PromptDialog(QDialog):
             signature=saved_signature,
         )
 
+    @with_widget_settings
     def render_token_usage(self) -> None:
         if self.state.s["type"] != "chat":
             return
@@ -882,25 +1031,25 @@ class PromptDialog(QDialog):
             daily_usage = chat_usage_tracker.get_openai_daily_usage()
             lines.append(
                 f"Today: {format_token_count(daily_usage.used_total_tokens)} / "
-                f"{format_token_count(config.openai_daily_token_budget)}"
+                f"{format_token_count(config.openai_daily_token_budget)} estimated guard"
             )
+            if daily_usage.estimated_total_tokens:
+                lines.append(
+                    f"Includes {format_token_count(daily_usage.estimated_total_tokens)} estimated tokens."
+                )
             lines.append("Resets: 00:00 UTC")
 
         self.token_usage_label.setText("\n".join(lines))
 
+    @with_widget_settings
     def on_test(self) -> None:
         prompt = self.state.s["prompt"]
 
         if not mw or not self.state.s["prompt"]:
             return
 
-        selected_note_type = self.state.s["selected_note_type"]
-        sample_note = get_random_note(
-            selected_note_type, deck_id=self.state.s["selected_deck"]
-        )
-
-        if not sample_note:
-            show_message_box("Smart Notes: need at least one note of this note type!")
+        sample_note = self.sample_note
+        if sample_note is None:
             return
         selected_deck = self.state.s["selected_deck"]
         snapshot = snapshot_note(
@@ -924,20 +1073,15 @@ class PromptDialog(QDialog):
             return
 
         use_custom_model = self.state.s["use_custom_model"]
-        chat_provider = (
-            self.chat_options.state.s["chat_provider"]
-            if use_custom_model
-            else config.chat_provider
-        ) or config.chat_provider
-        chat_model = (
-            self.chat_options.state.s["chat_model"]
-            if use_custom_model
-            else config.chat_model
-        ) or config.chat_model
+        effective_settings = resolve_field_settings(
+            config.snapshot(), self.model_options.state.s if use_custom_model else {}
+        )
+        chat_provider = effective_settings["chat_provider"]
+        chat_model = effective_settings["chat_model"]
 
-        tts_target: Optional[TTSVoiceTarget] = None
-        tts_provider: Optional[TTSProviders] = None
-        tts_model: Optional[TTSModels] = None
+        tts_target: TTSVoiceTarget | None = None
+        tts_provider: TTSProviders | None = None
+        tts_model: TTSModels | None = None
         tts_voice = ""
         if self.state.s["type"] == "tts":
             try:
@@ -966,63 +1110,68 @@ class PromptDialog(QDialog):
             if not self._ensure_api_key(image_provider):
                 return
 
+        field_state = deepcopy(self.state.s)
+        chat_settings = image_settings = tts_settings = effective_settings
+        daily_budget = config.openai_daily_token_budget
+        budget_enabled = config.openai_daily_token_budget_enabled
+        allow_empty_fields = config.allow_empty_fields
+        saved_usage_context = self.build_saved_prompt_usage_context()
         self.state["is_loading_prompt"] = True
 
-        def on_success(arg: Union[bytes, None]):
-            prompt = self.state.s["prompt"]
-            if not prompt:
-                return
+        stringified_vals = "\n".join(
+            f"{field}: {values.get(field, '')}" for field in get_prompt_fields(prompt)
+        )
 
-            prompt_fields = get_prompt_fields(prompt)
+        usage_scope_id = (
+            chat_usage_tracker.open_scope() if field_state["type"] == "chat" else None
+        )
 
-            # clumsy stuff to make it work with lowercase fields...
-            fields = to_lowercase_dict(sample_note)  # type: ignore
-            field_map = {
-                prompt_field: fields[prompt_field] for prompt_field in prompt_fields
-            }
+        def finish() -> None:
+            chat_usage_tracker.close_scope(usage_scope_id)
+            if not sip.isdeleted(self):
+                self.state["is_loading_prompt"] = False
 
-            stringified_vals = "\n".join([f"{k}: {v}" for k, v in field_map.items()])
-            self.state["is_loading_prompt"] = False
-            field_type = self.state.s["type"]
-            if field_type == "tts":
+        def on_success(arg: bytes | None) -> None:
+            if field_state["type"] == "tts":
                 msg = f"Ran with fields: \n{stringified_vals}.\n Voice: {tts_provider} - {tts_voice} ({tts_model})\n\n"
-                if arg is not None and isinstance(arg, bytes):
+                if arg is not None:
                     play_audio(arg)
                 else:
                     msg += "No audio response received"
                 show_message_box(msg, custom_ok="Close")
-            else:
-                if arg is not None and isinstance(arg, bytes):
-                    test_window = ImageTestDialog(
-                        arg, interpolate_prompt(prompt, sample_note) or ""
-                    )
-                    test_window.exec()
-                else:
-                    show_message_box("No image response received", custom_ok="Close")
-
-        def on_failure(e: Exception) -> None:
-            show_message_box(f"Failed to get response: {e}")
-            self.state["is_loading_prompt"] = False
-
-        if self.state.s["type"] == "chat":
-            usage_scope_id = chat_usage_tracker.open_scope()
-
-            def on_chat_success(result: Optional[str]) -> None:
-                prompt = self.state.s["prompt"]
-                if not prompt:
-                    chat_usage_tracker.close_scope(usage_scope_id)
-                    return
-
-                prompt_fields = get_prompt_fields(prompt)
-                fields = to_lowercase_dict(sample_note)  # type: ignore
-                field_map = {
-                    prompt_field: fields[prompt_field] for prompt_field in prompt_fields
-                }
-                stringified_vals = "\n".join(
-                    [f"{k}: {v}" for k, v in field_map.items()]
+            elif arg is not None:
+                test_window = ImageTestDialog(
+                    arg,
+                    interpolate_prompt_with_values(prompt, values, allow_empty_fields)
+                    or "",
+                    parent=self,
                 )
-                self.state["is_loading_prompt"] = False
+                test_window.exec()
+            else:
+                show_message_box("No image response received", custom_ok="Close")
 
+        def on_failure(error: Exception) -> None:
+            show_message_box(f"Failed to get response: {redact_text(str(error))}")
+
+        def launch(
+            operation: Callable[[], Awaitable[Any]],
+            on_result: Callable[[Any], None],
+        ) -> None:
+            try:
+                run_async_in_background_with_sentry(
+                    operation,
+                    on_result,
+                    on_failure,
+                    on_finished=finish,
+                    show_error=False,
+                )
+            except Exception as error:
+                finish()
+                on_failure(error)
+
+        if field_state["type"] == "chat":
+
+            def on_chat_success(result: str | None) -> None:
                 response_text = result if result is not None else "No response received"
                 message_parts = [
                     f"Ran with fields: \n{stringified_vals}.",
@@ -1042,21 +1191,18 @@ class PromptDialog(QDialog):
                         ]
                     )
 
-                if (
-                    chat_provider == "openai"
-                    and config.openai_daily_token_budget_enabled
-                ):
+                if chat_provider == "openai" and budget_enabled:
                     daily_usage = chat_usage_tracker.get_openai_daily_usage()
                     message_parts.append(
                         f"OpenAI today: {format_token_count(daily_usage.used_total_tokens)} / "
-                        f"{format_token_count(config.openai_daily_token_budget)}"
+                        f"{format_token_count(daily_budget)} estimated guard"
                     )
+                    if daily_usage.estimated_total_tokens:
+                        message_parts.append(
+                            f"Includes {format_token_count(daily_usage.estimated_total_tokens)} estimated tokens."
+                        )
 
-                show_message_box("\n".join(message_parts), custom_ok="Close")
-
-            def on_chat_failure(error: Exception) -> None:
-                chat_usage_tracker.close_scope(usage_scope_id)
-                on_failure(error)
+                TextTestDialog("\n".join(message_parts), parent=self).exec()
 
             def chat_fn():
                 return self.processor.field_processor.get_chat_response(
@@ -1068,27 +1214,24 @@ class PromptDialog(QDialog):
                     prompt=prompt,
                     provider=chat_provider,
                     model=chat_model,
-                    field_lower=self.state.s["selected_note_field"].lower(),
-                    deck_id=self.state.s["selected_deck"],
-                    temperature=key_or_config_val(
-                        self.chat_options.state.s, "chat_temperature"
-                    ),
+                    field_lower=field_state["selected_note_field"].lower(),
+                    deck_id=field_state["selected_deck"],
+                    temperature=key_or_config_val(chat_settings, "chat_temperature"),
+                    reasoning_effort=chat_settings.get("chat_reasoning_effort"),
                     should_convert_to_html=False,  # Don't show HTML here bc it's confusing
-                    use_tools=self.state.s["chat_use_tools"],
+                    use_tools=field_state["chat_use_tools"],
                     show_error_box=False,
-                    prompt_usage_context=self.build_saved_prompt_usage_context(),
+                    prompt_usage_context=saved_usage_context,
                     usage_scope_id=usage_scope_id,
                 )
 
-            run_async_in_background_with_sentry(
-                chat_fn, on_chat_success, on_chat_failure
-            )
-        elif self.state.s["type"] == "tts":
+            launch(chat_fn, on_chat_success)
+        elif field_state["type"] == "tts":
 
             def tts_fn():
                 assert tts_provider is not None and tts_model is not None
                 prompt_to_use = prompt
-                style = self.state.s.get("tts_style")
+                style = field_state.get("tts_style")
                 if style and "gemini" in tts_model and tts_provider == "google":
                     prompt_to_use = f"{style} {prompt}"
                 instructions = (
@@ -1106,28 +1249,17 @@ class PromptDialog(QDialog):
                     provider=tts_provider,
                     model=tts_model,
                     voice=tts_voice,
-                    strip_html=none_defaulting(
-                        self.tts_options.state.s, "tts_strip_html", True
-                    ),
+                    strip_html=tts_settings["tts_strip_html"],
                     instructions=instructions,
                 )
 
-            run_async_in_background_with_sentry(tts_fn, on_success, on_failure)
+            launch(tts_fn, on_success)
         else:
 
-            def img_fn():
-                image_settings = (
-                    self.image_options.state.s
-                    if self.state.s["use_custom_model"]
-                    else None
-                )
-                provider = (
-                    self.image_options.state.s["image_provider"]
-                    if self.state.s["use_custom_model"]
-                    else config.image_provider
-                )
+            async def img_fn() -> bytes | None:
+                provider = image_settings["image_provider"]
                 model = key_or_config_val(image_settings, "image_model")
-                return self.processor.field_processor.get_image_response(
+                image = await self.processor.field_processor.get_image_response(
                     note_id=snapshot.note_id,
                     values=values,
                     input_text=prompt,
@@ -1146,8 +1278,11 @@ class PromptDialog(QDialog):
                     ),
                 )
 
-            run_async_in_background_with_sentry(img_fn, on_success, on_failure)
+                return await image_preview_data(image) if image else None
 
+            launch(img_fn, on_success)
+
+    @with_widget_settings
     def get_effective_tts_target(self, selection_key: str) -> TTSVoiceTarget:
         pool = (
             self.tts_options.state.s["tts_voice_pool"]
@@ -1185,7 +1320,7 @@ class PromptDialog(QDialog):
         self,
         selected_note_type: str,
         deck_id: DeckId,
-        selected_note_field: Optional[str] = None,
+        selected_note_field: str | None = None,
     ) -> list[str]:
         """Gets all fields excluding selected and existing prompts"""
         all_valid_fields = get_valid_fields_for_prompt(
@@ -1227,7 +1362,7 @@ class PromptDialog(QDialog):
             "No valid source fields remaining",
         )
 
-    def _attempt_to_parse_source_field(self, prompt: str) -> Optional[str]:
+    def _attempt_to_parse_source_field(self, prompt: str) -> str | None:
         fields = get_prompt_fields(prompt, lower=False)
 
         if len(fields) != 1:
@@ -1235,6 +1370,7 @@ class PromptDialog(QDialog):
 
         return fields[0]
 
+    @with_widget_settings
     def on_accept(self):
         if not mw or not mw.col:
             return
@@ -1244,6 +1380,16 @@ class PromptDialog(QDialog):
         selected_field = self.state.s["selected_note_field"]
 
         if not prompt:
+            return
+        if (
+            self.mode == "new" or self.repairing
+        ) and selected_field not in self._get_valid_target_fields(
+            selected_card_type, self.state.s["selected_deck"]
+        ):
+            show_message_box(
+                "Choose an unused target field. This field already has a Smart Field, or no longer exists."
+            )
+            self.field_combo_box.setFocus()
             return
 
         if self.state.s["type"] == "tts":
@@ -1255,7 +1401,6 @@ class PromptDialog(QDialog):
 
         new_prompts_map = self._create_new_prompts_map()
         logger.debug("Created new prompts map")
-        logger.debug(new_prompts_map)
 
         # Make an ephemeral note
         note_type = next(
@@ -1289,11 +1434,24 @@ class PromptDialog(QDialog):
 
         tts_options = cast(
             "OverrideableTTSOptionsDict",
-            {k: self.tts_options.state.s[k] for k in overridable_tts_options},
+            {k: self.tts_options.state.s[k] for k in overridable_tts_options}
+            if s["type"] == "tts"
+            else {},
         )
 
+        prompts_map = self.prompts_map
+        if self.original_identity is not None:
+            original_type, original_deck, original_field = self.original_identity
+            if (original_type, original_deck, original_field) != (
+                s["selected_note_type"],
+                s["selected_deck"],
+                s["selected_note_field"],
+            ):
+                prompts_map = remove_prompt(
+                    prompts_map, original_type, original_deck, original_field
+                )
         return add_or_update_prompts(
-            prompts_map=self.prompts_map,
+            prompts_map=prompts_map,
             note_type=s["selected_note_type"],
             deck_id=s["selected_deck"],
             field=s["selected_note_field"],
@@ -1306,24 +1464,50 @@ class PromptDialog(QDialog):
             tts_language=s.get("tts_language"),
             chat_options={
                 k: self.chat_options.state.s[k] for k in overridable_chat_options
-            },
+            }
+            if s["type"] == "chat"
+            else {},
             image_options={
                 k: self.image_options.state.s[k] for k in overridable_image_options
-            },
+            }
+            if s["type"] == "image"
+            else {},
             chat_use_tools=s["chat_use_tools"] if s["type"] == "chat" else None,
             regenerate_when_batching=self.state.s["regenerate_when_batching"],
         )
 
 
+class TextTestDialog(QDialog):
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Smart Field preview")
+        layout = QVBoxLayout(self)
+        result = QPlainTextEdit(text)
+        result.setReadOnly(True)
+        result.setAccessibleName("Preview response and referenced fields")
+        layout.addWidget(result, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        bound_dialog(self)
+
+
 class ImageTestDialog(QDialog):
-    def __init__(self, image: bytes, prompt: str):
-        super().__init__()
+    def __init__(
+        self, image: bytes, prompt: str, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
         self.setWindowTitle("Image Previewer")
         layout = QVBoxLayout()
         self.setLayout(layout)
-        explainer = QLabel(f"Ran with prompt: {prompt}")
-        explainer.setWordWrap(True)
-        explainer.setMaximumWidth(480)
+        explainer = QPlainTextEdit(f"Prompt:\n{prompt}")
+        explainer.setReadOnly(True)
+        explainer.setAccessibleName("Image preview prompt")
+        explainer.setMaximumHeight(explainer.fontMetrics().lineSpacing() * 5)
         layout.addWidget(explainer)
         displayer = ImageDisplayer(image=image)
-        layout.addWidget(displayer)
+        layout.addWidget(displayer, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        bound_dialog(self)

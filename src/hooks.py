@@ -22,11 +22,11 @@ Setup the hooks for the Anki plugin
 """
 
 
-from collections.abc import Sequence
-from typing import Any, Callable, Optional
+from collections.abc import Callable, Sequence
+from typing import Any
 
-from anki.cards import Card
-from aqt import QAction, QMenu, browser, editor, gui_hooks, mw, sound
+from anki.cards import Card, CardId
+from aqt import QAction, QDialog, QMenu, browser, editor, gui_hooks, mw, sound
 from aqt.addcards import AddCards
 from aqt.browser.sidebar.item import SidebarItemType
 
@@ -40,12 +40,16 @@ from .migrations import migrate_models
 from .note_processor import BatchStatistics, NoteProcessor
 from .notes import get_field_from_index, is_ai_field, is_card_fully_processed
 from .sentry import with_sentry
-from .tasks import run_async_in_background
+from .tasks import close_profile_worker, open_profile_worker, run_async_in_background
 from .ui.addon_options_dialog import AddonOptionsDialog
 from .ui.changelog import perform_update_check
+from .ui.custom_prompt import CustomPrompt
+from .ui.custom_provider_dialog import CustomProviderDialog
 from .ui.field_menu import FieldMenu
+from .ui.mcp_server_dialog import McpServerDialog
+from .ui.prompt_dialog import PromptDialog
 from .ui.sparkle import Sparkle
-from .ui.ui_utils import show_message_box
+from .ui.ui_utils import editor_is_current, show_message_box
 
 SMART_NOTES_PLAY_AUDIO_PREFIX = "smartnotes-play-audio:"
 
@@ -88,7 +92,7 @@ def add_editor_top_button(
 
         # New notes don't have cards yet, fetch into the deck_chooser to get the deckId
         if card is None:
-            deck_id: Optional[int] = None
+            deck_id: int | None = None
             parent = editor.parentWindow
             # Parent should always be AddCards if there's no card
             if isinstance(parent, AddCards):
@@ -160,6 +164,8 @@ def add_editor_top_button(
             on_success=on_success,
             on_failure=lambda _: set_button_enabled(),
             on_field_update=on_field,
+            editor_alive=lambda: editor_is_current(editor, note),
+            editor_owner=editor.web,
             show_progress=False,
         )
 
@@ -325,6 +331,7 @@ def make_on_batch_success(
                     token_line += (
                         f". OpenAI today: {format_token_count(daily_usage.used_total_tokens)}"
                         f" / {format_token_count(config.openai_daily_token_budget)}"
+                        f" ({format_token_count(daily_usage.estimated_total_tokens)} estimated)"
                     )
 
                 parts.append(token_line)
@@ -340,7 +347,7 @@ def make_on_batch_success(
 
 def confirm_openai_batch_preflight(
     processor: NoteProcessor,
-    card_ids: Sequence[int],
+    card_ids: Sequence[CardId],
     overwrite_fields: bool,
 ) -> bool:
     preflight = processor.get_openai_batch_preflight(
@@ -459,8 +466,10 @@ def on_main_window(processor: NoteProcessor):
     # Setup logger as first thing
     setup_logger()
     # Then setup config, which depends on logger
+    config.initialize_profiles()
     config.setup_config()
     migrate_models()
+    open_profile_worker()
 
     # Add options to Anki Menu
     options_action = QAction("Smart Notes", mw)
@@ -538,13 +547,25 @@ def on_review(processor: NoteProcessor, card: Card):
 
         logger.debug("Did update card on review...")
 
+        if (
+            not mw
+            or not mw.reviewer
+            or not mw.reviewer.card
+            or mw.reviewer.card.id != card.id
+        ):
+            return
         card.load()
+        mw.reviewer.refresh_if_needed()
         Sparkle()
 
         bump_usage_counter()
 
     processor.process_card(
-        card, overwrite_fields=False, on_success=on_success, show_progress=False
+        card,
+        overwrite_fields=False,
+        on_success=on_success,
+        show_progress=False,
+        mode="review",
     )
 
 
@@ -590,8 +611,24 @@ def add_deck_option(
 
 @with_sentry
 def cleanup() -> None:
+    close_profile_worker()
+    if mw:
+        for dialog in mw.findChildren(QDialog):
+            if isinstance(
+                dialog,
+                (
+                    AddonOptionsDialog,
+                    CustomPrompt,
+                    CustomProviderDialog,
+                    McpServerDialog,
+                    PromptDialog,
+                ),
+            ):
+                QDialog.done(dialog, QDialog.DialogCode.Rejected)
     logger.debug("Shutting down loggers")
-    logger.handlers.clear()
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
 
 
 @with_sentry
@@ -603,4 +640,18 @@ def setup_hooks(processor: NoteProcessor):
     gui_hooks.reviewer_did_show_question.append(on_review(processor))
     gui_hooks.webview_did_receive_js_message.append(on_webview_message)
     gui_hooks.main_window_did_init.append(on_main_window(processor))
-    gui_hooks.profile_will_close.append(cleanup)
+
+    def profile_opened() -> None:
+        setup_logger()
+        config.initialize_profiles()
+        config.setup_config()
+        migrate_models()
+        processor.req_in_progress = False
+        open_profile_worker()
+
+    def profile_closing() -> None:
+        cleanup()
+        processor.req_in_progress = False
+
+    gui_hooks.profile_did_open.append(profile_opened)
+    gui_hooks.profile_will_close.append(profile_closing)

@@ -21,31 +21,37 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+from contextlib import aclosing, asynccontextmanager, contextmanager
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 from .chat_usage import OpenAITurnPermit, chat_usage_tracker
 from .config import config
 from .constants import DEFAULT_TEMPERATURE
-from .logger import logger
+from .logger import logger, redact_text
 from .models import (
     ChatModels,
-    ChatProviders,
     CustomProvider,
     OpenAIReasoningEffort,
     filter_openai_text_models,
     openai_reasoning_efforts_for_model,
+    openai_supports_chat_tools,
+    openai_supports_temperature,
+    validate_provider_model,
 )
 from .provider_runtime import (
     ProviderHTTPError,
     ProviderTimeoutError,
+    RequestAccounting,
     RequestTimeouts,
     ResponseFormatError,
     StreamingNotSupportedError,
     format_provider_http_error_for_log,
     provider_runtime,
+    request_accounting,
 )
 
 OPENAI_BASE_URL = "https://api.openai.com"
@@ -63,7 +69,6 @@ ResolvedApiMode = Literal["responses", "chat_completions"]
 ConversationRole = Literal["user", "assistant", "tool"]
 
 MAX_TOOL_TURNS = 6
-REASONING_TRACE_MAX_CHARS = 4000
 
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[str]]
@@ -80,6 +85,16 @@ class TextGenerationRequest:
     tools: list[TextToolDefinition] | None = None
     prompt_usage_key: str | None = None
     prompt_usage_signature: str | None = None
+    usage_scope_id: str | None = None
+
+    @property
+    def max_output_tokens(self) -> int:
+        reasoning = self.model.lower().startswith(("o", "gpt-5", "gpt-6"))
+        return (
+            (12288 if self.tools else 8192)
+            if reasoning
+            else (6144 if self.tools else 4096)
+        )
 
 
 @dataclass(frozen=True)
@@ -104,6 +119,7 @@ class TextConversationMessage:
     tool_call_id: str | None = None
     tool_name: str | None = None
     is_error: bool = False
+    provider_content: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +143,7 @@ class ProviderTurnResult:
     tool_calls: tuple[TextToolCall, ...]
     usage: dict[str, Any] | None
     response_id: str | None = None
+    provider_content: dict[str, Any] | None = None
 
 
 @dataclass
@@ -423,6 +440,16 @@ def merge_usage_dicts(
     return merged
 
 
+def reported_request_usage(
+    accounting: RequestAccounting | None,
+) -> dict[str, Any] | None:
+    usage: dict[str, Any] | None = None
+    if accounting is not None:
+        for reported in [*accounting.previous_usages, accounting.usage]:
+            usage = merge_usage_dicts(usage, reported)
+    return usage
+
+
 def parse_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
     if isinstance(raw_arguments, dict):
         return cast("dict[str, Any]", raw_arguments)
@@ -440,15 +467,82 @@ def parse_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
     return {}
 
 
+def validate_responses_completion(
+    response: Any, *, terminal_event: bool = False
+) -> None:
+    if not isinstance(response, dict):
+        raise ResponseFormatError("Responses API returned an invalid payload.")
+    status = response.get("status")
+    if status != "completed" and not (terminal_event and status is None):
+        raise ResponseFormatError("Responses API did not complete successfully.")
+    if response.get("error") or response.get("incomplete_details"):
+        raise ResponseFormatError("Responses API returned an unsuccessful response.")
+    output = response.get("output", [])
+    if not isinstance(output, list):
+        raise ResponseFormatError("Responses API output was invalid.")
+    for item in output:
+        if not isinstance(item, dict):
+            raise ResponseFormatError("Responses API output item was invalid.")
+        if item.get("status") not in {None, "completed"}:
+            raise ResponseFormatError("Responses API output was incomplete.")
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            raise ResponseFormatError("Responses API message content was invalid.")
+        if any(
+            isinstance(part, dict) and part.get("type") == "refusal" for part in content
+        ):
+            raise ResponseFormatError("The provider refused the request.")
+
+
+def validate_chat_completion(response: Any) -> None:
+    if not isinstance(response, dict):
+        raise ResponseFormatError("Chat response was not a JSON object.")
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ResponseFormatError("Chat response had no valid choice.")
+    choice = choices[0]
+    if choice.get("finish_reason") not in {"stop", "tool_calls"}:
+        raise ResponseFormatError("Chat response did not complete successfully.")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise ResponseFormatError("Chat response had no message.")
+    if message.get("refusal"):
+        raise ResponseFormatError("The provider refused the request.")
+
+
+def validate_anthropic_completion(response: Any) -> None:
+    if not isinstance(response, dict) or response.get("stop_reason") not in {
+        "end_turn",
+        "stop_sequence",
+        "tool_use",
+    }:
+        raise ResponseFormatError("Anthropic response did not complete successfully.")
+
+
+def validate_google_completion(response: Any) -> None:
+    if not isinstance(response, dict):
+        raise ResponseFormatError("Google response was not a JSON object.")
+    candidates = response.get("candidates")
+    if (
+        not isinstance(candidates, list)
+        or not candidates
+        or not isinstance(candidates[0], dict)
+    ):
+        raise ResponseFormatError("Google response had no valid candidate.")
+    if candidates[0].get("finishReason") != "STOP":
+        raise ResponseFormatError("Google response did not complete successfully.")
+
+
 class ChatProvider:
     def __init__(self) -> None:
         self._openai_models_cache: list[str] = []
+        self._openai_models_cache_key: tuple[str, str] | None = None
 
     async def async_get_chat_response(
         self,
         prompt: str,
         model: ChatModels,
-        provider: ChatProviders,
+        provider: str,
         note_id: int,
         temperature: float = DEFAULT_TEMPERATURE,
         reasoning_effort: OpenAIReasoningEffort | None = None,
@@ -458,6 +552,7 @@ class ChatProvider:
         tool_executor: ToolExecutor | None = None,
         prompt_usage_key: str | None = None,
         prompt_usage_signature: str | None = None,
+        usage_scope_id: str | None = None,
     ) -> str:
         result = await self.async_get_chat_response_result(
             prompt=prompt,
@@ -472,6 +567,7 @@ class ChatProvider:
             tool_executor=tool_executor,
             prompt_usage_key=prompt_usage_key,
             prompt_usage_signature=prompt_usage_signature,
+            usage_scope_id=usage_scope_id,
         )
         return result.text
 
@@ -479,7 +575,7 @@ class ChatProvider:
         self,
         prompt: str,
         model: ChatModels,
-        provider: ChatProviders,
+        provider: str,
         note_id: int,
         temperature: float = DEFAULT_TEMPERATURE,
         reasoning_effort: OpenAIReasoningEffort | None = None,
@@ -489,6 +585,7 @@ class ChatProvider:
         tool_executor: ToolExecutor | None = None,
         prompt_usage_key: str | None = None,
         prompt_usage_signature: str | None = None,
+        usage_scope_id: str | None = None,
     ) -> TextGenerationResult:
         del note_id, retry_count
         request = TextGenerationRequest(
@@ -503,6 +600,7 @@ class ChatProvider:
             tools=tools,
             prompt_usage_key=prompt_usage_key,
             prompt_usage_signature=prompt_usage_signature,
+            usage_scope_id=usage_scope_id,
         )
         return await self.generate_text(request, tool_executor=tool_executor)
 
@@ -511,35 +609,79 @@ class ChatProvider:
         request: TextGenerationRequest,
         tool_executor: ToolExecutor | None = None,
     ) -> TextGenerationResult:
-        if request.tools:
-            if tool_executor is None:
-                raise Exception("Tool-enabled requests require a tool executor.")
-            return await self._generate_text_with_tools(request, tool_executor)
+        with self._record_usage_on_failure(request) as accounting:
+            validate_provider_model(request.provider, request.model)
+            if request.tools:
+                if tool_executor is None:
+                    raise Exception("Tool-enabled requests require a tool executor.")
+                result = await self._generate_text_with_tools(request, tool_executor)
+                if not result.text.strip():
+                    raise ResponseFormatError("Provider completed without any text.")
+                return replace(
+                    result, usage=reported_request_usage(accounting) or result.usage
+                )
 
-        text_parts: list[str] = []
-        response_id: str | None = None
-        usage: dict[str, Any] | None = None
+            completed = False
+            text_parts: list[str] = []
+            response_id: str | None = None
+            usage: dict[str, Any] | None = None
 
-        async for event in self.async_iter_text_events(request):
-            if event.type == "text_delta":
-                text_parts.append(event.text)
-            elif event.type == "usage_reported":
-                usage = event.usage
-            elif event.type == "response_started":
-                response_id = event.response_id
-            elif event.type == "response_completed":
-                response_id = event.response_id or response_id
-                usage = event.usage or usage
+            async for event in self.async_iter_text_events(request):
+                if event.type == "text_delta":
+                    text_parts.append(event.text)
+                elif event.type == "usage_reported":
+                    usage = event.usage
+                elif event.type == "response_started":
+                    response_id = event.response_id
+                elif event.type == "response_completed":
+                    completed = True
+                    response_id = event.response_id or response_id
+                    usage = event.usage or usage
 
-        return TextGenerationResult(
-            text="".join(text_parts),
-            response_id=response_id,
-            usage=usage,
-        )
+            if not completed:
+                raise ResponseFormatError("Provider did not complete the response.")
+            return TextGenerationResult(
+                text="".join(text_parts),
+                response_id=response_id,
+                usage=reported_request_usage(accounting) or usage,
+            )
+
+    @contextmanager
+    def _record_usage_on_failure(
+        self, request: TextGenerationRequest
+    ) -> Generator[RequestAccounting | None]:
+        if request.provider == "openai":
+            yield None
+            return
+        accounting = RequestAccounting()
+        token = request_accounting.set(accounting)
+        try:
+            yield accounting
+        except BaseException:
+            usage = reported_request_usage(accounting)
+            if usage is not None:
+                try:
+                    chat_usage_tracker.finalize_request(
+                        provider=request.provider,
+                        model=request.model,
+                        reasoning_effort=request.reasoning_effort,
+                        use_tools=bool(request.tools),
+                        prompt_chars=len(request.prompt),
+                        raw_usage=usage,
+                        prompt_key=request.prompt_usage_key,
+                        prompt_signature=request.prompt_usage_signature,
+                        scope_id=request.usage_scope_id,
+                        record_openai_daily_usage=False,
+                    )
+                except Exception:
+                    logger.exception("Unable to record usage for a failed response.")
+            raise
+        finally:
+            request_accounting.reset(token)
 
     async def async_iter_text_events(
         self, request: TextGenerationRequest
-    ) -> AsyncIterator[TextGenerationEvent]:
+    ) -> AsyncGenerator[TextGenerationEvent]:
         custom_provider = next(
             (
                 p
@@ -550,33 +692,28 @@ class ChatProvider:
         )
 
         if custom_provider is not None:
-            async for event in self._iterate_custom_provider_events(
-                request, custom_provider
-            ):
-                yield event
-            return
+            events = self._iterate_custom_provider_events(request, custom_provider)
+        else:
+            validate_provider_model(request.provider, request.model)
+            if request.provider == "openai":
+                events = self._iterate_official_openai_events(request)
+            elif request.provider == "anthropic":
+                events = self._iterate_anthropic_events(request)
+            elif request.provider == "deepseek":
+                events = self._iterate_deepseek_events(request)
+            elif request.provider == "google":
+                events = self._iterate_google_events(request)
+            else:
+                raise ValueError(f"Unknown provider: {request.provider}")
 
-        if request.provider == "openai":
-            async for event in self._iterate_official_openai_events(request):
+        has_text = False
+        async with aclosing(events):
+            async for event in events:
+                if event.type == "text_delta" and event.text.strip():
+                    has_text = True
+                if event.type == "response_completed" and not has_text:
+                    raise ResponseFormatError("Provider completed without any text.")
                 yield event
-            return
-
-        if request.provider == "anthropic":
-            async for event in self._iterate_anthropic_events(request):
-                yield event
-            return
-
-        if request.provider == "deepseek":
-            async for event in self._iterate_deepseek_events(request):
-                yield event
-            return
-
-        if request.provider == "google":
-            async for event in self._iterate_google_events(request):
-                yield event
-            return
-
-        raise ValueError(f"Unknown provider: {request.provider}")
 
     async def verify_custom_provider(
         self, provider_config: CustomProvider
@@ -598,35 +735,40 @@ class ChatProvider:
 
     async def fetch_openai_chat_models(self) -> list[str]:
         api_key = config.openai_api_key
+        cache_key = self._openai_model_cache_key()
         if not api_key:
-            return list(self._openai_models_cache)
+            return []
 
         base_url = config.openai_endpoint or OPENAI_BASE_URL
-        try:
-            payload = await provider_runtime.request_json(
-                key="models:openai",
-                initial_window=1,
-                method="GET",
-                url=build_v1_endpoint(base_url, "/models"),
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                provider="openai",
-                model="models",
-                timeouts=json_timeouts(sock_read_timeout_sec=10.0),
-                max_retries=1,
-            )
-            models = filter_openai_text_models(self._extract_model_ids(payload))
-        except Exception as exc:
-            logger.warning(f"Failed to auto-detect OpenAI models: {exc}")
-            return list(self._openai_models_cache)
+        payload = await provider_runtime.request_json(
+            key="models:openai",
+            initial_window=1,
+            method="GET",
+            url=build_v1_endpoint(base_url, "/models"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            provider="openai",
+            model="models",
+            timeouts=json_timeouts(sock_read_timeout_sec=10.0),
+            max_retries=1,
+        )
+        models = filter_openai_text_models(self._extract_model_ids(payload))
 
-        if models:
-            self._openai_models_cache = models
-        return list(self._openai_models_cache)
+        self._openai_models_cache = models
+        self._openai_models_cache_key = cache_key
+        return list(models)
+
+    def _openai_model_cache_key(self) -> tuple[str, str]:
+        return (
+            config.openai_endpoint or OPENAI_BASE_URL,
+            hashlib.sha256((config.openai_api_key or "").encode()).hexdigest(),
+        )
 
     def get_cached_openai_chat_models(self) -> list[str]:
+        if self._openai_models_cache_key != self._openai_model_cache_key():
+            return []
         return list(self._openai_models_cache)
 
     async def acquire_openai_turn_permit(
@@ -662,6 +804,62 @@ class ChatProvider:
             prompt_key=prompt_usage_key,
             prompt_signature=prompt_usage_signature,
         )
+
+    @asynccontextmanager
+    async def _openai_turn(
+        self,
+        *,
+        request: TextGenerationRequest,
+        provider_name: str,
+        input_payload: str | list[dict[str, Any]],
+        prompt_usage_key: str | None,
+        prompt_usage_signature: str | None,
+    ) -> AsyncGenerator[RequestAccounting]:
+        permit = await self.acquire_openai_turn_permit(
+            request=request,
+            provider_name=provider_name,
+            input_payload=input_payload,
+            prompt_usage_key=prompt_usage_key,
+            prompt_usage_signature=prompt_usage_signature,
+        )
+        accounting = (
+            request_accounting.get() if provider_name != "openai" else None
+        ) or RequestAccounting()
+        token = request_accounting.set(accounting)
+        try:
+            yield accounting
+        finally:
+            request_accounting.reset(token)
+            if accounting.dispatched:
+                prompt_chars, prompt_bytes = payload_length_metrics(input_payload)
+                estimated_usage = (
+                    permit.estimated_usage
+                    if permit is not None
+                    else chat_usage_tracker.estimate_request_usage(
+                        provider=provider_name,
+                        model=request.model,
+                        reasoning_effort=request.reasoning_effort,
+                        use_tools=bool(request.tools),
+                        prompt_chars=prompt_chars,
+                        prompt_bytes=prompt_bytes,
+                    )
+                )
+                if provider_name == "openai":
+                    for previous_usage in accounting.previous_usages:
+                        await chat_usage_tracker.finalize_openai_turn(
+                            provider=provider_name,
+                            raw_usage=previous_usage,
+                            permit=None,
+                            estimated_usage=estimated_usage,
+                        )
+                await chat_usage_tracker.finalize_openai_turn(
+                    provider=provider_name,
+                    raw_usage=accounting.usage,
+                    permit=permit,
+                    estimated_usage=estimated_usage,
+                )
+            else:
+                await chat_usage_tracker.release_openai_turn_permit(permit)
 
     async def _generate_text_with_tools(
         self, request: TextGenerationRequest, tool_executor: ToolExecutor
@@ -796,16 +994,6 @@ class ChatProvider:
                     detail,
                 )
                 stream_enabled = False
-            except ResponseFormatError as exc:
-                if custom_provider is None:
-                    raise
-                detail = " ".join(str(exc).split())[:200]
-                logger.info(
-                    "Custom provider %s emitted an incompatible Responses tool stream; retrying without streaming. detail=%s",
-                    provider_name,
-                    detail,
-                )
-                stream_enabled = False
             except ProviderHTTPError as exc:
                 if (
                     custom_provider is not None
@@ -872,6 +1060,7 @@ class ChatProvider:
                     role="assistant",
                     content=turn_result.text,
                     tool_calls=turn_result.tool_calls,
+                    provider_content=turn_result.provider_content,
                 )
             )
 
@@ -976,15 +1165,13 @@ class ChatProvider:
         prompt_usage_signature = (
             request.prompt_usage_signature if previous_response_id is None else None
         )
-        permit = await self.acquire_openai_turn_permit(
+        async with self._openai_turn(
             request=request,
             provider_name=provider_name,
             input_payload=input_payload,
             prompt_usage_key=prompt_usage_key,
             prompt_usage_signature=prompt_usage_signature,
-        )
-
-        try:
+        ) as accounting:
             response = await provider_runtime.request_json(
                 key=text_transport_key(provider_name, request.model),
                 initial_window=text_initial_window(provider_name),
@@ -1002,29 +1189,13 @@ class ChatProvider:
                 model=request.model,
                 timeouts=responses_json_timeouts(request.reasoning_effort),
             )
-        except Exception:
-            await chat_usage_tracker.release_openai_turn_permit(permit)
-            raise
 
-        self._log_reasoning_trace(
-            provider=provider_name,
-            model=request.model,
-            source="responses",
-            payload=response,
-        )
-
-        try:
+            accounting.dispatched = True
+            accounting.observe(response)
             turn_result = self._parse_openai_responses_turn(response)
-        except Exception:
-            await chat_usage_tracker.release_openai_turn_permit(permit)
-            raise
 
-        await chat_usage_tracker.finalize_openai_turn(
-            provider=provider_name,
-            raw_usage=turn_result.usage,
-            permit=permit,
-        )
-        return turn_result
+            accounting.usage = turn_result.usage
+            return turn_result
 
     async def _responses_stream_turn(
         self,
@@ -1057,32 +1228,30 @@ class ChatProvider:
             allow_tools=allow_tools,
         )
         payload["stream"] = True
-        permit = await self.acquire_openai_turn_permit(
+        async with self._openai_turn(
             request=request,
             provider_name=provider_name,
             input_payload=input_payload,
             prompt_usage_key=prompt_usage_key,
             prompt_usage_signature=prompt_usage_signature,
-        )
+        ) as accounting:
+            response_id: str | None = None
+            usage: dict[str, Any] | None = None
+            text_parts: list[str] = []
+            response: dict[str, Any] | None = None
+            pending_calls: dict[int, ResponsesFunctionCallBuffer] = {}
+            completed_calls: dict[int, TextToolCall] = {}
+            completed = False
 
-        response_id: str | None = None
-        usage: dict[str, Any] | None = None
-        text_parts: list[str] = []
-        response: dict[str, Any] | None = None
-        pending_calls: dict[int, ResponsesFunctionCallBuffer] = {}
-        completed_calls: dict[int, TextToolCall] = {}
-        completed = False
+            def function_call_buffer(output_index: int) -> ResponsesFunctionCallBuffer:
+                existing = pending_calls.get(output_index)
+                if existing is not None:
+                    return existing
 
-        def function_call_buffer(output_index: int) -> ResponsesFunctionCallBuffer:
-            existing = pending_calls.get(output_index)
-            if existing is not None:
-                return existing
+                created = ResponsesFunctionCallBuffer(output_index=output_index)
+                pending_calls[output_index] = created
+                return created
 
-            created = ResponsesFunctionCallBuffer(output_index=output_index)
-            pending_calls[output_index] = created
-            return created
-
-        try:
             async for event in provider_runtime.stream_sse_json(
                 key=text_transport_key(provider_name, request.model),
                 initial_window=text_initial_window(provider_name),
@@ -1094,16 +1263,11 @@ class ChatProvider:
                 model=request.model,
                 timeouts=responses_timeouts(request.reasoning_effort),
             ):
-                self._log_reasoning_trace(
-                    provider=provider_name,
-                    model=request.model,
-                    source="responses_stream",
-                    payload=event,
-                )
+                accounting.dispatched = True
+                accounting.observe(event)
                 event_type = str(event.get("type", ""))
                 if event_type == "done":
                     continue
-
                 response_data = event.get("response")
                 if isinstance(response_data, dict) and isinstance(
                     response_data.get("id"), str
@@ -1113,13 +1277,11 @@ class ChatProvider:
                     stream_response_id = event.get("response_id")
                     if isinstance(stream_response_id, str) and stream_response_id:
                         response_id = stream_response_id
-
                 if event_type == "response.output_text.delta":
                     delta = event.get("delta")
                     if isinstance(delta, str) and delta:
                         text_parts.append(delta)
                     continue
-
                 if event_type == "response.output_item.added":
                     output_index = event.get("output_index")
                     if isinstance(output_index, int):
@@ -1130,7 +1292,6 @@ class ChatProvider:
                         ):
                             function_call_buffer(output_index).update_from_item(item)
                     continue
-
                 if event_type == "response.function_call_arguments.delta":
                     output_index = event.get("output_index")
                     if isinstance(output_index, int):
@@ -1140,7 +1301,6 @@ class ChatProvider:
                             call_buffer.item_id = item_id
                         call_buffer.append_arguments(event.get("delta"))
                     continue
-
                 if event_type == "response.function_call_arguments.done":
                     output_index = event.get("output_index")
                     if not isinstance(output_index, int):
@@ -1152,13 +1312,13 @@ class ChatProvider:
                     if call_buffer.is_ready():
                         completed_calls[output_index] = call_buffer.to_tool_call()
                     continue
-
                 if event_type == "response.completed":
                     response_payload = event.get("response")
                     if not isinstance(response_payload, dict):
                         raise ResponseFormatError(
                             "Responses stream completed without a response payload."
                         )
+                    validate_responses_completion(response_payload, terminal_event=True)
                     completed = True
                     response = cast("dict[str, Any]", response_payload)
                     response_id = cast("str | None", response.get("id", response_id))
@@ -1168,29 +1328,29 @@ class ChatProvider:
                         if final_text:
                             text_parts.append(final_text)
                     continue
+                if event_type in {
+                    "response.failed",
+                    "error",
+                    "response.incomplete",
+                    "response.refusal.delta",
+                    "response.refusal.done",
+                }:
+                    raise ResponseFormatError(
+                        redact_text(self._describe_event_error(event))
+                    )
 
-                if event_type in {"response.failed", "error", "response.incomplete"}:
-                    raise Exception(self._describe_event_error(event))
-        except Exception:
-            await chat_usage_tracker.release_openai_turn_permit(permit)
-            raise
+            if not completed:
+                raise ResponseFormatError(
+                    "Responses stream ended before the response completed."
+                )
 
-        if not completed:
-            await chat_usage_tracker.release_openai_turn_permit(permit)
-            raise ResponseFormatError(
-                "Responses stream ended before the response completed."
-            )
-
-        try:
             tool_calls = tuple(
                 tool_call for _, tool_call in sorted(completed_calls.items())
             )
-
             if response is not None:
                 parsed_tool_calls = self._extract_openai_responses_tool_calls(response)
                 if parsed_tool_calls:
                     tool_calls = parsed_tool_calls
-
             if not tool_calls and pending_calls:
                 ready_pending_calls = [
                     pending_calls[index]
@@ -1202,7 +1362,6 @@ class ChatProvider:
                         pending_call.to_tool_call()
                         for pending_call in ready_pending_calls
                     )
-
             if not tool_calls and pending_calls:
                 incomplete_pending_calls = [
                     pending_calls[index]
@@ -1219,23 +1378,16 @@ class ChatProvider:
                         raise ResponseFormatError(
                             "Responses stream omitted the tool call ID."
                         )
-
             result = ProviderTurnResult(
                 text="".join(text_parts),
                 tool_calls=tool_calls,
                 usage=usage,
                 response_id=response_id,
             )
-        except Exception:
-            await chat_usage_tracker.release_openai_turn_permit(permit)
-            raise
 
-        await chat_usage_tracker.finalize_openai_turn(
-            provider=provider_name,
-            raw_usage=result.usage,
-            permit=permit,
-        )
-        return result
+            accounting.dispatched = True
+            accounting.usage = result.usage
+            return result
 
     async def _message_turn(
         self, request: TextGenerationRequest, messages: list[TextConversationMessage]
@@ -1291,7 +1443,7 @@ class ChatProvider:
 
     async def _iterate_official_openai_events(
         self, request: TextGenerationRequest
-    ) -> AsyncIterator[TextGenerationEvent]:
+    ) -> AsyncGenerator[TextGenerationEvent]:
         api_key = config.openai_api_key
         if not api_key:
             raise Exception("OpenAI API key not found. Please set it in the settings.")
@@ -1316,7 +1468,7 @@ class ChatProvider:
         api_key: str,
         use_stream: bool,
         include_prompt_cache_key: bool = False,
-    ) -> AsyncIterator[TextGenerationEvent]:
+    ) -> AsyncGenerator[TextGenerationEvent]:
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -1331,16 +1483,14 @@ class ChatProvider:
         if use_stream:
             payload["stream"] = True
 
-        permit = await self.acquire_openai_turn_permit(
+        async with self._openai_turn(
             request=request,
             provider_name=provider_name,
             input_payload=request.prompt,
             prompt_usage_key=request.prompt_usage_key,
             prompt_usage_signature=request.prompt_usage_signature,
-        )
-
-        if not use_stream:
-            try:
+        ) as accounting:
+            if not use_stream:
                 response = await provider_runtime.request_json(
                     key=text_transport_key(provider_name, request.model),
                     initial_window=text_initial_window(provider_name),
@@ -1352,60 +1502,43 @@ class ChatProvider:
                     model=request.model,
                     timeouts=responses_json_timeouts(request.reasoning_effort),
                 )
-            except Exception:
-                await chat_usage_tracker.release_openai_turn_permit(permit)
-                raise
-            if not isinstance(response, dict):
-                await chat_usage_tracker.release_openai_turn_permit(permit)
-                raise ResponseFormatError("Responses API returned an invalid payload.")
-
-            self._log_reasoning_trace(
-                provider=provider_name,
-                model=request.model,
-                source="responses",
-                payload=response,
-            )
-
-            try:
+                accounting.dispatched = True
+                accounting.observe(response)
+                validate_responses_completion(response)
                 response_id = self._response_id(response)
                 usage = self._extract_usage(response)
                 final_text = self._extract_openai_responses_text(response)
-            except Exception:
-                await chat_usage_tracker.release_openai_turn_permit(permit)
-                raise
 
-            await chat_usage_tracker.finalize_openai_turn(
-                provider=provider_name,
-                raw_usage=usage,
-                permit=permit,
-            )
+                accounting.usage = usage
 
-            yield TextGenerationEvent(type="response_started", response_id=response_id)
-            if final_text:
                 yield TextGenerationEvent(
-                    type="text_delta",
-                    text=final_text,
-                    response_id=response_id,
+                    type="response_started", response_id=response_id
                 )
-            if usage:
+                if final_text:
+                    yield TextGenerationEvent(
+                        type="text_delta",
+                        text=final_text,
+                        response_id=response_id,
+                    )
+                if usage:
+                    yield TextGenerationEvent(
+                        type="usage_reported",
+                        usage=usage,
+                        response_id=response_id,
+                    )
                 yield TextGenerationEvent(
-                    type="usage_reported",
+                    type="response_completed",
+                    response_id=response_id,
                     usage=usage,
-                    response_id=response_id,
                 )
-            yield TextGenerationEvent(
-                type="response_completed",
-                response_id=response_id,
-                usage=usage,
-            )
-            return
+                return
 
-        started = False
-        accumulated_text = ""
-        last_response_id: str | None = None
-        last_usage: dict[str, Any] | None = None
+            started = False
+            accumulated_text = ""
+            last_response_id: str | None = None
+            last_usage: dict[str, Any] | None = None
+            completed = False
 
-        try:
             async for event in provider_runtime.stream_sse_json(
                 key=text_transport_key(provider_name, request.model),
                 initial_window=text_initial_window(provider_name),
@@ -1417,17 +1550,11 @@ class ChatProvider:
                 model=request.model,
                 timeouts=responses_timeouts(request.reasoning_effort),
             ):
-                self._log_reasoning_trace(
-                    provider=provider_name,
-                    model=request.model,
-                    source="responses_stream",
-                    payload=event,
-                )
+                accounting.dispatched = True
+                accounting.observe(event)
                 event_type = str(event.get("type", ""))
-
                 if event_type == "done":
                     continue
-
                 if not started:
                     response_data = event.get("response")
                     response_id = (
@@ -1446,16 +1573,16 @@ class ChatProvider:
                         type="response_started",
                         response_id=last_response_id,
                     )
-
                 if event_type == "response.output_text.delta":
                     delta = str(event.get("delta", ""))
                     if delta:
                         accumulated_text += delta
                         yield TextGenerationEvent(type="text_delta", text=delta)
                     continue
-
                 if event_type == "response.completed":
-                    response_data = event.get("response", {})
+                    response_data = event.get("response")
+                    validate_responses_completion(response_data, terminal_event=True)
+                    completed = True
                     if isinstance(response_data, dict):
                         last_response_id = cast(
                             "str | None", response_data.get("id", last_response_id)
@@ -1468,7 +1595,6 @@ class ChatProvider:
                                 usage=usage,
                                 response_id=last_response_id,
                             )
-
                         if not accumulated_text:
                             final_text = self._extract_openai_responses_text(
                                 response_data
@@ -1480,31 +1606,35 @@ class ChatProvider:
                                     text=final_text,
                                     response_id=last_response_id,
                                 )
-
                     yield TextGenerationEvent(
                         type="response_completed",
                         response_id=last_response_id,
                         usage=last_usage,
                     )
                     continue
+                if event_type in {
+                    "response.failed",
+                    "error",
+                    "response.incomplete",
+                    "response.refusal.delta",
+                    "response.refusal.done",
+                }:
+                    raise ResponseFormatError(
+                        redact_text(self._describe_event_error(event))
+                    )
 
-                if event_type in {"response.failed", "error", "response.incomplete"}:
-                    raise Exception(self._describe_event_error(event))
-        except Exception:
-            await chat_usage_tracker.release_openai_turn_permit(permit)
-            raise
-
-        await chat_usage_tracker.finalize_openai_turn(
-            provider=provider_name,
-            raw_usage=last_usage,
-            permit=permit,
-        )
+            if not completed:
+                raise ResponseFormatError(
+                    "Responses stream ended before the response completed."
+                )
+            accounting.dispatched = True
+            accounting.usage = last_usage
 
     async def _iterate_custom_provider_events(
         self,
         request: TextGenerationRequest,
         provider_config: CustomProvider,
-    ) -> AsyncIterator[TextGenerationEvent]:
+    ) -> AsyncGenerator[TextGenerationEvent]:
         api_mode = self._resolve_custom_provider_api_mode(provider_config)
         use_stream = self._custom_provider_streaming_enabled(provider_config)
         provider_name = provider_config["name"]
@@ -1533,6 +1663,7 @@ class ChatProvider:
                     reasoning_effort=reasoning_effort,
                     prompt_cache_key=None,
                 )
+                emitted_event = False
                 try:
                     if api_mode == "responses":
                         async for (
@@ -1544,6 +1675,7 @@ class ChatProvider:
                             api_key=api_key,
                             use_stream=stream_enabled,
                         ):
+                            emitted_event = True
                             yield event
                     else:
                         async for event in self._iterate_openai_compatible_chat_events(
@@ -1553,9 +1685,12 @@ class ChatProvider:
                             api_key=api_key,
                             use_stream=stream_enabled,
                         ):
+                            emitted_event = True
                             yield event
                     return
                 except StreamingNotSupportedError as exc:
+                    if emitted_event:
+                        raise
                     if stream_enabled:
                         detail = " ".join(str(exc).split())[:200]
                         logger.info(
@@ -1580,6 +1715,8 @@ class ChatProvider:
                     )
                     raise
                 except ProviderHTTPError as exc:
+                    if emitted_event:
+                        raise
                     if stream_enabled and looks_like_streaming_unsupported_http_error(
                         exc
                     ):
@@ -1634,7 +1771,7 @@ class ChatProvider:
         base_url: str,
         api_key: str,
         use_stream: bool,
-    ) -> AsyncIterator[TextGenerationEvent]:
+    ) -> AsyncGenerator[TextGenerationEvent]:
         url = build_v1_endpoint(base_url, "/chat/completions")
         headers = {"Content-Type": "application/json"}
         if api_key:
@@ -1643,6 +1780,9 @@ class ChatProvider:
         payload: dict[str, Any] = {
             "model": request.model,
             "messages": [{"role": "user", "content": request.prompt}],
+            "max_completion_tokens"
+            if request.model.lower().startswith(("gpt-5", "gpt-6", "o"))
+            else "max_tokens": request.max_output_tokens,
         }
 
         if request.model.lower() == "gpt-6-astra":
@@ -1655,6 +1795,8 @@ class ChatProvider:
             payload["temperature"] = request.temperature
 
         if use_stream:
+            completed = False
+            usage: dict[str, Any] | None = None
             payload["stream"] = True
             logger.debug(
                 "Provider %s stream started via chat_completions at %s",
@@ -1672,16 +1814,11 @@ class ChatProvider:
                 model=request.model,
                 timeouts=responses_timeouts(request.reasoning_effort),
             ):
-                self._log_reasoning_trace(
-                    provider=provider_name,
-                    model=request.model,
-                    source="chat_stream",
-                    payload=event,
-                )
                 event_type = str(event.get("type", ""))
                 if event_type == "done":
                     continue
 
+                usage = self._extract_usage(event) or usage
                 if "choices" not in event:
                     continue
 
@@ -1693,14 +1830,27 @@ class ChatProvider:
                 if not isinstance(choice, dict):
                     continue
 
+                finish_reason = choice.get("finish_reason")
+                if finish_reason is not None:
+                    if finish_reason != "stop":
+                        raise ResponseFormatError(
+                            "Chat stream did not complete successfully."
+                        )
+                    completed = True
                 delta = choice.get("delta", {})
                 if not isinstance(delta, dict):
                     continue
 
+                if delta.get("refusal"):
+                    raise ResponseFormatError("The provider refused the request.")
                 content = delta.get("content")
                 if isinstance(content, str) and content:
                     yield TextGenerationEvent(type="text_delta", text=content)
-            yield TextGenerationEvent(type="response_completed")
+            if not completed:
+                raise ResponseFormatError("Chat stream ended before completion.")
+            if usage:
+                yield TextGenerationEvent(type="usage_reported", usage=usage)
+            yield TextGenerationEvent(type="response_completed", usage=usage)
             return
 
         response = await provider_runtime.request_json(
@@ -1714,12 +1864,6 @@ class ChatProvider:
             model=request.model,
             timeouts=json_timeouts(),
         )
-        self._log_reasoning_trace(
-            provider=provider_name,
-            model=request.model,
-            source="chat",
-            payload=response,
-        )
         text = self._extract_openai_chat_text(response)
         usage = self._extract_usage(response)
         yield TextGenerationEvent(type="response_started")
@@ -1730,7 +1874,7 @@ class ChatProvider:
 
     async def _iterate_anthropic_events(
         self, request: TextGenerationRequest
-    ) -> AsyncIterator[TextGenerationEvent]:
+    ) -> AsyncGenerator[TextGenerationEvent]:
         api_key = config.anthropic_api_key
         if not api_key:
             raise Exception(
@@ -1740,7 +1884,7 @@ class ChatProvider:
         payload = {
             "model": request.model,
             "messages": [{"role": "user", "content": request.prompt}],
-            "max_tokens": 4096,
+            "max_tokens": request.max_output_tokens,
             "temperature": request.temperature,
         }
         response = await provider_runtime.request_json(
@@ -1768,7 +1912,7 @@ class ChatProvider:
 
     async def _iterate_deepseek_events(
         self, request: TextGenerationRequest
-    ) -> AsyncIterator[TextGenerationEvent]:
+    ) -> AsyncGenerator[TextGenerationEvent]:
         api_key = config.deepseek_api_key
         if not api_key:
             raise Exception(
@@ -1778,6 +1922,8 @@ class ChatProvider:
         payload = {
             "model": request.model,
             "messages": [{"role": "user", "content": request.prompt}],
+            "max_tokens": request.max_output_tokens,
+            "thinking": {"type": "disabled"},
             "temperature": request.temperature,
         }
         response = await provider_runtime.request_json(
@@ -1804,7 +1950,7 @@ class ChatProvider:
 
     async def _iterate_google_events(
         self, request: TextGenerationRequest
-    ) -> AsyncIterator[TextGenerationEvent]:
+    ) -> AsyncGenerator[TextGenerationEvent]:
         api_key = config.google_api_key
         if not api_key:
             raise Exception("Google API key not found. Please set it in the settings.")
@@ -1813,11 +1959,14 @@ class ChatProvider:
             key=f"text:google:{request.model}",
             initial_window=text_initial_window("google"),
             method="POST",
-            url=f"{GOOGLE_ENDPOINT_BASE}/{request.model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
+            url=f"{GOOGLE_ENDPOINT_BASE}/{request.model}:generateContent",
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
             json_payload={
                 "contents": [{"parts": [{"text": request.prompt}]}],
-                "generationConfig": {"temperature": request.temperature},
+                "generationConfig": {
+                    "temperature": request.temperature,
+                    "maxOutputTokens": request.max_output_tokens,
+                },
             },
             provider="google",
             model=request.model,
@@ -1825,7 +1974,7 @@ class ChatProvider:
         )
         error = response.get("error")
         if error:
-            raise Exception(f"google API error: {error}")
+            raise ResponseFormatError("Google returned an API error.")
 
         text = self._extract_google_text(response)
         usage = self._extract_usage(response)
@@ -1852,14 +2001,21 @@ class ChatProvider:
             "model": request.model,
             "messages": self._chat_completion_messages_payload(messages),
             "parallel_tool_calls": False,
+            "max_completion_tokens"
+            if request.model.lower().startswith(("gpt-5", "gpt-6", "o"))
+            else "max_tokens": request.max_output_tokens,
         }
+        if provider_name == "deepseek":
+            payload["thinking"] = {"type": "disabled"}
         if request.tools:
             payload["tools"] = self._chat_tools_payload(request.tools)
             payload["tool_choice"] = "auto"
 
         if request.model.lower() == "gpt-6-astra":
-            if request.tools:
-                raise ValueError("GPT-6 Astra tool calling requires the Responses API.")
+            if request.tools and not openai_supports_chat_tools(request.model):
+                raise ValueError(
+                    "This model requires the Responses API for tool calling."
+                )
             payload["reasoning_effort"] = choose_reasoning_effort(
                 request.model, request.reasoning_effort
             )
@@ -1878,12 +2034,6 @@ class ChatProvider:
             provider=provider_name,
             model=request.model,
             timeouts=json_timeouts(),
-        )
-        self._log_reasoning_trace(
-            provider=provider_name,
-            model=request.model,
-            source="chat",
-            payload=response,
         )
         return self._parse_openai_chat_turn(response)
 
@@ -1916,7 +2066,7 @@ class ChatProvider:
         payload: dict[str, Any] = {
             "model": request.model,
             "messages": self._anthropic_messages_payload(messages),
-            "max_tokens": 4096,
+            "max_tokens": request.max_output_tokens,
             "temperature": request.temperature,
         }
         if request.tools:
@@ -1948,7 +2098,10 @@ class ChatProvider:
 
         payload: dict[str, Any] = {
             "contents": self._google_contents_payload(messages),
-            "generationConfig": {"temperature": request.temperature},
+            "generationConfig": {
+                "temperature": request.temperature,
+                "maxOutputTokens": request.max_output_tokens,
+            },
         }
         if request.tools:
             payload["tools"] = [
@@ -1960,8 +2113,8 @@ class ChatProvider:
             key=f"text:google:{request.model}",
             initial_window=text_initial_window("google"),
             method="POST",
-            url=f"{GOOGLE_ENDPOINT_BASE}/{request.model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
+            url=f"{GOOGLE_ENDPOINT_BASE}/{request.model}:generateContent",
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
             json_payload=payload,
             provider="google",
             model=request.model,
@@ -1969,7 +2122,7 @@ class ChatProvider:
         )
         error = response.get("error")
         if error:
-            raise Exception(f"google API error: {error}")
+            raise ResponseFormatError("Google returned an API error.")
         return self._parse_google_turn(response)
 
     def _chat_completion_messages_payload(
@@ -2026,6 +2179,7 @@ class ChatProvider:
         ]
 
     def _parse_openai_chat_turn(self, response: Any) -> ProviderTurnResult:
+        validate_chat_completion(response)
         if not isinstance(response, dict):
             raise ResponseFormatError(
                 "OpenAI-compatible response was not a JSON object."
@@ -2122,6 +2276,7 @@ class ChatProvider:
         ]
 
     def _parse_anthropic_turn(self, response: Any) -> ProviderTurnResult:
+        validate_anthropic_completion(response)
         if not isinstance(response, dict):
             raise ResponseFormatError("Anthropic response was not a JSON object.")
 
@@ -2167,6 +2322,9 @@ class ChatProvider:
     ) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
         for message in messages:
+            if message.provider_content is not None:
+                payload.append(deepcopy(message.provider_content))
+                continue
             if message.role == "tool":
                 payload.append(
                     {
@@ -2175,6 +2333,11 @@ class ChatProvider:
                             {
                                 "functionResponse": {
                                     "name": message.tool_name or "",
+                                    **(
+                                        {"id": message.tool_call_id}
+                                        if message.tool_call_id
+                                        else {}
+                                    ),
                                     "response": {
                                         "content": message.content,
                                         "is_error": message.is_error,
@@ -2219,6 +2382,7 @@ class ChatProvider:
         ]
 
     def _parse_google_turn(self, response: Any) -> ProviderTurnResult:
+        validate_google_completion(response)
         if not isinstance(response, dict):
             raise ResponseFormatError("Google response was not a JSON object.")
 
@@ -2243,7 +2407,7 @@ class ChatProvider:
         for part in parts:
             if not isinstance(part, dict):
                 continue
-            if isinstance(part.get("text"), str):
+            if isinstance(part.get("text"), str) and not part.get("thought"):
                 text_parts.append(str(part["text"]))
                 continue
 
@@ -2257,7 +2421,7 @@ class ChatProvider:
 
             tool_calls.append(
                 TextToolCall(
-                    id=str(function_call.get("id") or tool_name),
+                    id=str(function_call.get("id") or ""),
                     name=tool_name,
                     arguments=parse_tool_arguments(function_call.get("args")),
                 )
@@ -2269,6 +2433,7 @@ class ChatProvider:
             tool_calls=tuple(tool_calls),
             usage=self._extract_usage(response),
             response_id=response_id if isinstance(response_id, str) else None,
+            provider_content=deepcopy(content),
         )
 
     async def _fetch_custom_provider_models(
@@ -2374,6 +2539,7 @@ class ChatProvider:
                     "content": [{"type": "input_text", "text": payload_input}],
                 }
             ],
+            "max_output_tokens": request.max_output_tokens,
             "store": bool(request.tools or previous_response_id),
             "truncation": "disabled",
             "tool_choice": "none",
@@ -2401,10 +2567,7 @@ class ChatProvider:
             }
         elif request.reasoning_effort:
             payload["reasoning"] = {"effort": request.reasoning_effort}
-        if request.model.lower() != "gpt-6-astra" and request.reasoning_effort in {
-            None,
-            "none",
-        }:
+        if openai_supports_temperature(request.model, request.reasoning_effort):
             payload["temperature"] = request.temperature
 
         if request.tools and allow_tools:
@@ -2460,6 +2623,7 @@ class ChatProvider:
         return tuple(tool_calls)
 
     def _parse_openai_responses_turn(self, response: Any) -> ProviderTurnResult:
+        validate_responses_completion(response)
         if not isinstance(response, dict):
             raise ResponseFormatError("Responses API returned an invalid payload.")
 
@@ -2469,84 +2633,6 @@ class ChatProvider:
             usage=self._extract_usage(response),
             response_id=self._response_id(response),
         )
-
-    def _log_reasoning_trace(
-        self,
-        *,
-        provider: str,
-        model: str,
-        source: str,
-        payload: Any,
-    ) -> None:
-        if not bool(getattr(config, "debug", False)):
-            return
-
-        for trace in self._extract_reasoning_traces(payload):
-            clean_trace = " ".join(trace.split())
-            if not clean_trace:
-                continue
-            if len(clean_trace) > REASONING_TRACE_MAX_CHARS:
-                clean_trace = (
-                    clean_trace[:REASONING_TRACE_MAX_CHARS].rstrip() + "... [truncated]"
-                )
-            logger.debug(
-                "Reasoning trace provider=%s model=%s source=%s: %s",
-                provider,
-                model,
-                source,
-                clean_trace,
-            )
-
-    def _extract_reasoning_traces(self, payload: Any) -> list[str]:
-        traces: list[str] = []
-
-        def collect(value: Any, *, in_reasoning: bool = False) -> None:
-            if isinstance(value, list):
-                for item in value:
-                    collect(item, in_reasoning=in_reasoning)
-                return
-
-            if not isinstance(value, dict):
-                return
-
-            raw_type = value.get("type")
-            item_type = raw_type if isinstance(raw_type, str) else ""
-            next_in_reasoning = in_reasoning or any(
-                marker in item_type.lower()
-                for marker in ("reasoning", "thinking", "thought")
-            )
-
-            for key, child in value.items():
-                lower_key = str(key).lower()
-                if any(
-                    blocked in lower_key
-                    for blocked in ("encrypted", "signature", "cipher")
-                ):
-                    continue
-
-                child_in_reasoning = next_in_reasoning or any(
-                    marker in lower_key
-                    for marker in ("reasoning", "thinking", "thought")
-                )
-
-                if isinstance(child, str):
-                    if child_in_reasoning and lower_key in {
-                        "text",
-                        "content",
-                        "summary",
-                        "reasoning",
-                        "reasoning_content",
-                        "thinking",
-                        "thought",
-                        "delta",
-                    }:
-                        traces.append(child)
-                    continue
-
-                collect(child, in_reasoning=child_in_reasoning)
-
-        collect(payload)
-        return traces
 
     def _extract_model_ids(self, payload: Any) -> list[str]:
         if not isinstance(payload, dict):
@@ -2603,6 +2689,7 @@ class ChatProvider:
         return "".join(text_parts)
 
     def _extract_openai_chat_text(self, response: Any) -> str:
+        validate_chat_completion(response)
         if not isinstance(response, dict):
             raise ResponseFormatError(
                 "OpenAI-compatible response was not a JSON object."
@@ -2631,37 +2718,10 @@ class ChatProvider:
         raise ResponseFormatError("OpenAI-compatible message content was invalid.")
 
     def _extract_anthropic_text(self, response: Any) -> str:
-        if not isinstance(response, dict):
-            raise ResponseFormatError("Anthropic response was not a JSON object.")
-
-        content = response.get("content", [])
-        if not isinstance(content, list) or not content:
-            raise ResponseFormatError("Anthropic response had no content.")
-
-        item = content[0]
-        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
-            raise ResponseFormatError("Anthropic response content was invalid.")
-        return str(item["text"])
+        return self._parse_anthropic_turn(response).text
 
     def _extract_google_text(self, response: Any) -> str:
-        if not isinstance(response, dict):
-            raise ResponseFormatError("Google response was not a JSON object.")
-
-        candidates = response.get("candidates", [])
-        if not isinstance(candidates, list) or not candidates:
-            raise ResponseFormatError("Google response had no candidates.")
-
-        content = candidates[0].get("content", {})
-        if not isinstance(content, dict):
-            raise ResponseFormatError("Google candidate content was invalid.")
-
-        parts = content.get("parts", [])
-        if not isinstance(parts, list):
-            raise ResponseFormatError("Google candidate parts were invalid.")
-
-        return "".join(
-            str(part.get("text", "")) for part in parts if isinstance(part, dict)
-        )
+        return self._parse_google_turn(response).text
 
     def _extract_usage(self, response: Any) -> dict[str, Any] | None:
         if not isinstance(response, dict):
@@ -2733,9 +2793,17 @@ class ChatProvider:
             message = event.get("message")
             if isinstance(message, str) and message:
                 return message
-            return json.dumps(event, ensure_ascii=True)
+            response = event.get("response")
+            if isinstance(response, dict):
+                details = response.get("incomplete_details")
+                if (
+                    isinstance(details, dict)
+                    and details.get("reason") == "max_output_tokens"
+                ):
+                    return "The response exceeded its output token limit. Shorten the prompt or requested answer."
+            return "The provider did not complete the response successfully."
 
-        return str(event)
+        return "The provider stream failed."
 
     def _response_id(self, response: dict[str, Any] | None) -> str | None:
         if response is None:

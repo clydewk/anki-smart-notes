@@ -17,13 +17,18 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+import src.prompts
+from src.prompts import add_or_update_prompts, get_prompt_fields, interpolate_prompt
 from tests.mocks import MockConfig, MockNote
 
 if TYPE_CHECKING:
+    from anki.decks import DeckId
+    from anki.notes import Note
+
     from src.models import (
         OverridableChatOptions,
         OverridableImageOptions,
@@ -35,7 +40,6 @@ if TYPE_CHECKING:
 def setup_prompts_config(
     monkeypatch: pytest.MonkeyPatch, allow_empty_fields: bool = False
 ) -> None:
-    import src.prompts
 
     monkeypatch.setattr(
         src.prompts,
@@ -61,7 +65,6 @@ def setup_prompts_config(
     ],
 )
 def test_get_prompt_fields(prompt: str, expected: list[str]) -> None:
-    from src.prompts import get_prompt_fields
 
     assert get_prompt_fields(prompt) == expected
 
@@ -75,7 +78,6 @@ def test_get_prompt_fields(prompt: str, expected: list[str]) -> None:
     ],
 )
 def test_get_prompt_fields_no_lower(prompt: str, expected: list[str]) -> None:
-    from src.prompts import get_prompt_fields
 
     assert get_prompt_fields(prompt, lower=False) == expected
 
@@ -131,26 +133,24 @@ def test_interpolate_prompt(
     prompt: str,
     note_data: dict[str, str],
     allow_empty_fields: bool,
-    expected: Optional[str],
+    expected: str | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.prompts import interpolate_prompt
 
     setup_prompts_config(monkeypatch, allow_empty_fields=allow_empty_fields)
 
     note = MockNote(note_type="Basic", data=note_data)
-    assert interpolate_prompt(prompt, note) == expected
+    assert interpolate_prompt(prompt, cast("Note", note)) == expected
 
 
 def test_add_or_update_prompts_persists_chat_use_tools() -> None:
-    from src.prompts import add_or_update_prompts
 
     prompts_map = cast("PromptMap", {"note_types": {}})
 
     updated = add_or_update_prompts(
         prompts_map=prompts_map,
         note_type="Basic",
-        deck_id=1,
+        deck_id=cast("DeckId", 1),
         field="Back",
         prompt="Use {{Front}}",
         is_automatic=True,
@@ -176,7 +176,6 @@ def test_add_or_update_prompts_persists_chat_use_tools() -> None:
 
 
 def test_tts_language_is_independent_of_voice_pool_override() -> None:
-    from src.prompts import add_or_update_prompts
 
     pool = [
         {
@@ -190,7 +189,7 @@ def test_tts_language_is_independent_of_voice_pool_override() -> None:
     updated = add_or_update_prompts(
         prompts_map=cast("PromptMap", {"note_types": {}}),
         note_type="Basic",
-        deck_id=1,
+        deck_id=cast("DeckId", 1),
         field="Audio",
         prompt="{{Front}}",
         is_automatic=True,
@@ -219,7 +218,7 @@ def test_tts_language_is_independent_of_voice_pool_override() -> None:
     overridden = add_or_update_prompts(
         prompts_map=cast("PromptMap", {"note_types": {}}),
         note_type="Basic",
-        deck_id=1,
+        deck_id=cast("DeckId", 1),
         field="Audio",
         prompt="{{Front}}",
         is_automatic=True,

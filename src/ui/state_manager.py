@@ -22,8 +22,6 @@ from typing import Any, Generic, TypeVar
 
 from aqt import QObject, pyqtSignal
 
-from ..logger import logger
-
 T = TypeVar("T")
 
 
@@ -48,18 +46,17 @@ class StateManager(QObject, Generic[T]):
         if self.updating:
             return
         self.updating = True
-        new_state = deepcopy(self._state)
-        for key, value in updates.items():
-            assert key in new_state  # type: ignore
-            new_state[key] = value  # type: ignore
+        try:
+            new_state = deepcopy(self._state)
+            for key, value in updates.items():
+                assert key in new_state  # type: ignore
+                new_state[key] = value  # type: ignore
 
-        if new_state != self._state:
-            self._state = new_state
-            logger.debug("Updating state from slice")
-            logger.debug(updates)
-            self.state_changed.emit(new_state)
-
-        self.updating = False
+            if new_state != self._state:
+                self._state = new_state
+                self.state_changed.emit(new_state)
+        finally:
+            self.updating = False
 
     def bind(
         self, widget: Any

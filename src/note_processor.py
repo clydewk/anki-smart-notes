@@ -24,10 +24,12 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from graphlib import TopologicalSorter
 from typing import TYPE_CHECKING
 
+from anki.errors import NotFoundError
 from aqt import mw
-from aqt.qt import QDialog, QLabel, QProgressBar, QPushButton, Qt, QVBoxLayout
+from aqt.qt import QDialog, QLabel, QProgressBar, QPushButton, Qt, QVBoxLayout, QWidget
 
 from .chat_provider import text_initial_window, text_transport_key
 from .chat_usage import (
@@ -39,12 +41,12 @@ from .chat_usage import (
 )
 from .collection_ops import mutate_collection, query_collection
 from .config import Config, bump_usage_counter, key_or_config_val
-from .dag import generate_fields_dag
-from .logger import logger
+from .dag import GenerationMode, generate_fields_dag
+from .job_context import JobCancelledError
+from .logger import RedactingFormatter, logger, redact_text
 from .models import (
     DEFAULT_EXTRAS,
     ChatModels,
-    ChatProviders,
     OpenAIReasoningEffort,
 )
 from .notes import get_note_type
@@ -60,6 +62,7 @@ from .provider_runtime import (
     provider_runtime,
 )
 from .sentry import run_async_in_background_with_sentry
+from .settings import resolve_field_settings
 from .ui.ui_utils import show_message_box
 from .utils import run_on_main
 
@@ -68,6 +71,7 @@ if TYPE_CHECKING:
     from typing import Any
 
     from anki.cards import Card, CardId
+    from anki.collection import OpChanges
     from anki.decks import DeckId
     from anki.notes import Note, NoteId
 
@@ -95,6 +99,7 @@ class NoteSnapshot:
     note_type: str
     field_order: tuple[str, ...]
     fields: dict[str, str]
+    note_type_id: int | None = None
 
     def lower_values(self) -> dict[str, str]:
         return {field.lower(): value for field, value in self.fields.items()}
@@ -121,6 +126,8 @@ class ProcessedNote:
     updates: dict[str, str]
     media: list[PendingMedia]
     field_failures: list[FieldFailureDetail]
+    note_type_id: int | None = None
+    field_order: tuple[str, ...] = ()
 
     @property
     def did_update(self) -> bool:
@@ -131,11 +138,11 @@ class ProcessedNote:
         return [field.lower() for field in self.updates]
 
 
-@dataclass(frozen=True)
+@dataclass
 class CommitResult:
     committed: list[NoteId]
     conflicted: list[NoteId]
-    changes: Any
+    changes: OpChanges
 
 
 @dataclass
@@ -181,9 +188,9 @@ class ListHandler(logging.Handler):
         super().__init__()
         self.logs = []
 
-    def emit(self, record):
+    def emit(self, record: logging.LogRecord) -> None:
         try:
-            msg = self.format(record)
+            msg = redact_text(self.format(record))
             self.logs.append(msg)
         except Exception:
             self.handleError(record)
@@ -209,11 +216,17 @@ def snapshot_note(
         note_type=note_type,
         field_order=tuple(fields),
         fields=fields,
+        note_type_id=note.mid,
     )
 
 
 def snapshot_cards(collection: Any, card_ids: Sequence[CardId]) -> list[NoteSnapshot]:
-    cards = [collection.get_card(card_id) for card_id in card_ids]
+    cards = []
+    for card_id in card_ids:
+        try:
+            cards.append(collection.get_card(card_id))
+        except NotFoundError:
+            logger.info("Skipped deleted card %s", card_id)
     unique_cards = {card.nid: card for card in cards}.values()
     return [
         snapshot_note(
@@ -223,6 +236,33 @@ def snapshot_cards(collection: Any, card_ids: Sequence[CardId]) -> list[NoteSnap
         )
         for card in unique_cards
     ]
+
+
+def note_matches_result(note: Note, result: ProcessedNote) -> bool:
+    if note.id != result.note_id:
+        return False
+    if result.note_type_id is not None and note.mid != result.note_type_id:
+        return False
+    if result.field_order and tuple(note.keys()) != result.field_order:
+        return False
+    try:
+        return all(
+            str(note[name] or "") == value
+            for name, value in result.original_values.items()
+        )
+    except KeyError:
+        return False
+
+
+def apply_note_result(collection: Any, note: Note, result: ProcessedNote) -> None:
+    written_media = {
+        media.filename: collection.media.write_data(media.filename, media.data)
+        for media in result.media
+    }
+    for name, value in result.updates.items():
+        for requested, actual in written_media.items():
+            value = value.replace(requested, actual)
+        note[name] = value
 
 
 def commit_processed_notes(
@@ -235,30 +275,18 @@ def commit_processed_notes(
     conflicted: list[NoteId] = []
 
     for result in results:
-        note = collection.get_note(result.note_id)
-        try:
-            unchanged = all(
-                str(note[field] or "") == original
-                for field, original in result.original_values.items()
-            )
-        except KeyError:
-            unchanged = False
-
-        if not unchanged:
+        if not result.note_id:
             conflicted.append(result.note_id)
             continue
-
-        written_media = {
-            pending_media.filename: collection.media.write_data(
-                pending_media.filename,
-                pending_media.data,
-            )
-            for pending_media in result.media
-        }
-        for field, value in result.updates.items():
-            for requested_filename, written_filename in written_media.items():
-                value = value.replace(requested_filename, written_filename)
-            note[field] = value
+        try:
+            note = collection.get_note(result.note_id)
+        except NotFoundError:
+            conflicted.append(result.note_id)
+            continue
+        if not note_matches_result(note, result):
+            conflicted.append(result.note_id)
+            continue
+        apply_note_result(collection, note, result)
 
         notes.append(note)
         committed.append(result.note_id)
@@ -407,22 +435,19 @@ class NoteProcessor:
             values=values,
             overwrite_fields=overwrite_fields,
             deck_id=snapshot.deck_id,
+            mode="batch",
         )
         if not dag:
             return []
 
-        pending_inputs = {
+        graph = {
             field: {in_node.field for in_node in node.in_nodes}
             for field, node in dag.items()
         }
-        ready_fields = [
-            field for field, in_fields in pending_inputs.items() if not in_fields
-        ]
         simulated_values = values.copy()
         estimated_requests: list[EstimatedOpenAIRequest] = []
 
-        while ready_fields:
-            field = ready_fields.pop(0)
+        for field in TopologicalSorter(graph).static_order():
             node = dag[field]
 
             if not self.should_skip_node_for_estimate(node, simulated_values):
@@ -446,11 +471,6 @@ class NoteProcessor:
                         node=node,
                         prompt=node.input,
                     )
-
-            for out_node in node.out_nodes:
-                pending_inputs[out_node.field].discard(node.field)
-                if not pending_inputs[out_node.field]:
-                    ready_fields.append(out_node.field)
 
         return estimated_requests
 
@@ -485,15 +505,16 @@ class NoteProcessor:
             )
             or DEFAULT_EXTRAS
         )
-        chat_provider: ChatProviders = key_or_config_val(extras, "chat_provider")
+        settings = resolve_field_settings(self.config.snapshot(), extras)
+        chat_provider = str(settings["chat_provider"])
         if chat_provider != "openai":
             return None
 
-        chat_model: ChatModels = key_or_config_val(extras, "chat_model")
+        chat_model: ChatModels = key_or_config_val(settings, "chat_model")
         chat_reasoning_effort: OpenAIReasoningEffort | None = key_or_config_val(
-            extras, "chat_reasoning_effort"
+            settings, "chat_reasoning_effort"
         )
-        use_tools: bool = key_or_config_val(extras, "chat_use_tools")
+        use_tools: bool = key_or_config_val(settings, "chat_use_tools")
         prompt_key = build_prompt_usage_key(
             note_type=note_type,
             deck_id=int(node.deck_id),
@@ -545,12 +566,13 @@ class NoteProcessor:
             )
             or DEFAULT_EXTRAS
         )
-        chat_provider: ChatProviders = key_or_config_val(extras, "chat_provider")
-        chat_model: ChatModels = key_or_config_val(extras, "chat_model")
+        settings = resolve_field_settings(self.config.snapshot(), extras)
+        chat_provider = str(settings["chat_provider"])
+        chat_model: ChatModels = key_or_config_val(settings, "chat_model")
         chat_reasoning_effort: OpenAIReasoningEffort | None = key_or_config_val(
-            extras, "chat_reasoning_effort"
+            settings, "chat_reasoning_effort"
         )
-        use_tools: bool = key_or_config_val(extras, "chat_use_tools")
+        use_tools: bool = key_or_config_val(settings, "chat_use_tools")
         prompt_signature = build_prompt_usage_signature(
             prompt=prompt,
             provider=str(chat_provider),
@@ -593,7 +615,11 @@ class NoteProcessor:
         if not mw or not mw.col or not self._assert_preconditions():
             return
 
-        bump_usage_counter()
+        try:
+            bump_usage_counter()
+        except Exception:
+            self._release_request()
+            raise
         requested_card_ids = tuple(card_ids)
         total_notes = len(requested_card_ids)
         cancel_event = threading.Event()
@@ -615,25 +641,24 @@ class NoteProcessor:
         log_handler = ListHandler() if self.config.debug else None
         if log_handler:
             log_handler.setFormatter(
-                logging.Formatter("%(asctime)s - %(name)s - %(message)s")
+                RedactingFormatter("%(asctime)s - %(name)s - %(message)s")
             )
             logger.addHandler(log_handler)
 
         def finish() -> None:
+            chat_usage_tracker.close_scope(usage_scope_id)
             if log_handler:
                 logger.removeHandler(log_handler)
             progress.close()
             self._release_request()
 
         def wrapped_on_success(stats: BatchStatistics) -> None:
-            finish()
             if on_success:
                 on_success(stats)
 
         def on_failure(error: Exception) -> None:
-            chat_usage_tracker.close_scope(usage_scope_id)
-            finish()
-            show_message_box(f"Error: {error}")
+            if not isinstance(error, JobCancelledError):
+                show_message_box(f"Error: {error}")
 
         def update_progress(processed_count: int, finished: bool = False) -> None:
             progress.set_value(processed_count)
@@ -670,7 +695,7 @@ class NoteProcessor:
 
             async def commit_chunk(results: list[ProcessedNote]) -> None:
                 nonlocal commit_count
-                if not results:
+                if not results or cancel_event.is_set():
                     return
 
                 outcome = await mutate_collection(
@@ -700,6 +725,7 @@ class NoteProcessor:
                             snapshot,
                             overwrite_fields=overwrite_fields,
                             usage_scope_id=usage_scope_id,
+                            mode="batch",
                         ),
                     )
                 except Exception as error:
@@ -721,57 +747,56 @@ class NoteProcessor:
                         return
                     active_tasks.add(asyncio.create_task(worker(snapshot)))
 
-            schedule_more()
-            while active_tasks:
-                done, pending = await asyncio.wait(
-                    active_tasks,
-                    timeout=0.1,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                active_tasks = set(pending)
-
-                for completed_task in done:
-                    note_id, status = completed_task.result()
-                    processed_count += 1
-
-                    if isinstance(status, Exception):
-                        failed[note_id] = describe_exception(status)
-                        logger.error(
-                            "Error processing note %s: %s",
-                            note_id,
-                            failed[note_id],
-                        )
-                    elif status.did_update:
-                        update_buffer.append(status)
-                    elif status.field_failures:
-                        blocked[note_id] = status.field_failures
-                    else:
-                        unchanged.append(note_id)
-
-                    if len(update_buffer) >= COMMIT_CHUNK_SIZE:
-                        chunk = update_buffer[:COMMIT_CHUNK_SIZE]
-                        del update_buffer[:COMMIT_CHUNK_SIZE]
-                        await commit_chunk(chunk)
-
-                    run_on_main(lambda count=processed_count: update_progress(count))
-
-                if cancel_event.is_set():
-                    for active_task in active_tasks:
-                        active_task.cancel()
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*active_tasks, return_exceptions=True),
-                            timeout=5.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "Some tasks did not cancel cleanly within timeout"
-                        )
-                    break
-
+            try:
                 schedule_more()
+                while active_tasks:
+                    done, pending = await asyncio.wait(
+                        active_tasks,
+                        timeout=0.1,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    active_tasks = set(pending)
 
-            await commit_chunk(update_buffer)
+                    for completed_task in done:
+                        note_id, status = completed_task.result()
+                        processed_count += 1
+
+                        if isinstance(status, Exception):
+                            failed[note_id] = describe_exception(status)
+                            logger.error(
+                                "Error processing note %s: %s",
+                                note_id,
+                                failed[note_id],
+                            )
+                        elif status.did_update:
+                            update_buffer.append(status)
+                        elif status.field_failures:
+                            blocked[note_id] = status.field_failures
+                        else:
+                            unchanged.append(note_id)
+
+                        if len(update_buffer) >= COMMIT_CHUNK_SIZE:
+                            chunk = update_buffer[:COMMIT_CHUNK_SIZE]
+                            del update_buffer[:COMMIT_CHUNK_SIZE]
+                            await commit_chunk(chunk)
+
+                        run_on_main(
+                            lambda count=processed_count: update_progress(count)
+                        )
+
+                    if cancel_event.is_set():
+                        break
+
+                    schedule_more()
+
+            finally:
+                for task in active_tasks:
+                    task.cancel()
+                if active_tasks:
+                    await asyncio.wait(active_tasks, timeout=2.0)
+
+            if not cancel_event.is_set():
+                await commit_chunk(update_buffer)
             run_on_main(lambda count=processed_count: update_progress(count, True))
 
             return BatchStatistics(
@@ -792,7 +817,9 @@ class NoteProcessor:
             )
 
         try:
-            run_async_in_background_with_sentry(op, wrapped_on_success, on_failure)
+            run_async_in_background_with_sentry(
+                op, wrapped_on_success, on_failure, on_finished=finish
+            )
         except Exception:
             chat_usage_tracker.close_scope(usage_scope_id)
             finish()
@@ -807,13 +834,21 @@ class NoteProcessor:
         on_failure: Callable[[Exception], None] | None = None,
         target_field: str | None = None,
         on_field_update: Callable[[], None] | None = None,
+        editor_alive: Callable[[], bool] | None = None,
+        editor_owner: QWidget | None = None,
+        mode: GenerationMode = "manual",
     ) -> None:
         """Process one detached snapshot and commit it through the collection worker."""
         if not self._assert_preconditions():
             return
 
-        deck_name = mw.col.decks.name(card.did) if mw and mw.col else None
-        snapshot = snapshot_note(card.note(), card.did, deck_name)
+        try:
+            deck_name = mw.col.decks.name(card.did) if mw and mw.col else None
+            editor_note = card.note()
+            snapshot = snapshot_note(editor_note, card.did, deck_name)
+        except Exception:
+            self._release_request()
+            raise
         if show_progress and mw:
             mw.progress.start(label="✨ Generating...", immediate=True)
 
@@ -822,21 +857,26 @@ class NoteProcessor:
         ) -> None:
             processed, committed = result
             did_update = bool(committed and committed.committed)
+            if not processed.note_id and processed.did_update:
+                if editor_alive is None or not editor_alive():
+                    return
+                if mw and mw.col and note_matches_result(editor_note, processed):
+                    apply_note_result(mw.col, editor_note, processed)
+                    did_update = True
             if committed and committed.conflicted:
                 logger.info("Skipped note %s because it changed", processed.note_id)
             if on_field_update and did_update:
                 on_field_update()
-            if show_progress and mw:
-                mw.progress.finish()
-
-            self._release_request()
             on_success(did_update)
 
-        def wrapped_failure(error: Exception) -> None:
+        def finish() -> None:
             if show_progress and mw:
                 mw.progress.finish()
-            self._handle_failure(error)
             self._release_request()
+
+        def wrapped_failure(error: Exception) -> None:
+            if not isinstance(error, JobCancelledError):
+                self._handle_failure(error)
             if on_failure:
                 on_failure(error)
 
@@ -846,15 +886,27 @@ class NoteProcessor:
                 overwrite_fields=overwrite_fields,
                 target_field=target_field,
                 usage_scope_id=None,
+                mode=mode,
             )
             committed = None
-            if result.did_update:
+            if result.did_update and result.note_id:
                 committed = await mutate_collection(
                     lambda collection: commit_processed_notes(collection, [result])
                 )
             return result, committed
 
-        run_async_in_background_with_sentry(op, wrapped_on_success, wrapped_failure)
+        try:
+            run_async_in_background_with_sentry(
+                op,
+                wrapped_on_success,
+                wrapped_failure,
+                owner_alive=editor_alive,
+                owner=editor_owner,
+                on_finished=finish,
+            )
+        except Exception:
+            finish()
+            raise
 
     async def _process_note(
         self,
@@ -862,6 +914,7 @@ class NoteProcessor:
         overwrite_fields: bool = False,
         target_field: str | None = None,
         usage_scope_id: str | None = None,
+        mode: GenerationMode = "manual",
     ) -> ProcessedNote:
         """Generate field and media updates from a detached note snapshot."""
         values = snapshot.lower_values()
@@ -886,6 +939,7 @@ class NoteProcessor:
             target_field=target_field,
             overwrite_fields=overwrite_fields,
             deck_id=snapshot.deck_id,
+            mode=mode,
         )
         canonical_fields = {field.lower(): field for field in snapshot.field_order}
         relevant_fields = set(dag)
@@ -901,8 +955,33 @@ class NoteProcessor:
         media: list[PendingMedia] = []
         field_failures: list[FieldFailureDetail] = []
 
-        while dag:
-            next_batch = [node for node in dag.values() if not node.in_nodes]
+        sorter = TopologicalSorter(
+            {
+                field: {parent.field for parent in node.in_nodes}
+                for field, node in dag.items()
+            }
+        )
+        sorter.prepare()
+        blocked: set[str] = set()
+        while sorter.is_active():
+            ready = sorter.get_ready()
+            next_batch = [dag[field] for field in ready]
+            for node in next_batch:
+                missing = set(get_prompt_fields(node.input)) - set(values)
+                failed_dependencies = {
+                    parent.field for parent in node.in_nodes
+                } & blocked
+                if missing or failed_dependencies:
+                    blocked.add(node.field)
+                    node.abort = True
+                    node.outcome = "blocked"
+                    field_failures.append(
+                        FieldFailureDetail(
+                            node.field,
+                            "Missing or failed dependencies: "
+                            + ", ".join(sorted(missing | failed_dependencies)),
+                        )
+                    )
             logger.debug("Processing next nodes: %s", [n.field for n in next_batch])
             batch_tasks = {
                 node.field: self._process_node(
@@ -919,8 +998,10 @@ class NoteProcessor:
                 return_exceptions=True,
             )
 
-            for field, response in zip(batch_tasks, responses):
+            for field, response in zip(batch_tasks, responses, strict=True):
                 node = dag[field]
+                if isinstance(response, asyncio.CancelledError):
+                    raise response
                 if isinstance(response, BaseException):
                     failure_detail = FieldFailureDetail(
                         field=field,
@@ -936,12 +1017,21 @@ class NoteProcessor:
                         failure_detail.summary(),
                     )
                     node.abort = True
-                    for out_node in node.out_nodes:
-                        out_node.in_nodes.remove(node)
-                        out_node.abort = True
-                    dag.pop(field)
+                    node.outcome = "failed"
+                    blocked.add(field)
+                    sorter.done(field)
                     continue
 
+                if node.abort:
+                    if field not in blocked:
+                        field_failures.append(
+                            FieldFailureDetail(
+                                field,
+                                "Generation was blocked: no usable input or response.",
+                            )
+                        )
+                    blocked.add(field)
+                    node.outcome = "blocked"
                 if response.value is not None:
                     values[node.field] = response.value
                 if node.did_update and response.value is not None:
@@ -949,9 +1039,7 @@ class NoteProcessor:
                     if response.media:
                         media.append(response.media)
 
-                for out_node in node.out_nodes:
-                    out_node.in_nodes.remove(node)
-                dag.pop(field)
+                sorter.done(field)
 
         return ProcessedNote(
             note_id=snapshot.note_id,
@@ -959,6 +1047,8 @@ class NoteProcessor:
             updates=updates,
             media=media,
             field_failures=field_failures,
+            note_type_id=snapshot.note_type_id,
+            field_order=snapshot.field_order,
         )
 
     def _handle_failure(self, e: Exception) -> None:
@@ -1038,8 +1128,12 @@ class NoteProcessor:
                 show_error_box=show_error_message_box,
                 usage_scope_id=usage_scope_id,
             )
-            if result.value:
+            if result.value is None:
+                node.abort = True
+                node.outcome = "blocked"
+            elif result.value != value or result.media is not None:
                 node.did_update = True
+                node.outcome = "successful"
             return result
         except Exception:
             status = "failed"

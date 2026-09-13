@@ -17,24 +17,48 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Optional
+from __future__ import annotations
 
-from aqt import QFont, QFormLayout, QMessageBox, QPushButton, Qt
+from typing import TYPE_CHECKING
+
+from PyQt6 import sip
+
+from ..logger import redact_text
+
+if TYPE_CHECKING:
+    from anki.notes import Note
+    from aqt.editor import Editor
+
+from aqt import (
+    QDialog,
+    QFont,
+    QFormLayout,
+    QLabel,
+    QLayout,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    Qt,
+    QWidget,
+    mw,
+)
+from aqt.utils import restoreGeom, saveGeom
 
 
 def show_message_box(
     message: str,
-    details: Optional[str] = None,
-    custom_ok: Optional[str] = None,
+    details: str | None = None,
+    custom_ok: str | None = None,
     show_cancel: bool = False,
-    copy_button_text: Optional[str] = None,
-    copy_button_content: Optional[str] = None,
+    copy_button_text: str | None = None,
+    copy_button_content: str | None = None,
 ):
     msg = QMessageBox()
-    msg.setText(message)
+    msg.setText(redact_text(message))
 
     if details:
-        msg.setInformativeText(details)
+        msg.setInformativeText(redact_text(details))
 
     ok_button = None
     if custom_ok:
@@ -57,10 +81,9 @@ def show_message_box(
 
     if clicked_button == copy_button:
         # Copy to clipboard
-        from aqt import mw
 
-        if mw:
-            mw.app.clipboard().setText(copy_button_content)
+        if mw and (clipboard := mw.app.clipboard()) is not None:
+            clipboard.setText(copy_button_content)
         return False
 
     return clicked_button == ok_button or val == QMessageBox.StandardButton.Ok
@@ -70,18 +93,59 @@ def default_form_layout() -> QFormLayout:
     form = QFormLayout()
     form.setVerticalSpacing(12)
     form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-    form.setFormAlignment(Qt.AlignmentFlag.AlignLeft)
+    form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
     return form
 
 
 # UI constants
 font_small = QFont()
-font_small.setPointSize(10)
 
 font_large = QFont()
-font_large.setPointSize(16)
 font_large.setBold(True)
 
 font_bold = QFont()
 font_bold.setBold(True)
-font_bold.setPointSize(12)
+
+
+def editor_is_current(editor: Editor, note: Note) -> bool:
+    return bool(editor.web and not sip.isdeleted(editor.web) and editor.note is note)
+
+
+def scroll_page(widget: QWidget) -> QScrollArea:
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+    scroll.setWidget(widget)
+    for label in widget.findChildren(QLabel):
+        label.setWordWrap(True)
+        policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        policy.setHeightForWidth(True)
+        label.setSizePolicy(policy)
+    layout = widget.layout()
+    if layout is not None:
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+    return scroll
+
+
+def bound_dialog(dialog: QDialog) -> None:
+    display = dialog.screen()
+    if display is None:
+        return
+    screen = display.availableGeometry()
+    dialog.setMinimumSize(min(600, screen.width()), min(400, screen.height()))
+    layout = dialog.layout()
+    if layout is not None:
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+    dialog.resize(min(800, screen.width()), min(650, screen.height()))
+    if mw and mw.pm.profile is not None:
+        profile = mw.pm.profile
+        key = f"smart_notes_{type(dialog).__name__}"
+        restoreGeom(dialog, key)
+        dialog.finished.connect(
+            lambda _: saveGeom(dialog, key) if mw and mw.pm.profile is profile else None
+        )
+    dialog.resize(
+        min(dialog.width(), screen.width()), min(dialog.height(), screen.height())
+    )

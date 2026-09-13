@@ -17,8 +17,6 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Optional
-
 from anki.cards import Card
 from anki.decks import DeckId
 from anki.notes import Note
@@ -72,7 +70,7 @@ def is_card_fully_processed(card: Card) -> bool:
     return True
 
 
-def get_field_from_index(note: Note, index: int) -> Optional[str]:
+def get_field_from_index(note: Note, index: int) -> str | None:
     """Gets the field name from the index of a note."""
     fields = get_fields(get_note_type(note))
     if index < 0 or index >= len(fields):
@@ -81,7 +79,7 @@ def get_field_from_index(note: Note, index: int) -> Optional[str]:
 
 
 # TODO: make this work with get_field_from_index, taking in a field name
-def is_ai_field(current_field_num: Optional[int], card: Card) -> Optional[str]:
+def is_ai_field(current_field_num: int | None, card: Card) -> str | None:
     """Helper to determine if the current field is an AI field. Returns the non-lowercased field name if it is."""
     if not card:
         return None
@@ -92,7 +90,7 @@ def is_ai_field(current_field_num: Optional[int], card: Card) -> Optional[str]:
     sorted_fields_lower = [field.lower() for field in sorted_fields]
 
     # SNEAKY: current_field_num can be 0
-    if current_field_num is None:
+    if current_field_num is None or not 0 <= current_field_num < len(sorted_fields):
         return None
 
     current_field = sorted_fields_lower[current_field_num]
@@ -106,7 +104,7 @@ def is_ai_field(current_field_num: Optional[int], card: Card) -> Optional[str]:
     return sorted_fields[current_field_num] if is_ai else None
 
 
-def get_random_note(note_type: str, deck_id: DeckId) -> Optional[Note]:
+def get_random_note(note_type: str, deck_id: DeckId) -> Note | None:
     if not mw or not mw.col:
         return None
 
@@ -132,8 +130,8 @@ def get_random_note(note_type: str, deck_id: DeckId) -> Optional[Note]:
 def get_valid_fields_for_prompt(
     selected_note_type: str,
     deck_id: DeckId,
-    selected_note_field: Optional[str] = None,
-    prompts_map: Optional[PromptMap] = None,
+    selected_note_field: str | None = None,
+    prompts_map: PromptMap | None = None,
 ) -> list[str]:
     """Gets all fields excluding the selected one, if one is selected"""
     fields = get_fields(selected_note_type)

@@ -17,26 +17,63 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from aqt import gui_hooks, mw, sound
+from contextlib import suppress
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .logger import logger
+from anki.sound import SoundOrVideoTag
+from anki.utils import tmpfile
+from aqt import gui_hooks, sound
+
+if TYPE_CHECKING:
+    from anki.sound import AVTag
+    from aqt.sound import Player
+
+preview_path: Path | None = None
+preview_playing = False
 
 
-def play_audio(audio: bytes):
-    logger.debug("Successfully got audio!")
-    if not mw or not mw.col or not mw.col.media:
-        logger.error("No mw")
+def clear_audio_preview(*, stop: bool = True) -> None:
+    global preview_path, preview_playing
+    path, preview_path = preview_path, None
+    preview_playing = False
+    if path is None:
         return
+    if stop:
+        sound.av_player.stop_and_clear_queue_if_caller(path)
+    # Anki's temporary directory also cleans up files still held open on Windows.
+    with suppress(OSError):
+        path.unlink(missing_ok=True)
 
-    path = mw.col.media.write_data("smart-notes-test", audio)
 
-    def on_end(_):
-        if not mw or not mw.col or not mw.col.media:
-            logger.error("No mw")
-            return
-        logger.debug("Finished playing audio, cleaning up file")
-        mw.col.media.trash_files([path])
-        gui_hooks.av_player_did_end_playing.remove(on_end)
+def audio_preview_did_begin(player: "Player", tag: "AVTag") -> None:
+    global preview_playing
+    if preview_path is None:
+        return
+    if isinstance(tag, SoundOrVideoTag) and tag.filename == str(preview_path):
+        preview_playing = True
+    elif preview_playing:
+        clear_audio_preview(stop=False)
 
-    gui_hooks.av_player_did_end_playing.append(on_end)
-    sound.av_player.play_file(path)
+
+def audio_preview_did_end(player: "Player | None") -> None:
+    if preview_playing:
+        clear_audio_preview(stop=False)
+
+
+def play_audio(audio: bytes) -> None:
+    global preview_path
+    clear_audio_preview()
+    suffix = ".wav" if audio[:4] == b"RIFF" and audio[8:12] == b"WAVE" else ".mp3"
+    preview_path = Path(tmpfile(prefix="smart-notes-preview-", suffix=suffix))
+    try:
+        preview_path.write_bytes(audio)
+        sound.av_player.play_file_with_caller(str(preview_path), preview_path)
+    except Exception:
+        clear_audio_preview()
+        raise
+
+
+gui_hooks.av_player_did_begin_playing.append(audio_preview_did_begin)
+gui_hooks.av_player_did_end_playing.append(audio_preview_did_end)
+gui_hooks.profile_will_close.append(clear_audio_preview)

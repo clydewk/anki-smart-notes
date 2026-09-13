@@ -21,9 +21,10 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from typing import Any, Optional
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from src.provider_runtime import (
@@ -31,11 +32,13 @@ from src.provider_runtime import (
     ProviderRuntime,
     ProviderTimeoutError,
     ProviderUnavailableError,
+    RequestAccounting,
     RequestTimeouts,
     TrafficController,
     extract_provider_error_detail,
     format_provider_http_error_for_log,
     parse_google_retry_delay,
+    request_accounting,
 )
 
 
@@ -205,9 +208,9 @@ async def test_stream_idle_timeout_reports_last_event_type(
 
         async def __aexit__(
             self,
-            exc_type: Optional[type[BaseException]],
-            exc: Optional[BaseException],
-            tb: Optional[Any],
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: Any | None,
         ) -> None:
             del exc_type, exc, tb
             return None
@@ -572,3 +575,93 @@ async def test_handle_timeout_error_does_not_retry_custom_read_idle_timeout(
     assert log_call.args[1:6] == ("Compat", "compat-model", 1, 3, "no")
     assert "phase=read_idle" in log_call.args[6]
     assert "timeout=30s" in log_call.args[6]
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_tracks_dispatch_and_releases_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = ProviderRuntime()
+    accounting = RequestAccounting()
+    token = request_accounting.set(accounting)
+    client = AsyncMock()
+    entered = asyncio.Event()
+
+    async def request(**kwargs: Any) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    client.request.side_effect = request
+    monkeypatch.setattr(runtime, "get_http_client", AsyncMock(return_value=client))
+    controller = runtime.controller("test", 1)
+
+    async def perform() -> bytes:
+        return await runtime.request_bytes(
+            key="test",
+            initial_window=1,
+            method="POST",
+            url="https://example.com",
+            provider="openai",
+            model="test",
+            timeouts=RequestTimeouts(),
+            max_retries=0,
+        )
+
+    try:
+        await controller.acquire()
+        queued = asyncio.create_task(perform())
+        await asyncio.sleep(0)
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        assert not accounting.dispatched
+        await controller.release()
+
+        dispatched = asyncio.create_task(perform())
+        await asyncio.wait_for(entered.wait(), 1)
+        dispatched.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await dispatched
+        assert accounting.dispatched
+        assert controller.snapshot()["inflight"] == 0
+    finally:
+        request_accounting.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_http_errors_preserve_reported_usage(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool
+) -> None:
+    runtime = ProviderRuntime()
+    accounting = RequestAccounting()
+    token = request_accounting.set(accounting)
+    usage = {"input_tokens": 10, "output_tokens": 20}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"message": "incomplete response"}, "usage": usage}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(runtime, "get_http_client", AsyncMock(return_value=client))
+        kwargs: dict[str, Any] = {
+            "key": "error",
+            "initial_window": 1,
+            "method": "POST",
+            "url": "https://example.com",
+            "provider": "openai",
+            "model": "test",
+            "timeouts": RequestTimeouts(),
+            "max_retries": 0,
+        }
+        try:
+            with pytest.raises(ProviderHTTPError):
+                if streaming:
+                    async for _ in runtime.stream_sse_json(**kwargs):
+                        pass
+                else:
+                    await runtime.request_json(**kwargs)
+            assert accounting.usage == usage
+        finally:
+            request_accounting.reset(token)

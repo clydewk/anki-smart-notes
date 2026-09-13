@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -eu
 
 # Copyright (C) 2024 Michael Piazza
 #
@@ -18,242 +18,134 @@ set -e
 # You should have received a copy of the GNU General Public License
 # along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
+PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd -- "$PROJECT_DIR"
+
 resolve_python () {
-  if [ -x ".venv/Scripts/python.exe" ]; then
-    echo ".venv/Scripts/python.exe"
-    return
-  fi
-
-  if [ -x ".venv/bin/python" ]; then
-    echo ".venv/bin/python"
-    return
-  fi
-
+  for executable in .venv/Scripts/python.exe .venv/bin/python; do
+    if [ -x "$executable" ]; then
+      echo "$executable"
+      return
+    fi
+  done
   if command -v python3 >/dev/null 2>&1; then
-    echo "python3"
-    return
+    echo python3
+  else
+    echo python
   fi
-
-  if command -v python >/dev/null 2>&1; then
-    echo "python"
-    return
-  fi
-
-  echo "Python executable not found" >&2
-  exit 1
 }
 
 PYTHON_CMD=$(resolve_python)
 
-vendor_deps () {
-  "$PYTHON_CMD" - <<'PY'
-from importlib.util import find_spec
+clean () {
+  "$PYTHON_CMD" - <<'PYTHON'
 from pathlib import Path
 import shutil
 
-from runtime_dependencies import REQUIRED_RUNTIME_IMPORTS
-
-target = Path("dist/vendor")
-required = list(REQUIRED_RUNTIME_IMPORTS)
-
-def copy_import(name: str) -> None:
-    spec = find_spec(name)
-    if spec is None:
-        raise SystemExit(f"Missing runtime dependency for vendoring: {name}")
-
-    if spec.submodule_search_locations:
-        source = Path(next(iter(spec.submodule_search_locations)))
-    elif spec.origin:
-        source = Path(spec.origin)
-    else:
-        raise SystemExit(f"Could not resolve vendored dependency: {name}")
-
-    destination = target / source.name
-    if destination.exists():
-        if destination.is_dir():
-            shutil.rmtree(destination)
-        else:
-            destination.unlink()
-
-    if source.is_dir():
-        shutil.copytree(source, destination)
-    else:
-        shutil.copy2(source, destination)
-
-for dependency in required:
-    copy_import(dependency)
-PY
-}
-
-strip_dist_noise () {
-  find dist -name "__pycache__" -type d -prune -exec rm -rf {} +
-  find dist/vendor \( -name "_tests" -o -name "tests" \) -type d -prune -exec rm -rf {} +
-  find dist -name "*.pyc" -delete
-  find dist/vendor -name "pytest_plugin.py" -delete
+stage = Path("dist")
+if stage.is_symlink():
+    raise SystemExit("Refusing to clean a symlinked staging directory: dist")
+if stage.exists():
+    shutil.rmtree(stage)
+PYTHON
 }
 
 build () {
-  echo "Building..."
-  rm -rf dist
-  mkdir -p dist/vendor
-
-  cp *.py dist/
-  cp manifest.json dist/
-  cp config.json dist/
-  cp -r src dist/
-  cp license dist/
-  cp changelog.md dist/
-  echo "environment = \"PROD\"" > dist/src/env.py
-
-  vendor_deps
-  strip_dist_noise
-
-  # Voices
-  cp -r eleven_voices.json dist/
-  cp -r google_voices.json dist/
-  cp -r azure_voices.json dist/
-
-  # Zip it
-  cd dist
-  zip -9 -r smart-notes.ankiaddon .
-  cd ..
-}
-
-clean () {
-  echo "Cleaning..."
-  rm -rf dist
-  rm -rf ~/Library/Application\ Support/Anki2/addons21/smart-notes
-  rm -rf ~/development/win_shared/smart-notes
-}
-
-link-dev () {
-  # Link for Mac Local Dev
-  ln -s $(pwd) ~/Library/Application\ Support/Anki2/addons21/smart-notes
-}
-
-win-dist () {
   clean
-  build
-  rm -rf ~/development/win_shared/smart-notes
-  mkdir ~/development/win_shared/smart-notes
-  # Link for Windows dev thru shared folder
-  cp -r $(pwd)/dist/* ~/development/win_shared/smart-notes
+  "$PYTHON_CMD" - <<'PYTHON'
+import json
+import re
+import shutil
+import subprocess
+import sys
+from importlib.metadata import distribution, packages_distributions
+from importlib.util import find_spec
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+from runtime_dependencies import REQUIRED_RUNTIME_IMPORTS
+
+if sys.version_info < (3, 13):
+    raise SystemExit("Building requires Python 3.13 or newer.")
+
+stage = Path("dist")
+vendor = stage / "vendor"
+vendor.mkdir(parents=True)
+
+# Only code and declared assets belong in the package, never runtime state.
+assets = (
+    "__init__.py", "runtime_dependencies.py", "manifest.json", "license",
+    "changelog.md", "eleven_voices.json", "google_voices.json", "azure_voices.json",
+)
+for source in [*(Path(name) for name in assets), *Path("src").rglob("*.py")]:
+    if source.is_symlink():
+        raise SystemExit(f"Refusing to package a symlink: {source}")
+    destination = stage / source
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+# Anki may modify config.json in a source-linked install. Read committed defaults.
+defaults = json.loads(subprocess.check_output(["git", "show", "HEAD:config.json"]))
+for key in defaults:
+    if key.endswith("_api_key") or key in {"auth_token", "uuid", "openai_endpoint"}:
+        defaults[key] = None
+for key in ("mcp_servers", "custom_providers"):
+    defaults[key] = []
+defaults["provider_settings"] = {}
+defaults["prompts_map"] = {"note_types": {}}
+(stage / "config.json").write_text(json.dumps(defaults, indent=2) + "\n", encoding="utf-8")
+
+environment = stage / "src" / "env.py"
+environment.write_text(
+    re.sub(r'environment(?:: str)? = "(?:DEV|PROD)"', 'environment: str = "PROD"', environment.read_text(encoding="utf-8")),
+    encoding="utf-8",
+)
+
+package_names = packages_distributions()
+for name in REQUIRED_RUNTIME_IMPORTS:
+    spec = find_spec(name)
+    if spec is None:
+        raise SystemExit(f"Missing runtime dependency: {name}. Install requirements.txt first.")
+    source = Path(next(iter(spec.submodule_search_locations))) if spec.submodule_search_locations else Path(spec.origin or "")
+    if source.is_dir():
+        shutil.copytree(source, vendor / source.name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests", "_tests", "pytest_plugin.py"))
+    else:
+        shutil.copy2(source, vendor / source.name)
+    # Keep package metadata and license notices with the vendored modules.
+    for package in package_names.get(name, []):
+        metadata = distribution(package)
+        for entry in metadata.files or []:
+            if ".dist-info/" in str(entry) and (entry.name in {"METADATA", "LICENSE", "COPYING"} or "/licenses/" in str(entry)):
+                destination = vendor / entry
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(metadata.locate_file(entry), destination)
+
+archive = stage / "smart-notes.ankiaddon"
+with ZipFile(archive, "w", ZIP_DEFLATED, compresslevel=9) as output:
+    for source in sorted(stage.rglob("*")):
+        if source.is_file() and source != archive:
+            output.write(source, source.relative_to(stage))
+print(f"Built {archive.resolve()}")
+PYTHON
 }
 
-# Tests a production build by symlinking dist folder
-link-dist () {
-  ln -s $(pwd)/dist ~/Library/Application\ Support/Anki2/addons21/smart-notes
-}
-
-anki () {
-   /Applications/Anki.app/Contents/MacOS/launcher
-}
-
-test-dev () {
-  clean
-  link-dev
-  anki
-}
-
-test-build () {
-  clean
-  build
-  rm -rf dist/meta.json
-  link-dist
-  # cp meta.json dist/
-  # copy the current meta to make testing easier
-  # jq '.config.auth_token = null' dist/meta.json > dist/temp.json && mv dist/temp.json dist/meta.json
-  anki
-}
-
-sentry-release () {
-  # Write some jq
-  version=$(jq '.human_version' manifest.json)
-  echo $version
-  # sentry-cli releases --org michael-piazza new --finalize ${version}
-}
-
-format () {
-  echo "Formatting code..."
-  "$PYTHON_CMD" -m ruff format .
-}
-
-lint () {
-  echo "Linting code..."
-  "$PYTHON_CMD" -m ruff check .
-}
-
-typecheck () {
-  echo "Type checking..."
-  "$PYTHON_CMD" -m pyright .
-}
-
-check () {
-  echo "Running all checks..."
-  "$PYTHON_CMD" -m ruff format . --check && "$PYTHON_CMD" -m ruff check . && "$PYTHON_CMD" -m pyright .
-}
-
-fix () {
-  echo "Fixing code issues..."
-  "$PYTHON_CMD" -m ruff format . && "$PYTHON_CMD" -m ruff check . --fix
-}
-
-version () {
-  if [ -z "$1" ]; then
-    echo "Usage: $0 <version>"
+case "${1:-}" in
+  build) build ;;
+  clean) clean ;;
+  format) "$PYTHON_CMD" -m ruff format . ;;
+  lint) "$PYTHON_CMD" -m ruff check . ;;
+  typecheck) "$PYTHON_CMD" -m pyright . ;;
+  check)
+    "$PYTHON_CMD" -m ruff format . --check
+    "$PYTHON_CMD" -m ruff check .
+    "$PYTHON_CMD" -m pyright .
+    ;;
+  fix)
+    "$PYTHON_CMD" -m ruff check . --fix
+    "$PYTHON_CMD" -m ruff format .
+    ;;
+  *)
+    echo "Usage: $0 {build|clean|format|lint|typecheck|check|fix}" >&2
     exit 1
-  fi
-
-  VERSION=$1
-
-  jq --arg version "$VERSION" '.human_version = $version' manifest.json > manifest.tmp && mv manifest.tmp manifest.json
-
-  # Commit the changes
-  git add manifest.json
-  git add changelog.md
-  git commit -m "v$VERSION"
-
-  # Create a tag
-  git tag "v$VERSION"
-
-  # Push the commit and the tag
-  git push
-  git push origin "v$VERSION"
-}
-
-
-if [ "$1" == "build" ]; then
-  clean
-  build
-elif [ "$1" == "clean" ]; then
-  clean
-elif [ "$1" == "win" ]; then
-  win-dist
-elif [ "$1" == "test-dev" ]; then
-  test-dev
-elif [ "$1" == "test-build" ]; then
-  test-build
-elif [ "$1" == "sentry-release" ]; then
-  sentry-release
-elif [ "$1" == "version" ]; then
-  version $2
-elif [ "$1" == "format" ]; then
-  format
-elif [ "$1" == "lint" ]; then
-  lint
-elif [ "$1" == "typecheck" ]; then
-  typecheck
-elif [ "$1" == "check" ]; then
-  check
-elif [ "$1" == "fix" ]; then
-  fix
-else
-  echo "Invalid argument: $1"
-  echo "Available commands: build, clean, win, test-dev, test-build, sentry-release, version, format, lint, typecheck, check, fix"
-  exit 1
-fi
-
-# Check if the last command succeeded
-if [ $? -eq 0 ]; then
-  echo "Done"
-fi
+    ;;
+esac

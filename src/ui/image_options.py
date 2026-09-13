@@ -17,12 +17,13 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import Any, Optional, TypedDict, cast
+from typing import Any, TypedDict, cast
 
-from aqt import QGroupBox, QLabel, QVBoxLayout, QWidget
+from aqt import QGroupBox, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from ..config import config, key_or_config_val
 from ..models import (
+    RETIRED_PROVIDER_MODELS,
     ImageAspectRatio,
     ImageGenerationQuality,
     ImageModels,
@@ -31,6 +32,7 @@ from ..models import (
     ImageResolution,
     OverridableImageOptionsDict,
     image_generation_qualities,
+    openai_image_size,
 )
 from .reactive_combo_box import ReactiveComboBox
 from .reactive_spin_box import ReactiveSpinBox
@@ -63,19 +65,20 @@ provider_labels = {
 model_labels = {
     "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
     "gpt-image-2.5-flare": "GPT Image 2.5 Flare",
-    "flux-schnell": "Flux Schnell (1x Image Cost)",
-    "flux-dev": "Flux Dev (8x Image Cost)",
-    "gemini-3-pro-image-preview": "Google Gemini 3 Pro (Image Preview)",
+    "flux-schnell": "Flux Schnell",
+    "flux-dev": "Flux Dev",
+    "gemini-3-pro-image": "Google Gemini 3 Pro Image",
+    "gemini-3-pro-image-preview": "Google Gemini 3 Pro Image (Unavailable)",
     "gpt-image-2": "GPT Image 2",
     "gpt-image-1.5": "GPT Image 1.5",
     "gpt-image-1": "GPT Image 1",
-    "gpt-image-1-mini": "GPT Image 1 Mini (Cost Effective)",
+    "gpt-image-1-mini": "GPT Image 1 Mini",
     "dall-e-3": "DALL·E 3 (Deprecated)",
 }
 
 provider_models: dict[ImageProviders, list[ImageModels]] = {
     "replicate": ["flux-schnell", "flux-dev"],
-    "google": ["gemini-3-pro-image-preview"],
+    "google": ["gemini-3-pro-image"],
     "openai": [
         "gpt-image-2.5-flare",
         "gpt-image-2.5-sunburst",
@@ -92,20 +95,45 @@ resolutions: list[ImageResolution] = ["1024x1024", "2048x2048", "4096x4096"]
 output_formats: list[ImageOutputFormat] = ["webp", "png", "jpeg", "avif"]
 
 format_labels = {
-    "webp": "WebP (Default)",
+    "webp": "WebP",
     "png": "PNG (Lossless)",
     "jpeg": "JPEG",
     "avif": "AVIF",
 }
 
 
+def image_output_summary(
+    provider: str,
+    model: str,
+    aspect_ratio: ImageAspectRatio,
+    resolution: ImageResolution,
+    output_format: ImageOutputFormat,
+) -> str:
+    if provider == "google":
+        preset = {"1024x1024": "1K", "2048x2048": "2K", "4096x4096": "4K"}.get(
+            resolution, resolution
+        )
+        dimensions = f"{aspect_ratio}, {preset} requested; pixel dimensions are selected by the provider"
+    elif provider == "replicate":
+        dimensions = f"{aspect_ratio}; pixel dimensions are selected by the provider"
+    else:
+        dimensions = (
+            openai_image_size(model, aspect_ratio, resolution).replace("x", " × ")
+            + " pixels requested"
+        )
+    return f"Output: {dimensions}. Saved as {output_format.upper()}."
+
+
 class ImageOptions(QWidget):
     def __init__(
-        self, image_options: Optional[OverridableImageOptionsDict] = None
+        self, image_options: OverridableImageOptionsDict | None = None
     ) -> None:
         super().__init__()
 
-        # Merge custom providers
+        self._provider_models: dict[str, list[str]] = {}
+        self._provider_labels = dict(provider_labels)
+        self._model_labels = dict(model_labels)
+        self._reset_to_base_models()
         self._inject_custom_models()
 
         # Helper to get initial value
@@ -113,20 +141,13 @@ class ImageOptions(QWidget):
             return key_or_config_val(image_options or {}, key)
 
         provider = get_val("image_provider", config.image_provider)
-        # Fallback if provider is invalid or not in map (shouldn't happen with correct config)
-        if provider not in provider_models:
-            provider = "replicate"
-
-        models = provider_models[provider]
+        available_providers = list(self._provider_models)
+        if provider not in available_providers:
+            available_providers.append(provider)
+        models = list(self._provider_models.get(provider, []))
         model = get_val("image_model", config.image_model)
-        if model not in models:
-            # Handle case where model might be a custom one
-            if provider in provider_models and model in provider_models[provider]:
-                pass  # all good
-            elif models:
-                model = models[0]
-            else:
-                model = ""  # Should not happen unless empty provider
+        if model and model not in models:
+            models.append(model)
 
         aspect_ratio = get_val("image_aspect_ratio", config.image_aspect_ratio) or "1:1"
         resolution = get_val("image_resolution", config.image_resolution) or "1024x1024"
@@ -138,9 +159,9 @@ class ImageOptions(QWidget):
         self.state = StateManager[State](
             {
                 "image_provider": provider,
-                "image_providers": list(provider_models.keys()),
+                "image_providers": cast("list[ImageProviders]", available_providers),
                 "image_model": model,
-                "image_models": models,
+                "image_models": cast("list[ImageModels]", models),
                 "image_aspect_ratio": aspect_ratio,
                 "image_aspect_ratios": aspect_ratios,
                 "image_resolution": resolution,
@@ -161,81 +182,39 @@ class ImageOptions(QWidget):
         self._on_model_change(model)
 
     def refresh_custom_providers(self) -> None:
-        # Reset to base state
         self._reset_to_base_models()
-        # Inject new custom models
         self._inject_custom_models()
-
-        # Update state
-        new_providers = list(provider_models.keys())
-        self.state.update({"image_providers": new_providers})
-
-        # Handle current provider validity
         current_provider = self.state.s["image_provider"]
-        if current_provider not in new_providers:
-            # Fallback
-            fallback = "replicate"
-            self.state.update({"image_provider": fallback})
-            self._on_provider_change(fallback)
-        else:
-            # Refresh models for current provider
-            self._on_provider_change(current_provider)
+        providers = list(self._provider_models)
+        if current_provider not in providers:
+            providers.append(current_provider)
+        self.state.update({"image_providers": providers})
+        self._on_provider_change(current_provider, preserve_current=True)
 
     def _reset_to_base_models(self) -> None:
-        # Restore provider_models to initial state (remove non-standard keys)
-        # and clean up model_labels
-
-        standard_providers = ["replicate", "google", "openai"]
-
-        # Remove custom providers from provider_models
-        keys_to_remove = [k for k in provider_models if k not in standard_providers]
-        for k in keys_to_remove:
-            del provider_models[k]
-            if k in provider_labels:
-                del provider_labels[k]
-
-        # We don't easily know which models in model_labels are custom without tracking them
-        # but we can just rebuild the custom labels in _inject_custom_models
-        # For now, let's just leave potentially unused labels in model_labels as they don't harm
-        # unless name collision, but _inject will overwrite.
+        self._provider_models = {
+            provider: list(models) for provider, models in provider_models.items()
+        }
+        self._provider_labels = dict(provider_labels)
+        self._model_labels = dict(model_labels)
 
     def _inject_custom_models(self) -> None:
-        if not config.custom_providers:
-            return
-
-        for provider in config.custom_providers:
-            caps = provider.get("capabilities", [])
-            # If capabilities list is empty or explicitly contains "image"
-            if not caps or "image" in caps:
-                p_name = provider["name"]
-
-                # Check for image_models first, then fallback to models
-                models_to_add = []
-                if provider.get("image_models"):
-                    models_to_add = provider["image_models"]  # type: ignore
-                elif provider.get("models"):
-                    models_to_add = provider["models"]  # type: ignore
-
-                if not models_to_add:
-                    continue
-
-                # Add/Update provider models map
-                provider_models[p_name] = models_to_add  # type: ignore
-
-                # Add to labels map if not present
-                if p_name not in provider_labels:
-                    provider_labels[p_name] = p_name
-
-                for m in models_to_add:
-                    if m not in model_labels:
-                        model_labels[m] = f"{m} ({p_name})"
+        for provider in config.custom_providers or []:
+            capabilities = provider.get("capabilities", [])
+            if capabilities and "image" not in capabilities:
+                continue
+            name = provider["name"]
+            self._provider_models[name] = list(
+                provider.get("image_models") or provider.get("models") or []
+            )
+            self._provider_labels[name] = name
 
     def _setup_ui(self) -> None:
         self.provider_picker = ReactiveComboBox(
             self.state,
             "image_providers",
             "image_provider",
-            provider_labels,
+            self._provider_labels,
         )
         self.provider_picker.on_change.connect(self._on_provider_change)
 
@@ -243,9 +222,12 @@ class ImageOptions(QWidget):
             self.state,
             "image_models",
             "image_model",
-            model_labels,
+            self._model_labels,
         )
-        self.model_picker.setMaximumWidth(300)
+        self.model_picker.setMinimumWidth(0)
+        self.model_picker.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.model_picker.on_change.connect(self._on_model_change)
         self.generation_quality_picker = ReactiveComboBox(
             self.state,
@@ -260,7 +242,10 @@ class ImageOptions(QWidget):
                 "max": "Maximum",
             },
         )
-        self.generation_quality_label = QLabel("Rendering Quality:")
+        self.generation_quality_picker.on_change.connect(
+            lambda _: self._on_model_change(self.state.s["image_model"])
+        )
+        self.generation_quality_label = QLabel("Rendering quality:")
 
         self.ratio_picker = ReactiveComboBox(
             self.state,
@@ -268,11 +253,19 @@ class ImageOptions(QWidget):
             "image_aspect_ratio",
         )
 
+        self.ratio_picker.on_change.connect(lambda _: self._update_output_summary())
+
         self.resolution_picker = ReactiveComboBox(
             self.state,
             "image_resolutions",
             "image_resolution",
+            {
+                "1024x1024": "1K preset",
+                "2048x2048": "2K preset",
+                "4096x4096": "4K preset",
+            },
         )
+        self.resolution_picker.on_change.connect(lambda _: self._update_size_controls())
 
         self.format_picker = ReactiveComboBox(
             self.state,
@@ -286,55 +279,148 @@ class ImageOptions(QWidget):
             self.state,
             "image_quality",
         )
-        self.quality_spinner.setRange(1, 100)
+        self.quality_spinner.setRange(0, 100)
         self.quality_spinner.setSuffix("%")
 
-        self.quality_label = QLabel("Compression Quality:")
+        self.quality_label = QLabel("File compression quality:")
 
-        box = QGroupBox("🖼️ Image Model Settings")
+        self.generation_quality_help = QLabel(
+            "Higher rendering quality can take longer and cost more. This changes the image generated by the model."
+        )
+        self.generation_quality_help.setWordWrap(True)
+        self.compression_help = QLabel(
+            "Higher values retain more detail and produce larger files. This controls encoding, not model rendering quality."
+        )
+        self.compression_help.setWordWrap(True)
+        self.output_summary = QLabel()
+        self.output_summary.setWordWrap(True)
+        self.output_summary.setAccessibleDescription("Effective image output")
+        self.resolution_label = QLabel("Resolution preset:")
+        self.ratio_label = QLabel("Image shape:")
+        box = QGroupBox("Image model")
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
         layout.addWidget(box)
         box_layout = default_form_layout()
         box.setLayout(box_layout)
 
         box_layout.addRow("Provider:", self.provider_picker)
         box_layout.addRow("Model:", self.model_picker)
+        self.model_warning = QLabel()
+        self.model_warning.setWordWrap(True)
+        box_layout.addRow(self.model_warning)
         box_layout.addRow(self.generation_quality_label, self.generation_quality_picker)
-        box_layout.addRow("Aspect Ratio:", self.ratio_picker)
-        box_layout.addRow("Resolution:", self.resolution_picker)
-        box_layout.addRow("Output Format:", self.format_picker)
-        box_layout.addRow(self.quality_label, self.quality_spinner)
+        box_layout.addRow(self.generation_quality_help)
+        box_layout.addRow(self.ratio_label, self.ratio_picker)
+        box_layout.addRow(self.resolution_label, self.resolution_picker)
+        box_layout.addRow(self.output_summary)
+        media_box = QGroupBox("Saved media")
+        media_form = default_form_layout()
+        media_box.setLayout(media_form)
+        media_form.addRow("File format:", self.format_picker)
+        media_form.addRow(self.quality_label, self.quality_spinner)
+        media_form.addRow(self.compression_help)
+        media_help = QLabel(
+            "The generated image is converted locally when needed to save it in this format. PNG is lossless; other formats use the selected compression quality."
+        )
+        media_help.setWordWrap(True)
+        media_form.addRow(media_help)
+        layout.addWidget(media_box)
+        layout.addStretch()
 
         self.setLayout(layout)
 
-    def _on_provider_change(self, provider: str) -> None:
-        provider = cast("ImageProviders", provider)
-        models = provider_models[provider]
-        self.state.update({"image_models": models})
-
-        # Select first model if current is not in new list
+    def _on_provider_change(
+        self, provider: str, preserve_current: bool = False
+    ) -> None:
+        models = list(self._provider_models.get(provider, []))
         current_model = self.state.s["image_model"]
-        if current_model not in models:
-            self.state.update({"image_model": models[0]})
-        self._on_model_change(self.state.s["image_model"])
+        if preserve_current and current_model and current_model not in models:
+            models.append(current_model)
+        selected = (
+            current_model if current_model in models else (models[0] if models else "")
+        )
+        self.state.update({"image_models": models, "image_model": selected})
+        self._on_model_change(selected)
 
     def _on_model_change(self, model: str) -> None:
+        provider = self.state.s["image_provider"]
+        unavailable = (
+            provider not in self._provider_models
+            or (provider, model) in RETIRED_PROVIDER_MODELS
+        )
+        self.model_warning.setText(
+            "Saved provider or model is unavailable. Choose a supported selection before generating."
+            if unavailable
+            else ""
+        )
+        self.model_warning.setVisible(unavailable)
+        self.model_picker.setToolTip(model)
         qualities = image_generation_qualities(model)
         quality = self.state.s["image_generation_quality"]
-        self.state.update(
-            {
-                "image_generation_qualities": qualities,
-                "image_generation_quality": quality if quality in qualities else "auto",
-            }
+        if model.startswith("gpt-image-") and quality not in qualities:
+            qualities.append(quality)
+            self.model_warning.setText(
+                self.model_warning.text()
+                + (" " if unavailable else "")
+                + f"Saved rendering quality ‘{quality}’ is not supported by this model. Choose a supported quality."
+            )
+            self.model_warning.show()
+        self.state.update({"image_generation_qualities": qualities})
+        has_quality = len(qualities) > 1
+        self.generation_quality_picker.setVisible(has_quality)
+        self.generation_quality_label.setVisible(has_quality)
+        self.generation_quality_help.setVisible(has_quality)
+        self._update_size_controls()
+
+    def _update_size_controls(self) -> None:
+        provider = self.state.s["image_provider"]
+        model = self.state.s["image_model"]
+        resolution = self.state.s["image_resolution"]
+        uses_openai_sizes = provider not in {"google", "replicate"}
+        flexible_size = model == "gpt-image-2" or model.startswith("gpt-image-2.5-")
+        uses_resolution = provider == "google" or (uses_openai_sizes and flexible_size)
+        self.resolution_picker.setVisible(uses_resolution)
+        self.resolution_label.setVisible(uses_resolution)
+        ratios: list[ImageAspectRatio] = list(aspect_ratios)
+        current = self.state.s["image_aspect_ratio"]
+        labels: dict[str, str] = {}
+        if uses_openai_sizes:
+            if not flexible_size:
+                ratios = ["1:1", "16:9", "9:16"]
+                if current not in ratios:
+                    ratios.append(current)
+            for ratio in ratios:
+                size = openai_image_size(model, ratio, resolution).replace("x", " × ")
+                shape = {"1:1": "square", "16:9": "landscape", "9:16": "portrait"}.get(
+                    ratio, f"saved {ratio}"
+                )
+                labels[ratio] = (
+                    f"{size} · {ratio} preset" if flexible_size else f"{size} · {shape}"
+                )
+        self.ratio_picker.state_to_ui = labels
+        self.ratio_picker.ui_to_state = {
+            label: ratio for ratio, label in labels.items()
+        }
+        self.state.update({"image_aspect_ratios": ratios})
+        self.ratio_picker.update_from_state(dict(self.state.s))
+        self._update_output_summary()
+
+    def _update_output_summary(self) -> None:
+        self.output_summary.setText(
+            image_output_summary(
+                self.state.s["image_provider"],
+                self.state.s["image_model"],
+                self.state.s["image_aspect_ratio"],
+                self.state.s["image_resolution"],
+                self.state.s["image_output_format"],
+            )
         )
-        self.generation_quality_picker.setVisible(len(qualities) > 1)
-        self.generation_quality_label.setVisible(len(qualities) > 1)
 
     def _on_format_change(self, format: str) -> None:
-        # Show quality only for lossy formats
-        # PNG is usually lossless (compression level 0-9), we can reuse quality spinner
-        # but standard PIL usage maps quality to JPEG/WEBP/AVIF.
-        # For this UI, let's hide quality for PNG to keep it simple as "Lossless"
-        is_lossy = format in ["jpeg", "webp", "avif"]
+        is_lossy = format in {"jpeg", "webp", "avif"}
         self.quality_label.setVisible(is_lossy)
         self.quality_spinner.setVisible(is_lossy)
+        self.compression_help.setVisible(is_lossy)
+        self._update_output_summary()

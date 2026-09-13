@@ -19,20 +19,72 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import logging
 import os
+import re
 import sys
+from collections.abc import Iterable
 
 from aqt import mw
 
 from .utils import get_file_path, is_production
 
+SECRET_KEY_RE = re.compile(
+    r"(?:api.?key|authorization|password|secret|token|credential)", re.IGNORECASE
+)
+SECRET_VALUE_RE = re.compile(
+    r"([\"']?(?:[\w-]*(?:api.?key|token|secret|password)|authorization)[\"']?\s*[:=]\s*)"
+    r"(?:[\"'][^\"']*[\"']|[^\s&,}]+)",
+    re.IGNORECASE,
+)
+known_secrets: frozenset[str] = frozenset()
+
+
+def register_secrets(values: Iterable[str]) -> None:
+    global known_secrets
+    known_secrets = known_secrets.union(value for value in values if value)
+
+
+def redact_text(value: str) -> str:
+    for secret in sorted(known_secrets, key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED]")
+    value = re.sub(r"(https?://)[^\s/@]+@", r"\1[REDACTED]@", value)
+    value = re.sub(
+        r"(Bearer\s+)[^\s\"',}]+", r"\1[REDACTED]", value, flags=re.IGNORECASE
+    )
+    value = re.sub(
+        r"([?&](?:key|api_key|token|access_token|secret|password)=)[^&#\s]*",
+        r"\1[REDACTED]",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return SECRET_VALUE_RE.sub(r"\1[REDACTED]", value)
+
+
+def redact(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if SECRET_KEY_RE.search(str(key)) else redact(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_text(super().format(record))
+
 
 def setup_logger() -> None:
-    global logger
-
     if not mw:
         return
 
-    formatter = logging.Formatter("%(name)s/%(filename)s: [%(levelname)s] %(message)s")
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+    formatter = RedactingFormatter("%(name)s/%(filename)s: [%(levelname)s] %(message)s")
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
 
@@ -49,11 +101,25 @@ def setup_logger() -> None:
         logger.setLevel(logging.DEBUG)
 
         if not os.getenv("IS_TEST"):
-            file_handler = logging.FileHandler(
-                get_file_path("smart-notes.log"), mode="w", encoding="utf-8"
-            )
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
+            try:
+                file_handler = logging.FileHandler(
+                    get_file_path("smart-notes.log"), mode="w", encoding="utf-8"
+                )
+            except OSError:
+                stream_handler.handle(
+                    logger.makeRecord(
+                        logger.name,
+                        logging.WARNING,
+                        __file__,
+                        0,
+                        "Cannot open the log file; using console logging.",
+                        (),
+                        None,
+                    )
+                )
+            else:
+                file_handler.setFormatter(formatter)
+                logger.addHandler(file_handler)
 
             if is_debug:
                 logger.debug("Starting app in debug mode")
@@ -62,3 +128,4 @@ def setup_logger() -> None:
 
 
 logger = logging.getLogger("smart_notes")
+logger.propagate = False

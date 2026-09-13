@@ -165,7 +165,7 @@ cython_debug/
 
 # Anki overwriting config
 meta.json
-config_backup.json
+config_backup*.json
 config.json
 
 # Dependencies
@@ -175,3 +175,5 @@ todo*.md
 rate_limits.json
 chat_usage.json
 *.md
+
+!REFACTOR_VALIDATION.md

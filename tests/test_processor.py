@@ -17,25 +17,71 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import sys
-import types
+import asyncio
+from copy import deepcopy
+from dataclasses import asdict
+from graphlib import CycleError
 from pathlib import Path
-from typing import Any, Optional
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import MagicMock
 
 import pytest
+from anki.errors import NotFoundError
 
+import src.config
+import src.dag
+import src.note_processor as note_processor
+import src.prompts
 from src.chat_usage import (
     ChatUsageTracker,
     build_prompt_usage_key,
     build_prompt_usage_signature,
 )
+from src.config import Config
+from src.dag import GenerationMode, generate_fields_dag
+from src.field_processor import FieldProcessor
+from src.note_processor import (
+    MAX_ACTIVE_NOTE_TASKS,
+    NoteProcessor,
+    NoteSnapshot,
+    PendingMedia,
+    ProcessedNote,
+    ResolvedField,
+    commit_processed_notes,
+    snapshot_note,
+)
+from src.prompts import interpolate_prompt_with_values
 from tests.mocks import (
     MockConfig,
     MockNote,
     p,
 )
 
+if TYPE_CHECKING:
+    from anki.cards import Card, CardId
+    from anki.decks import DeckId
+    from anki.notes import NoteId
+
 NOTE_TYPE_NAME = "note_type_1"
+
+
+class NoteProcessorHarness(NoteProcessor):
+    async def process_snapshot(
+        self,
+        snapshot: NoteSnapshot,
+        overwrite_fields: bool = False,
+        target_field: str | None = None,
+        usage_scope_id: str | None = None,
+        mode: GenerationMode = "manual",
+    ) -> ProcessedNote:
+        return await self._process_note(
+            snapshot,
+            overwrite_fields,
+            target_field,
+            usage_scope_id=usage_scope_id,
+            mode=mode,
+        )
 
 
 class FakeFieldProcessor:
@@ -48,44 +94,30 @@ class FakeFieldProcessor:
         usage_scope_id: str | None = None,
         **context: Any,
     ) -> Any:
-        from src.note_processor import ResolvedField
-        from src.prompts import config, interpolate_prompt_with_values
 
         del show_error_box, usage_scope_id, context
 
         interpolated = interpolate_prompt_with_values(
             node.input,
             values,
-            config.allow_empty_fields,
+            src.prompts.config.allow_empty_fields,
         )
         return ResolvedField(p(interpolated) if interpolated else None)
 
 
-def make_snapshot(note: Any, deck_id: int = 1) -> Any:
-    from src.note_processor import snapshot_note
+def make_snapshot(note: Any, deck_id: int = 1) -> NoteSnapshot:
 
-    return snapshot_note(note, deck_id)
+    return snapshot_note(note, cast("DeckId", deck_id))
 
 
-def setup_data(monkeypatch, note, prompts_map, options, allow_empty_fields):
-    import src.config
-    import src.prompts
-
-    fake_field_processor_module = types.ModuleType("src.field_processor")
-    fake_field_processor_module.FieldProcessor = object
-    monkeypatch.setitem(sys.modules, "src.field_processor", fake_field_processor_module)
-
-    fake_sentry_module = types.ModuleType("src.sentry")
-    fake_sentry_module.run_async_in_background_with_sentry = (
-        lambda *args, **kwargs: None
-    )
-    monkeypatch.setitem(sys.modules, "src.sentry", fake_sentry_module)
-
-    fake_ui_utils_module = types.ModuleType("src.ui.ui_utils")
-    fake_ui_utils_module.show_message_box = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "src.ui.ui_utils", fake_ui_utils_module)
-
-    from src.note_processor import NoteProcessor
+def setup_data(
+    monkeypatch: pytest.MonkeyPatch,
+    note: MockNote,
+    prompts_map: dict[str, str],
+    options: dict[str, Any],
+    allow_empty_fields: bool,
+) -> NoteProcessorHarness:
+    del note
 
     extras = {
         field: {
@@ -97,41 +129,46 @@ def setup_data(monkeypatch, note, prompts_map, options, allow_empty_fields):
             "chat_temperature": 0,
             "chat_reasoning_effort": None,
             "chat_markdown_to_html": False,
+            "regenerate_when_batching": options.get(field, {}).get(
+                "regenerate_when_batching", False
+            ),
         }
         for field in prompts_map
     }
 
-    prompts_map = {
+    prompts_data = {
         "note_types": {NOTE_TYPE_NAME: {"1": {"fields": prompts_map, "extras": extras}}}
     }
 
-    c = MockConfig(prompts_map=prompts_map, allow_empty_fields=allow_empty_fields)
-    f = FakeFieldProcessor()
-    p = NoteProcessor(field_processor=f, config=c)
+    values = asdict(
+        MockConfig(prompts_map=prompts_data, allow_empty_fields=allow_empty_fields)
+    )
+    c = MagicMock(spec=Config, **values)
+    c.snapshot.side_effect = lambda: deepcopy(values)
+    f = MagicMock(spec=FieldProcessor, resolve=FakeFieldProcessor().resolve)
+    p = NoteProcessorHarness(field_processor=f, config=c)
 
     monkeypatch.setattr(src.config, "config", c)
     monkeypatch.setattr(src.prompts, "config", c)
     monkeypatch.setattr(
         src.prompts,
         "get_prompts_for_note",
-        lambda note_type, deck_id, override_prompts_map=None: prompts_map["note_types"][
-            note_type
-        ]["1"]["fields"],
+        lambda note_type, deck_id, override_prompts_map=None: prompts_data[
+            "note_types"
+        ][note_type]["1"]["fields"],
     )
     monkeypatch.setattr(
         src.prompts,
         "get_extras",
-        lambda note_type,
-        field,
-        deck_id,
-        prompts=None,
-        fallback_to_global_deck=True: extras.get(field, {"automatic": True}),
+        lambda note_type, field, deck_id, prompts=None, fallback_to_global_deck=True: (
+            extras.get(field, {"automatic": True})
+        ),
     )
 
     return p
 
 
-def setup_tracker(monkeypatch, tmp_path: Path) -> ChatUsageTracker:
+def setup_tracker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ChatUsageTracker:
     tracker = ChatUsageTracker(state_path=str(tmp_path / "chat_usage.json"))
     monkeypatch.setattr("src.note_processor.chat_usage_tracker", tracker)
     return tracker
@@ -262,10 +299,17 @@ Example: ("basic", {"f1": "1", "f2": ""}, {"f2": "{{f1}}"}, {"f2": "p_1"}, {})
             "chained, allowing empty",
             {"f1": "1", "f2": "", "f3": "", "f4": "", "f5": ""},
             {"f2": "{{f1}}", "f3": "{{f2}} {{f5}}", "f5": "{{f4}}"},
-            {"f2": p("1"), "f3": p(p("1") + " "), "f4": "", "f5": ""},
+            {"f2": p("1"), "f3": "", "f4": "", "f5": ""},
             {
                 "allow_empty": True,
             },
+        ),
+        (
+            "allow empty ordinary source alongside nonempty input",
+            {"f1": "1", "f2": "", "f3": ""},
+            {"f3": "{{f1}} {{f2}}"},
+            {"f3": p("1 ")},
+            {"allow_empty": True},
         ),
         # ----- Target Field ------
         # Target field specified, only that field is updated
@@ -446,13 +490,20 @@ Example: ("basic", {"f1": "1", "f2": ""}, {"f2": "{{f1}}"}, {"f2": "p_1"}, {})
         # TODO: error handling?
     ],
 )
-async def test_processor_1(name, note, prompts_map, expected, options, monkeypatch):
+async def test_processor_1(
+    name: str,
+    note: dict[str, str],
+    prompts_map: dict[str, str],
+    expected: dict[str, str],
+    options: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     overwrite_fields = bool(options.get("overwrite"))
     target_field = options.get("target_field")
     allow_empty_fields = bool(options.get("allow_empty"))
 
     n = MockNote(note_type=NOTE_TYPE_NAME, data=note)
-    p = setup_data(  # type: ignore
+    p = setup_data(
         monkeypatch=monkeypatch,
         note=n,
         prompts_map=prompts_map,
@@ -460,7 +511,7 @@ async def test_processor_1(name, note, prompts_map, expected, options, monkeypat
         allow_empty_fields=allow_empty_fields,
     )
 
-    result = await p._process_note(
+    result = await p.process_snapshot(
         make_snapshot(n),
         overwrite_fields=overwrite_fields,
         target_field=target_field,
@@ -511,9 +562,12 @@ Example: ({"f1": "1", "f2": ""}, {"f2": "{{f1}} {{f4}}", "f4": "{{f2}}"}, True)
         ),
     ],
 )
-async def test_cycle(note, prompts_map, expected, monkeypatch):
-    import src.dag
-    import src.prompts
+async def test_cycle(
+    note: dict[str, str],
+    prompts_map: dict[str, str],
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
 
     n = MockNote(note_type=NOTE_TYPE_NAME, data=note)
 
@@ -537,6 +591,16 @@ async def test_cycle(note, prompts_map, expected, monkeypatch):
     )
 
     snapshot = make_snapshot(n)
+    if expected:
+        with pytest.raises(CycleError):
+            dag = src.dag.generate_fields_dag(
+                note_type=snapshot.note_type,
+                field_order=snapshot.field_order,
+                values=snapshot.lower_values(),
+                deck_id=snapshot.deck_id,
+                overwrite_fields=True,
+            )
+        return
     dag = src.dag.generate_fields_dag(
         note_type=snapshot.note_type,
         field_order=snapshot.field_order,
@@ -574,9 +638,14 @@ Example: ({"f1": "1", "f2": ""}, {"f2": "{{f1}}"}, True)
         ),
     ],
 )
-async def test_returns_if_updated(note, prompts_map, expected, monkeypatch):
+async def test_returns_if_updated(
+    note: dict[str, str],
+    prompts_map: dict[str, str],
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     n = MockNote(note_type=NOTE_TYPE_NAME, data=note)
-    p = setup_data(  # type: ignore
+    p = setup_data(
         monkeypatch=monkeypatch,
         note=n,
         prompts_map=prompts_map,
@@ -584,7 +653,7 @@ async def test_returns_if_updated(note, prompts_map, expected, monkeypatch):
         allow_empty_fields=False,
     )
 
-    result = await p._process_note(  # type: ignore
+    result = await p.process_snapshot(
         make_snapshot(n),
         overwrite_fields=False,
         target_field=None,
@@ -593,11 +662,12 @@ async def test_returns_if_updated(note, prompts_map, expected, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_process_note_reports_field_failures(monkeypatch):
-    import src.prompts
+async def test_process_note_reports_field_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
 
     note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "1", "f2": "", "f3": ""})
-    processor = setup_data(  # type: ignore
+    processor = setup_data(
         monkeypatch=monkeypatch,
         note=note,
         prompts_map={"f2": "{{f1}}", "f3": "{{f2}}"},
@@ -613,7 +683,6 @@ async def test_process_note_reports_field_failures(monkeypatch):
         usage_scope_id: str | None = None,
         **context: Any,
     ) -> Any:
-        from src.note_processor import ResolvedField
 
         del show_error_box, usage_scope_id, context
         if node.field == "f2":
@@ -626,9 +695,9 @@ async def test_process_note_reports_field_failures(monkeypatch):
         )
         return ResolvedField(p(interpolated) if interpolated else None)
 
-    processor.field_processor.resolve = fail_resolve
+    monkeypatch.setattr(processor.field_processor, "resolve", fail_resolve)
 
-    result = await processor._process_note(  # type: ignore
+    result = await processor.process_snapshot(
         make_snapshot(note),
         overwrite_fields=False,
         target_field=None,
@@ -636,17 +705,16 @@ async def test_process_note_reports_field_failures(monkeypatch):
 
     assert result.did_update is False
     assert result.updated_fields == []
-    assert len(result.field_failures) == 1
+    assert len(result.field_failures) == 2
     assert result.field_failures[0].field == "f2"
     assert result.field_failures[0].error == "TimeoutError"
     assert result.field_failures[0].aborted_dependents == ("f3",)
 
 
 def test_openai_batch_preflight_recommends_fast_note_count(
-    monkeypatch,
-    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    import src.config
 
     note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "seed", "f2": ""})
     processor = setup_data(
@@ -683,10 +751,9 @@ def test_openai_batch_preflight_recommends_fast_note_count(
 
 
 def test_openai_batch_preflight_counts_chained_openai_fields(
-    monkeypatch,
-    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    import src.config
 
     note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "source", "f2": "", "f3": ""})
     processor = setup_data(
@@ -708,10 +775,9 @@ def test_openai_batch_preflight_counts_chained_openai_fields(
 
 
 def test_estimated_generated_field_value_uses_visible_response_chars(
-    monkeypatch,
-    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    from src.dag import generate_fields_dag
 
     note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "source", "f2": "", "f3": ""})
     processor = setup_data(
@@ -781,6 +847,10 @@ class CommitNote:
     def __init__(self, note_id: int, fields: dict[str, str]) -> None:
         self.id = note_id
         self.fields = fields
+        self.mid = 1
+
+    def keys(self) -> list[str]:
+        return list(self.fields)
 
     def __getitem__(self, field: str) -> str:
         return self.fields[field]
@@ -790,7 +860,7 @@ class CommitNote:
 
 
 class CommitMedia:
-    def __init__(self, written_names: Optional[dict[str, str]] = None) -> None:
+    def __init__(self, written_names: dict[str, str] | None = None) -> None:
         self.writes: list[tuple[str, bytes]] = []
         self.written_names = written_names or {}
 
@@ -803,7 +873,7 @@ class CommitCollection:
     def __init__(
         self,
         note: CommitNote,
-        written_names: Optional[dict[str, str]] = None,
+        written_names: dict[str, str] | None = None,
     ) -> None:
         self.note = note
         self.media = CommitMedia(written_names)
@@ -820,12 +890,11 @@ class CommitCollection:
 
 
 def test_commit_processed_notes_applies_unchanged_result() -> None:
-    from src.note_processor import PendingMedia, ProcessedNote, commit_processed_notes
 
     note = CommitNote(1, {"Front": "source", "Back": "", "Extra": "edited"})
     collection = CommitCollection(note)
     result = ProcessedNote(
-        note_id=1,
+        note_id=cast("NoteId", 1),
         original_values={"Front": "source", "Back": ""},
         updates={"Back": "generated"},
         media=[PendingMedia("generated.mp3", b"audio")],
@@ -847,7 +916,6 @@ def test_commit_processed_notes_applies_unchanged_result() -> None:
 
 
 def test_commit_processed_notes_uses_written_media_filenames() -> None:
-    from src.note_processor import PendingMedia, ProcessedNote, commit_processed_notes
 
     note = CommitNote(1, {"Audio": "", "Image": ""})
     collection = CommitCollection(
@@ -858,7 +926,7 @@ def test_commit_processed_notes_uses_written_media_filenames() -> None:
         },
     )
     result = ProcessedNote(
-        note_id=1,
+        note_id=cast("NoteId", 1),
         original_values={"Audio": "", "Image": ""},
         updates={
             "Audio": "[sound:Animecards-audio.wav]",
@@ -880,12 +948,11 @@ def test_commit_processed_notes_uses_written_media_filenames() -> None:
 
 
 def test_commit_processed_notes_skips_conflicted_result() -> None:
-    from src.note_processor import PendingMedia, ProcessedNote, commit_processed_notes
 
     note = CommitNote(1, {"Front": "user edit", "Back": ""})
     collection = CommitCollection(note)
     result = ProcessedNote(
-        note_id=1,
+        note_id=cast("NoteId", 1),
         original_values={"Front": "source", "Back": ""},
         updates={"Back": "generated"},
         media=[PendingMedia("generated.mp3", b"audio")],
@@ -907,10 +974,9 @@ class BrokenCommitCollection(CommitCollection):
 
 
 def test_commit_processed_notes_propagates_collection_failure() -> None:
-    from src.note_processor import ProcessedNote, commit_processed_notes
 
     collection = BrokenCommitCollection(CommitNote(1, {}))
-    result = ProcessedNote(1, {}, {"Back": "generated"}, [], [])
+    result = ProcessedNote(cast("NoteId", 1), {}, {"Back": "generated"}, [], [])
 
     with pytest.raises(RuntimeError, match="database failed"):
         commit_processed_notes(collection, [result])
@@ -920,7 +986,6 @@ def test_commit_processed_notes_propagates_collection_failure() -> None:
 async def test_process_note_returns_deferred_media_without_mutating_note(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.note_processor import PendingMedia, ResolvedField
 
     note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
     processor = setup_data(
@@ -940,7 +1005,7 @@ async def test_process_note_returns_deferred_media_without_mutating_note(
         return ResolvedField("[sound:note-back.mp3]", media)
 
     processor.field_processor.resolve = resolve
-    result = await processor._process_note(  # pyright: ignore[reportPrivateUsage]
+    result = await processor.process_snapshot(  # pyright: ignore[reportPrivateUsage]
         make_snapshot(note)
     )
 
@@ -955,11 +1020,6 @@ async def test_batch_cancellation_stops_scheduling_new_notes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import asyncio
-    from types import SimpleNamespace
-
-    import src.note_processor as note_processor
-    from src.note_processor import MAX_ACTIVE_NOTE_TASKS, NoteSnapshot
 
     note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
     processor = setup_data(
@@ -974,8 +1034,8 @@ async def test_batch_cancellation_stops_scheduling_new_notes(
 
     snapshots = [
         NoteSnapshot(
-            note_id=note_id,
-            deck_id=1,
+            note_id=cast("NoteId", note_id),
+            deck_id=cast("DeckId", 1),
             deck_name=None,
             note_type=NOTE_TYPE_NAME,
             field_order=("Front", "Back"),
@@ -1019,11 +1079,13 @@ async def test_batch_cancellation_stops_scheduling_new_notes(
         operation: Any,
         on_success: Any,
         on_failure: Any,
+        **kwargs: Any,
     ) -> None:
         captured.update(
             operation=operation,
             on_success=on_success,
             on_failure=on_failure,
+            on_finished=kwargs.get("on_finished", lambda: None),
         )
 
     started = 0
@@ -1051,7 +1113,7 @@ async def test_batch_cancellation_stops_scheduling_new_notes(
     )
     monkeypatch.setattr(processor, "_process_note", slow_process)
 
-    processor.process_cards_with_progress([1], on_success=None)
+    processor.process_cards_with_progress([cast("CardId", 1)], on_success=None)
     stats = await captured["operation"]()
 
     assert stats.was_cancelled
@@ -1064,7 +1126,10 @@ async def test_batch_cancellation_stops_scheduling_new_notes(
     assert not stats.unchanged
     assert not stats.conflicted
 
-    captured["on_success"](stats)
+    try:
+        captured["on_success"](stats)
+    finally:
+        captured["on_finished"]()
     assert not processor.req_in_progress
     assert FakeProgressDialog.instance is not None
     assert FakeProgressDialog.instance.closed
@@ -1073,9 +1138,6 @@ async def test_batch_cancellation_stops_scheduling_new_notes(
 def test_process_card_failure_releases_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from types import SimpleNamespace
-
-    import src.note_processor as note_processor
 
     note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
     processor = setup_data(
@@ -1098,11 +1160,13 @@ def test_process_card_failure_releases_request(
         operation: Any,
         on_success: Any,
         on_failure: Any,
+        **kwargs: Any,
     ) -> None:
         captured.update(
             operation=operation,
             on_success=on_success,
             on_failure=on_failure,
+            on_finished=kwargs.get("on_finished", lambda: None),
         )
 
     decks = SimpleNamespace(name=lambda _: None)
@@ -1125,17 +1189,19 @@ def test_process_card_failure_releases_request(
     assert processor.req_in_progress
 
     error = RuntimeError("failed")
-    captured["on_failure"](error)
+    try:
+        captured["on_failure"](error)
+    finally:
+        captured["on_finished"]()
 
     assert failure_seen == [error]
     assert not processor.req_in_progress
 
 
 def test_estimated_generated_field_value_defaults_without_response_chars(
-    monkeypatch,
-    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    from src.dag import generate_fields_dag
 
     note = MockNote(note_type=NOTE_TYPE_NAME, data={"f1": "source", "f2": "", "f3": ""})
     processor = setup_data(
@@ -1185,3 +1251,167 @@ def test_estimated_generated_field_value_defaults_without_response_chars(
         )
         == 256
     )
+
+
+@pytest.mark.asyncio
+async def test_failure_blocks_all_dependents_but_preserves_independent_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = MockNote(NOTE_TYPE_NAME, dict.fromkeys(["a", "b", "c", "d"], ""))
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"a": "seed", "b": "{{a}}", "c": "{{b}}", "d": "independent"},
+        {},
+        False,
+    )
+    attempted: list[str] = []
+
+    async def resolve(node: Any, **kwargs: Any) -> ResolvedField:
+        attempted.append(node.field)
+        if node.field == "a":
+            raise TimeoutError("provider failed")
+        return ResolvedField("generated")
+
+    monkeypatch.setattr(processor.field_processor, "resolve", resolve)
+    result = await processor.process_snapshot(make_snapshot(note))
+    assert set(attempted) == {"a", "d"}
+    assert result.updates == {"d": "generated"}
+    assert {failure.field for failure in result.field_failures} == {"a", "b", "c"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["review", "manual", "batch", "preview"])
+async def test_field_batch_overwrite_applies_only_to_batch_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: GenerationMode,
+) -> None:
+    note = MockNote(NOTE_TYPE_NAME, {"front": "source", "back": "existing"})
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"back": "{{front}}"},
+        {"back": {"regenerate_when_batching": True}},
+        False,
+    )
+    result = await processor.process_snapshot(make_snapshot(note), mode=mode)
+    assert result.updates == ({"back": "p_source"} if mode == "batch" else {})
+
+
+@pytest.mark.asyncio
+async def test_missing_source_blocks_only_affected_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = MockNote(NOTE_TYPE_NAME, {"a": "", "b": "", "independent": ""})
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"a": "{{deleted}}", "b": "{{a}}", "independent": "ready"},
+        {},
+        False,
+    )
+    result = await processor.process_snapshot(make_snapshot(note))
+    assert result.updates == {"independent": "p_ready"}
+    assert {failure.field for failure in result.field_failures} == {"a", "b"}
+
+
+@pytest.mark.asyncio
+async def test_deleted_configured_target_warns_and_keeps_valid_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = MockNote(NOTE_TYPE_NAME, {"present": ""})
+    processor = setup_data(
+        monkeypatch, note, {"deleted": "obsolete", "present": "ready"}, {}, False
+    )
+    logger = MagicMock()
+    monkeypatch.setattr(src.dag, "logger", logger)
+    result = await processor.process_snapshot(make_snapshot(note))
+    assert result.updates == {"present": "p_ready"}
+    assert not result.field_failures
+    logger.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_targeted_generation_rejects_cycles_before_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = MockNote(NOTE_TYPE_NAME, {"a": "", "b": ""})
+    processor = setup_data(monkeypatch, note, {"a": "{{b}}", "b": "{{a}}"}, {}, False)
+    with pytest.raises(CycleError):
+        await asyncio.wait_for(
+            processor.process_snapshot(make_snapshot(note), target_field="a"), 0.1
+        )
+
+
+@pytest.mark.parametrize("change", ["note_type", "field_schema"])
+def test_commit_rejects_changed_schema_before_writing_media(change: str) -> None:
+    note = CommitNote(1, {"Front": "source", "Back": ""})
+    collection = CommitCollection(note)
+    result = ProcessedNote(
+        note_id=cast("NoteId", 1),
+        original_values=dict(note.fields),
+        updates={"Back": "generated"},
+        media=[PendingMedia("generated.mp3", b"audio")],
+        field_failures=[],
+        note_type_id=1,
+        field_order=("Front", "Back"),
+    )
+    if change == "note_type":
+        note.mid = 2
+    else:
+        note.fields["Extra"] = ""
+    outcome = commit_processed_notes(collection, [result])
+    assert outcome.conflicted == [1]
+    assert collection.media.writes == []
+    assert not collection.updated_notes
+
+
+class MissingNoteCommitCollection(CommitCollection):
+    def get_note(self, note_id: int) -> CommitNote:
+        if note_id != self.note.id:
+            raise NotFoundError("deleted", None, None, None)
+        return self.note
+
+
+def test_commit_skips_deleted_note_and_commits_surviving_note() -> None:
+    note = CommitNote(2, {"Back": ""})
+    collection = MissingNoteCommitCollection(note)
+    results = [
+        ProcessedNote(
+            note_id=cast("NoteId", note_id),
+            original_values={"Back": ""},
+            updates={"Back": "generated"},
+            media=[PendingMedia(f"{note_id}.mp3", b"audio")],
+            field_failures=[],
+            note_type_id=1,
+            field_order=("Back",),
+        )
+        for note_id in (1, 2)
+    ]
+    outcome = commit_processed_notes(collection, results)
+    assert outcome.conflicted == [1]
+    assert outcome.committed == [2]
+    assert note.fields["Back"] == "generated"
+    assert collection.media.writes == [("2.mp3", b"audio")]
+
+
+@pytest.mark.parametrize("mode", ["single", "batch"])
+def test_preparation_failure_releases_request(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
+    processor = setup_data(monkeypatch, note, {"Back": "{{Front}}"}, {}, False)
+    monkeypatch.setattr(note_processor, "mw", SimpleNamespace(col=object()))
+    failure = RuntimeError("collection or settings became unavailable")
+    if mode == "single":
+        card = cast("Card", SimpleNamespace(note=MagicMock(side_effect=failure)))
+        monkeypatch.setattr(note_processor, "mw", None)
+        with pytest.raises(RuntimeError, match="became unavailable"):
+            processor.process_card(card, show_progress=False)
+    else:
+        monkeypatch.setattr(
+            note_processor, "bump_usage_counter", MagicMock(side_effect=failure)
+        )
+        with pytest.raises(RuntimeError, match="became unavailable"):
+            processor.process_cards_with_progress([], on_success=None)
+    assert not processor.req_in_progress

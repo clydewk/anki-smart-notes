@@ -597,7 +597,11 @@ class BuiltInToolProvider:
             results: list[dict[str, Any]] = []
             total_matches = 0
 
-            for note_id in note_ids:
+            truncated = False
+            for index, note_id in enumerate(note_ids):
+                if index >= 1000 or len(results) >= limit:
+                    truncated = True
+                    break
                 if exclude_current_note and note_id == self._context.note_id:
                     continue
 
@@ -650,6 +654,7 @@ class BuiltInToolProvider:
                     "exclude_current_note": exclude_current_note,
                     "limit": limit,
                     "match_count": total_matches,
+                    "truncated": truncated,
                     "current_note_type": self._context.note_type,
                     "current_note_type_fields": self._current_note_type_fields(),
                     "results": results,

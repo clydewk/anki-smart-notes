@@ -1,6 +1,6 @@
 [tool.ruff]
 line-length = 88
-target-version = "py39"
+target-version = "py313"
 exclude = [
     "dist",
     "env",
@@ -23,6 +23,8 @@ select = [
     "TCH", # flake8-type-checking
 ]
 ignore = [
+    "UP046", # Preserve Qt generic classes during the reliability refactor.
+    "UP047", # Avoid unrelated generic function syntax migrations.
     "E501",  # line too long (handled by formatter)
     "E402",  # module level import not at top of file (conflicts with conditional imports)
     "B008",  # do not perform function calls in argument defaults
