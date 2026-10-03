@@ -1,3 +1,14 @@
+# Unreleased — Gemini speech delivery and native ChatGPT provider
+
+- Add Gemini 3.8 Flash and Flash-Lite TTS with separate delivery metadata and validated WAV/PCM responses.
+- Offer Natural, Custom, and optional Automatic delivery using the default text model; preserve transcripts, voice routing, and existing styles.
+- Share speech preparation between previews and generation, retain inline vocal tags through HTML stripping, and include custom style references in field dependencies.
+
+- Sign in with ChatGPT directly from Providers, without installing Codex. The connection uses the native OAuth/backend approach used by OpenCode and may require compatibility updates.
+- Discover account models and reasoning options, check reported subscription limits, and use existing Anki/MCP tools for text generation.
+- Keep login credentials separate from profiles and exports; account actions apply immediately and invalidate stale generation jobs.
+- Require completed final answers, preserve stateless tool history, and bound requests, text, tool calls, and cancellation without automatic replay.
+
 # v3.0.0 — BYOK reliability refactor
 
 - Target Anki 26.5+ on Windows and macOS, with Python 3.13 for development.

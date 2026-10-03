@@ -19,18 +19,16 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, cast
 
 # Providers
 
 TTSProviders = Literal["openai", "elevenLabs", "google", "azure", "fish"]
-ChatProviders = Literal["openai", "anthropic", "deepseek", "google"]
+ChatProviders = Literal["openai", "chatgpt", "anthropic", "deepseek", "google"]
 
 # Reasoning Efforts
 # "none" is a UI concept meaning "don't use reasoning, use temperature instead"
-OpenAIReasoningEffort = Literal[
-    "none", "minimal", "low", "medium", "high", "xhigh", "max"
-]
+OpenAIReasoningEffort = str
 OPENAI_DEFAULT_REASONING_EFFORTS: tuple[OpenAIReasoningEffort, ...] = (
     "low",
     "medium",
@@ -56,6 +54,14 @@ DeepseekModels = str
 AnthropicModels = str
 GoogleChatModels = str
 ChatModels = str
+
+
+@dataclass(frozen=True)
+class ChatGPTModel:
+    model: str
+    label: str
+    reasoning_efforts: tuple[str, ...]
+    default_reasoning_effort: str | None
 
 
 @dataclass(frozen=True)
@@ -114,6 +120,7 @@ google_chat_models: list[ChatModels] = [
 
 provider_model_map: dict[ChatProviders, list[ChatModels]] = {
     "openai": openai_chat_models,
+    "chatgpt": [],
     "anthropic": anthropic_chat_models,
     "deepseek": deepseek_chat_models,
     "google": google_chat_models,
@@ -297,10 +304,14 @@ GoogleModels = Literal[
     "standard",
     "wavenet",
     "neural",
+    "gemini-3.8-flash-tts",
+    "gemini-3.8-flash-lite-tts",
     "gemini-3.1-flash-tts-preview",
     "gemini-2.5-flash-preview-tts",
     "gemini-2.5-pro-preview-tts",
 ]
+GEMINI_METADATA_TTS_MODELS = ("gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts")
+TTSDeliveryMode = Literal["natural", "custom", "automatic"]
 AzureModels = Literal["standard", "neural"]
 TTSModels = (
     OpenAITTSModels | ElevenTTSModels | FishTTSModels | GoogleModels | AzureModels
@@ -442,6 +453,7 @@ class FieldExtras(TypedDict):
     tts_language: str | None
     tts_strip_html: bool | None
     tts_style: str | None
+    tts_delivery: NotRequired[TTSDeliveryMode | None]
     # Legacy single-voice settings retained for import/migration compatibility.
     tts_provider: TTSProviders | None
     tts_model: TTSModels | None
@@ -475,6 +487,7 @@ DEFAULT_EXTRAS: FieldExtras = {
     "tts_language": None,
     "tts_strip_html": None,
     "tts_style": None,
+    "tts_delivery": None,
     # Legacy single-voice settings.
     "tts_model": None,
     "tts_provider": None,
@@ -489,6 +502,17 @@ DEFAULT_EXTRAS: FieldExtras = {
     "image_generation_quality": None,
     "regenerate_when_batching": False,
 }
+
+
+def tts_delivery_mode(extras: FieldExtras) -> TTSDeliveryMode:
+    mode = extras.get("tts_delivery")
+    if mode is None:
+        return "custom" if extras.get("tts_style") else "natural"
+    if mode not in ("natural", "custom", "automatic"):
+        raise ValueError(
+            "Unknown speech delivery mode. Choose Natural, Custom, or Automatic."
+        )
+    return mode
 
 
 class NoteTypeMap(TypedDict):

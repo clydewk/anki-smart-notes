@@ -39,7 +39,7 @@ from src.chat_usage import (
     build_prompt_usage_signature,
 )
 from src.config import Config
-from src.dag import GenerationMode, generate_fields_dag
+from src.dag import GenerationMode, generate_fields_dag, prompt_has_error
 from src.field_processor import FieldProcessor
 from src.note_processor import (
     MAX_ACTIVE_NOTE_TASKS,
@@ -61,7 +61,9 @@ from tests.mocks import (
 if TYPE_CHECKING:
     from anki.cards import Card, CardId
     from anki.decks import DeckId
-    from anki.notes import NoteId
+    from anki.notes import Note, NoteId
+
+    from src.models import TTSDeliveryMode
 
 NOTE_TYPE_NAME = "note_type_1"
 
@@ -1341,6 +1343,145 @@ async def test_targeted_generation_rejects_cycles_before_traversal(
         await asyncio.wait_for(
             processor.process_snapshot(make_snapshot(note), target_field="a"), 0.1
         )
+
+
+@pytest.mark.asyncio
+async def test_custom_speech_direction_adds_dependency_and_conflict_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = MockNote(
+        NOTE_TYPE_NAME,
+        {
+            "source": "hello",
+            "tone": "gentle",
+            "direction": "",
+            "audio": "",
+            "other": "",
+        },
+    )
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {"direction": "{{tone}}", "audio": "{{source}}", "other": "independent"},
+        {},
+        False,
+    )
+    extras = processor.config.prompts_map["note_types"][NOTE_TYPE_NAME]["1"]["extras"]
+    extras["audio"].update(type="tts", tts_style="{{direction}}", tts_delivery="custom")
+    attempted: list[str] = []
+
+    async def resolve(
+        node: Any, *, values: dict[str, str], **kwargs: Any
+    ) -> ResolvedField:
+        attempted.append(node.field)
+        if node.field == "audio":
+            assert values["direction"] == "generated direction"
+        return ResolvedField(f"generated {node.field}")
+
+    monkeypatch.setattr(processor.field_processor, "resolve", resolve)
+    result = await processor.process_snapshot(make_snapshot(note), target_field="audio")
+    assert attempted == ["direction", "audio"]
+    assert result.original_values == {
+        "source": "hello",
+        "tone": "gentle",
+        "direction": "",
+        "audio": "",
+    }
+    assert result.updates == {
+        "direction": "generated direction",
+        "audio": "generated audio",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [False, True])
+async def test_speech_direction_failure_blocks_only_its_dependents(
+    monkeypatch: pytest.MonkeyPatch, missing: bool
+) -> None:
+    note = MockNote(
+        NOTE_TYPE_NAME, dict.fromkeys(["direction", "audio", "dependent", "other"], "")
+    )
+    processor = setup_data(
+        monkeypatch,
+        note,
+        {
+            "direction": "tone",
+            "audio": "Hello",
+            "dependent": "{{audio}}",
+            "other": "independent",
+        },
+        {},
+        False,
+    )
+    extras = processor.config.prompts_map["note_types"][NOTE_TYPE_NAME]["1"]["extras"]
+    extras["audio"].update(
+        type="tts", tts_style="{{deleted}}" if missing else "{{direction}}"
+    )
+    attempted: list[str] = []
+
+    async def resolve(node: Any, **kwargs: Any) -> ResolvedField:
+        attempted.append(node.field)
+        if node.field == "direction":
+            raise TimeoutError("provider failed")
+        return ResolvedField("generated")
+
+    monkeypatch.setattr(processor.field_processor, "resolve", resolve)
+    result = await processor.process_snapshot(make_snapshot(note))
+    assert set(attempted) == {"direction", "other"}
+    assert result.updates == {"other": "generated"}
+    assert {failure.field for failure in result.field_failures} == {
+        "direction",
+        "audio",
+        "dependent",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["natural", "automatic"])
+async def test_inactive_speech_direction_does_not_block_generation(
+    monkeypatch: pytest.MonkeyPatch, mode: "TTSDeliveryMode"
+) -> None:
+    note = MockNote(NOTE_TYPE_NAME, {"audio": ""})
+    processor = setup_data(monkeypatch, note, {"audio": "Hello"}, {}, False)
+    extras = processor.config.prompts_map["note_types"][NOTE_TYPE_NAME]["1"]["extras"]
+    extras["audio"].update(
+        type="tts", tts_style="{{audio}} {{deleted}}", tts_delivery=mode
+    )
+    result = await processor.process_snapshot(make_snapshot(note))
+    assert result.updates == {"audio": "p_Hello"}
+    assert not result.field_failures
+
+
+@pytest.mark.parametrize(
+    "style, direction_prompt, expected",
+    [
+        ("{{deleted}}", "gentle", "Invalid field"),
+        ("{{audio}}", "gentle", "Cannot reference"),
+        ("{{direction}}", "{{audio}}", "cannot make a cycle"),
+        ("{{direction}}", "gentle", None),
+    ],
+)
+def test_speech_direction_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    style: str,
+    direction_prompt: str,
+    expected: str | None,
+) -> None:
+    note = MockNote(NOTE_TYPE_NAME, {"audio": "", "direction": ""})
+    processor = setup_data(
+        monkeypatch, note, {"audio": "Hello", "direction": direction_prompt}, {}, False
+    )
+    prompts_map = processor.config.prompts_map
+    extras = prompts_map["note_types"][NOTE_TYPE_NAME]["1"]["extras"]
+    extras["audio"].update(type="tts", tts_style=style, tts_delivery="custom")
+    monkeypatch.setattr(src.dag, "get_fields", lambda _: list(note.keys()))
+    error = prompt_has_error(
+        "Hello", cast("Note", note), cast("DeckId", 1), "audio", prompts_map
+    )
+    if expected:
+        assert error and expected in error
+    else:
+        assert error is None
 
 
 @pytest.mark.parametrize("change", ["note_type", "field_schema"])

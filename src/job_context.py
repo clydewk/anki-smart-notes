@@ -46,6 +46,7 @@ class JobContext:
     active: Event
     cancelled: Event = field(default_factory=Event)
     owner_alive: Callable[[], bool] | None = None
+    connection_valid: Callable[[], bool] | None = None
     _bridges: set[asyncio.Future[Any]] = field(default_factory=set, repr=False)
     _bridge_lock: Lock = field(default_factory=Lock, repr=False)
 
@@ -68,7 +69,11 @@ class JobContext:
             deliver_future(future.get_loop(), future.cancel)
 
     def valid(self) -> bool:
-        return self.active.is_set() and not self.cancelled.is_set()
+        return (
+            self.active.is_set()
+            and not self.cancelled.is_set()
+            and (self.connection_valid is None or self.connection_valid())
+        )
 
     def check(self, collection: Any = NO_COLLECTION) -> None:
         if not self.valid() or (

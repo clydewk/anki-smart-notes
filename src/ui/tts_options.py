@@ -375,6 +375,8 @@ def get_gemini_voices() -> list[TTSMeta]:
     voices: list[TTSMeta] = []
 
     models: list[tuple[str, str, PriceTiers]] = [
+        ("gemini-3.8-flash-tts", "Gemini 3.8 Flash", "low"),
+        ("gemini-3.8-flash-lite-tts", "Gemini 3.8 Flash Lite", "low"),
         ("gemini-3.1-flash-tts-preview", "Gemini 3.1 Flash", "low"),
         ("gemini-2.5-flash-preview-tts", "Gemini 2.5 Flash", "low"),
         ("gemini-2.5-pro-preview-tts", "Gemini 2.5 Pro", "standard"),

@@ -52,7 +52,7 @@ from .models import (
 from .notes import get_note_type
 from .prompts import (
     get_extras,
-    get_prompt_fields,
+    get_field_dependencies,
     get_prompts_for_note,
     interpolate_prompt_with_values,
 )
@@ -942,9 +942,18 @@ class NoteProcessor:
             mode=mode,
         )
         canonical_fields = {field.lower(): field for field in snapshot.field_order}
+        dependencies = {
+            field: set(
+                get_field_dependencies(
+                    node.input,
+                    get_extras(snapshot.note_type, field, snapshot.deck_id),
+                )
+            )
+            for field, node in dag.items()
+        }
         relevant_fields = set(dag)
-        for node in dag.values():
-            relevant_fields.update(get_prompt_fields(node.input))
+        for fields in dependencies.values():
+            relevant_fields.update(fields)
 
         original_values = {
             canonical_fields[field]: values.get(field, "")
@@ -967,7 +976,7 @@ class NoteProcessor:
             ready = sorter.get_ready()
             next_batch = [dag[field] for field in ready]
             for node in next_batch:
-                missing = set(get_prompt_fields(node.input)) - set(values)
+                missing = dependencies[node.field] - set(values)
                 failed_dependencies = {
                     parent.field for parent in node.in_nodes
                 } & blocked

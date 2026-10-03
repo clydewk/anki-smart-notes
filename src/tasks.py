@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from aqt import mw
 from PyQt6 import sip
 
+from .chatgpt_auth import account_epoch, chatgpt_auth
 from .config import config, config_context
 from .job_context import (
     JobCancelledError,
@@ -145,15 +146,18 @@ class ProfileWorker:
         if not context.ui_valid():
             raise JobCancelledError("The originating window is closed.")
         settings = config.snapshot()
+        chatgpt_generation = chatgpt_auth.generation
         taskman = mw.taskman
 
         async def run() -> T:
             job_token = current_job.set(context)
             config_token = config_context.set(settings)
+            account_token = account_epoch.set(chatgpt_generation)
             try:
                 context.check()
                 return await op()
             finally:
+                account_epoch.reset(account_token)
                 config_context.reset(config_token)
                 current_job.reset(job_token)
 

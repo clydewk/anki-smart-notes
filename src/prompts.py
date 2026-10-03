@@ -40,10 +40,12 @@ from .models import (
     OverrideableTTSOptionsDict,
     PromptMap,
     SmartFieldType,
+    TTSDeliveryMode,
     normalize_field_extras,
     overridable_chat_options,
     overridable_image_options,
     overridable_tts_options,
+    tts_delivery_mode,
 )
 from .utils import to_lowercase_dict
 
@@ -138,6 +140,14 @@ def get_prompt_fields(prompt: str, lower: bool = True) -> list[str]:
     return [(field.lower() if lower else field) for field in fields]
 
 
+def get_field_dependencies(prompt: str, extras: FieldExtras | None) -> list[str]:
+    """Return field references used by the prompt and its active speech direction."""
+    fields = get_prompt_fields(prompt)
+    if extras and extras["type"] == "tts" and tts_delivery_mode(extras) == "custom":
+        fields.extend(get_prompt_fields(extras.get("tts_style") or ""))
+    return list(dict.fromkeys(fields))
+
+
 def interpolate_prompt_with_values(
     prompt: str,
     values: Mapping[str, str],
@@ -185,6 +195,7 @@ def add_or_update_prompts(
     image_options: dict[OverridableImageOptions, Any],
     chat_use_tools: bool | None,
     regenerate_when_batching: bool,
+    tts_delivery: TTSDeliveryMode | None = None,
 ) -> PromptMap:
     new_prompts_map = deepcopy(prompts_map)
 
@@ -221,6 +232,11 @@ def add_or_update_prompts(
     extras["use_custom_model"] = is_custom_model
     extras["chat_use_tools"] = chat_use_tools if type == "chat" else None
     extras["tts_style"] = tts_style if type == "tts" else None
+    extras["tts_delivery"] = (
+        tts_delivery or ("custom" if tts_style else "natural")
+        if type == "tts"
+        else None
+    )
     extras["tts_language"] = tts_language if type == "tts" else None
 
     # If we're doing custom settings, write out extra config

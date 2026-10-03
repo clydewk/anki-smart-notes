@@ -23,7 +23,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 from collections.abc import Callable
 from copy import deepcopy
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TypedDict
 
 from anki.decks import DeckId
 from anki.errors import NotFoundError
@@ -36,6 +36,7 @@ from aqt import (
     QLabel,
     QPushButton,
     QSpacerItem,
+    Qt,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -45,17 +46,18 @@ from PyQt6 import sip
 
 from .. import tasks
 from ..decks import deck_id_to_name_map
-from ..field_processor import field_processor
+from ..field_processor import SpeechResult, field_processor
 from ..job_context import JobContext
 from ..logger import logger, redact_text
 from ..markdown import convert_markdown_to_html, convert_text_to_html
 from ..media_utils import get_media_path, image_preview_data
+from ..models import DEFAULT_EXTRAS, OverrideableTTSOptionsDict
 from ..note_processor import NoteSnapshot, PendingMedia, ProcessedNote, snapshot_note
 from ..notes import get_note_type, get_valid_fields_for_prompt
-from ..prompts import get_prompts_for_note
+from ..prompts import get_extras, get_prompts_for_note
 from ..sentry import run_async_in_background_with_sentry
 from ..settings import with_widget_settings
-from ..tts_routing import select_tts_target, tts_audio_extension
+from ..tts_routing import tts_audio_extension
 from ..tts_utils import play_audio
 from .chat_options import ChatOptions
 from .image_displayer import ImageDisplayer
@@ -64,9 +66,6 @@ from .reactive_combo_box import ReactiveComboBox
 from .state_manager import StateManager
 from .tts_options import TTSOptions
 from .ui_utils import bound_dialog, font_small, scroll_page, show_message_box
-
-if TYPE_CHECKING:
-    from ..models import TTSModels, TTSProviders
 
 
 class CustomPrompt(QDialog):
@@ -498,65 +497,95 @@ class CustomTTSPrompt(CustomPrompt):
         )
 
     def render_response_box(self) -> QWidget:
-        # Create a play button from a QIcon
-        self.play_button = QPushButton("▶️ Play")
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.speech_details = QLabel(
+            "Generate speech to inspect its voice and delivery."
+        )
+        self.speech_details.setWordWrap(True)
+        self.speech_details.setTextFormat(Qt.TextFormat.PlainText)
+        self.speech_details.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.speech_details)
+        self.play_button = QPushButton("Play")
         self.play_button.setEnabled(False)
-        return self.play_button
+        layout.addWidget(self.play_button)
+        return page
 
     def on_generate(self) -> None:
         self.audio = None
+        self.speech_details.setText("Generating speech…")
         prompt = self._prompt_window.toPlainText()
         tts_settings = deepcopy(self.tts_options.state.s)
         snapshot = self._snapshot()
-        try:
-            target = select_tts_target(
-                tts_settings["tts_voice_pool"],
-                language=None,
-                selection_key=f"{snapshot.note_id}:{self._field_upper.lower()}",
+        extras = deepcopy(
+            get_extras(
+                note_type=snapshot.note_type,
+                field=self._field_upper,
+                deck_id=self._deck_id,
             )
-        except ValueError as error:
-            self._loading = False
-            self._update_ui_states()
-            show_message_box(str(error))
-            return
-        self.audio_extension = tts_audio_extension(target)
+            or DEFAULT_EXTRAS
+        )
+        extras.update(
+            type="tts",
+            use_custom_model=True,
+            tts_voice_pool=tts_settings["tts_voice_pool"],
+            tts_strip_html=tts_settings["tts_strip_html"],
+        )
 
-        async def get_tts_response():
-            return await field_processor.get_tts_response(
+        async def generate_speech() -> SpeechResult | None:
+            return await field_processor.generate_speech(
                 note_id=snapshot.note_id,
+                field=self._field_upper,
                 values=snapshot.lower_values(),
                 input_text=prompt,
-                model=cast("TTSModels", target["model"]),
-                provider=cast("TTSProviders", target["provider"]),
-                voice=target["voice"],
-                strip_html=tts_settings["tts_strip_html"],
+                extras=extras,
             )
 
-        def on_success(audio: bytes | None):
+        def on_success(speech: SpeechResult | None) -> None:
             self._loading = False
-            self.audio = audio
-
+            self.audio = speech.data if speech else None
+            if speech:
+                self.audio_extension = tts_audio_extension(speech.target)
+                self.speech_details.setText(
+                    f"Voice: {speech.target['voice']}\n"
+                    f"Model: {speech.target['model']}\n"
+                    f"Direction: {speech.style or 'Natural delivery'}"
+                )
+            else:
+                self.speech_details.setText("No audio response received.")
             self._update_ui_states()
-
-            if not audio:
-                logger.error("Custom prompt: no audio returned")
-                return
-
-            play_audio(audio)
+            if self.audio:
+                play_audio(self.audio)
 
         def on_failure(error: Exception):
+            self.speech_details.setText("Speech generation failed.")
             self._loading = False
             self._update_ui_states()
 
         run_async_in_background_with_sentry(
-            get_tts_response,
+            generate_speech,
             on_success=on_success,
             on_failure=on_failure,
             on_finished=self._finish_generation,
         )
 
     def render_custom_model(self) -> QWidget:
-        self.tts_options = TTSOptions(extras_visible=False)
+        extras = get_extras(
+            note_type=get_note_type(self._note),
+            field=self._field_upper,
+            deck_id=self._deck_id,
+        )
+        overrides: OverrideableTTSOptionsDict | None = (
+            {
+                "tts_voice_pool": extras.get("tts_voice_pool"),
+                "tts_strip_html": extras.get("tts_strip_html"),
+            }
+            if extras and extras["use_custom_model"]
+            else None
+        )
+        self.tts_options = TTSOptions(overrides, extras_visible=False)
         return self.tts_options
 
     def has_output(self) -> bool:

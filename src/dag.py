@@ -28,7 +28,7 @@ from .logger import logger
 from .models import PromptMap
 from .nodes import FieldNode
 from .notes import get_note_type
-from .prompts import get_extras, get_prompt_fields, get_prompts_for_note
+from .prompts import get_extras, get_field_dependencies, get_prompts_for_note
 from .utils import get_fields
 
 GenerationMode = Literal["review", "manual", "batch", "preview"]
@@ -58,6 +58,7 @@ def generate_fields_dag(
         return {}
 
     dag: dict[str, FieldNode] = {}
+    dependencies: dict[str, list[str]] = {}
 
     for field in field_order:
         field_lower = field.lower()
@@ -76,6 +77,7 @@ def generate_fields_dag(
 
         type = extras["type"]
         should_generate_automatically = extras["automatic"]
+        dependencies[field_lower] = get_field_dependencies(prompt, extras)
 
         dag[field_lower] = FieldNode(
             field=field_lower,
@@ -98,15 +100,11 @@ def generate_fields_dag(
         )
 
     for field, node in dag.items():
-        prompt = node.input
-        in_fields = get_prompt_fields(prompt)
-
-        for in_field in in_fields:
+        for in_field in dependencies[field]:
             if in_field in dag:
-                this_node = dag[field]
                 depends_on = dag[in_field]
-                this_node.in_nodes.append(depends_on)
-                depends_on.out_nodes.append(this_node)
+                node.in_nodes.append(depends_on)
+                depends_on.out_nodes.append(node)
 
     # Validate before traversal, including imported configurations.
     TopologicalSorter(
@@ -162,16 +160,21 @@ def prompt_has_error(
     """Checks if a prompt has an error. Returns the error message if there is one."""
     note_type = get_note_type(note)
     note_fields = {field.lower() for field in get_fields(note_type)}
-    prompt_fields = get_prompt_fields(prompt)
+    extras = (
+        get_extras(note_type, target_field, deck_id, prompts_map)
+        if target_field
+        else None
+    )
+    prompt_fields = get_field_dependencies(prompt, extras)
 
     # Check for referencing invalid fields
     for prompt_field in prompt_fields:
         if prompt_field not in note_fields:
-            return f"Invalid field in prompt: {prompt_field}"
+            return f"Invalid field in prompt or speech direction: {prompt_field}"
 
     # Can't reference itself
     if target_field and target_field.lower() in prompt_fields:
-        return "Cannot reference the target field in the prompt."
+        return "Cannot reference the target field in the prompt or speech direction."
 
     try:
         generate_fields_dag(

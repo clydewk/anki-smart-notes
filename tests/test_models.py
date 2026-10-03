@@ -1018,6 +1018,7 @@ async def test_google_gemini_tts_uses_header_auth_and_wraps_pcm_as_wav(
             {
                 "candidates": [
                     {
+                        "finishReason": "STOP",
                         "content": {
                             "parts": [
                                 {"text": "metadata"},
@@ -1030,7 +1031,7 @@ async def test_google_gemini_tts_uses_header_auth_and_wraps_pcm_as_wav(
                                     }
                                 },
                             ]
-                        }
+                        },
                     }
                 ]
             }
@@ -2383,6 +2384,74 @@ async def test_cancelled_openai_request_releases_reservation(
     assert bool(usage.estimated_total_tokens) == dispatched
     assert usage.used_total_tokens == usage.estimated_total_tokens
     assert request_accounting.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider, api_mode",
+    [("openai", "responses"), ("Compat", "responses"), ("Compat", "chat_completions")],
+)
+async def test_text_bound_closes_real_stream_and_releases_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider: str,
+    api_mode: str,
+) -> None:
+    tracker = ChatUsageTracker(state_path=str(tmp_path / "usage.json"))
+    configuration = custom_provider_test_config(
+        chat_api_mode=api_mode, streaming_mode="enabled"
+    )
+    configuration.openai_api_key = "test-key"
+    configuration.openai_endpoint = "https://api.openai.com"
+    configuration.openai_daily_token_budget_enabled = True
+    monkeypatch.setattr("src.chat_provider.config", configuration)
+    monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    model = "gpt-5.6-sol" if provider == "openai" else "compat-model"
+    events = (
+        [
+            {"type": "response.output_text.delta", "delta": "too large"},
+            response_completed_event("next", text="ok"),
+        ]
+        if api_mode == "responses"
+        else [
+            {"choices": [{"delta": {"content": "too large"}}]},
+            {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]},
+        ]
+    )
+    responses = [
+        httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=httpx.ByteStream(f"data: {json.dumps(event)}\n\n".encode()),
+        )
+        for event in events
+    ]
+    pending = iter(responses)
+    runtime = ProviderRuntime()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: next(pending))
+    ) as client:
+        monkeypatch.setattr(runtime, "get_http_client", AsyncMock(return_value=client))
+        monkeypatch.setattr("src.chat_provider.provider_runtime", runtime)
+        chat = ChatProvider()
+        with pytest.raises(ResponseFormatError, match="text limit"):
+            await chat.generate_text(
+                TextGenerationRequest(
+                    "hello", model, provider, 0.5, None, response_character_limit=4
+                )
+            )
+        assert responses[0].is_closed
+        assert tracker.active_turn_reserved_total_locked() == 0
+        assert (
+            runtime.controller(f"text:{provider}:{model}", 4).snapshot()["inflight"]
+            == 0
+        )
+        assert request_accounting.get() is None
+        result = await chat.generate_text(
+            TextGenerationRequest("hello", model, provider, 0.5, None)
+        )
+        assert result.text == "ok"
+        assert responses[1].is_closed
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,7 @@ import pytest
 from src.built_in_tools import BuiltInToolContext, BuiltInToolProvider
 from src.chat_provider import TextGenerationResult
 from src.config import Config
-from src.field_processor import FieldProcessor
+from src.field_processor import FieldProcessor, SpeechResult
 from src.mcp_runtime import (
     McpServerInfo,
     McpServerProbeResult,
@@ -721,7 +721,7 @@ async def test_tool_registry_merges_built_in_and_mcp_tools(
                 "tts_language": None,
                 "tts_style": None,
             },
-            "get_tts_response",
+            "generate_speech",
             b"audio",
             "[sound:Basic-back-42.mp3]",
         ),
@@ -754,7 +754,12 @@ async def test_field_processor_defers_media_writes(
         "src.field_processor.get_extras", lambda *args, **kwargs: extras
     )
     processor = FieldProcessor(MagicMock(), MagicMock(), MagicMock())
-    generate = AsyncMock(return_value=data)
+    generated = (
+        SpeechResult(data, extras["tts_voice_pool"][0], "", "hello")
+        if field_type == "tts"
+        else data
+    )
+    generate = AsyncMock(return_value=generated)
     monkeypatch.setattr(processor, method_name, generate)
     node = FieldNode(
         field="back",

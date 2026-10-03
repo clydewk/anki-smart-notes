@@ -144,8 +144,10 @@ import src.utils as utils_module
 import src.ui.prompt_dialog as prompt_module
 import src.config as config_module
 import src.ui.addon_options_dialog as options_module
+import src.ui.chatgpt_account as account_module
 
 app = QApplication([])
+account_module.chatgpt_auth.status = lambda: None
 defaults = json.loads(Path("config.json").read_text())
 class Manager:
     def __init__(self):
@@ -318,11 +320,13 @@ import src.decks as decks_module
 import src.notes as notes_module
 import src.utils as utils_module
 import src.ui.addon_options_dialog as options_module
+import src.ui.chatgpt_account as account_module
 import src.ui.prompt_dialog as prompt_module
 from src.ui.chat_options import ChatOptions
 from src.ui.custom_prompt import CustomTextPrompt
 
 app = QApplication([])
+account_module.chatgpt_auth.status = lambda: None
 ChatOptions._refresh_openai_models_if_needed = lambda *args: None
 defaults = json.loads(Path("config.json").read_text())
 defaults.update(openai_api_key="persisted-key", tts_strip_html=True)
@@ -354,11 +358,11 @@ requests = []
 async def get_chat_response(**kwargs):
     requests.append((kwargs, config_module.config.openai_api_key))
     return "complete response"
-async def get_tts_response(**kwargs):
+async def generate_speech(**kwargs):
     requests.append((kwargs, config_module.config.openai_api_key))
-    return b"audio"
+    return prompt_module.SpeechResult(b"audio", {"provider": "openai", "model": "tts-1", "voice": "alloy", "enabled": True, "language": None}, "", "captured source")
 processor = SimpleNamespace(field_processor=SimpleNamespace(
-    get_chat_response=get_chat_response, get_tts_response=get_tts_response,
+    get_chat_response=get_chat_response, generate_speech=generate_speech,
 ))
 parent = options_module.AddonOptionsDialog(processor)
 parent.state.update({"openai_api_key": "draft-key"})
@@ -438,7 +442,9 @@ try:
 finally:
     config_module.config_context.reset(token)
     captured["on_finished"]()
-assert requests[-1][0]["strip_html"] is True
+assert requests[-1][0]["extras"]["use_custom_model"] is False
+assert captured["settings"]["tts_strip_html"] is True
+assert requests[-1][0]["field"] == "Back"
 assert not tts.state.s["is_loading_prompt"]
 
 def reject_launch(*args, **kwargs):
@@ -608,10 +614,12 @@ import src.config as config_module
 import src.sentry as sentry_module
 import src.tasks as tasks
 import src.ui.addon_options_dialog as options_module
+import src.ui.chatgpt_account as account_module
 import src.ui.chat_options as chat_module
 from src.job_context import JobCancelledError
 
 app = QApplication([])
+account_module.chatgpt_auth.status = lambda: None
 defaults = json.loads(Path("config.json").read_text())
 defaults.update(openai_api_key="configured-test-key", chat_provider="openai", chat_model="gpt-5.6-sol")
 class Manager:

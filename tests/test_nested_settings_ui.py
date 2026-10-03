@@ -27,12 +27,13 @@ def test_nested_editors_preserve_drafts_and_make_preview_data_explicit(
     tmp_path: Path,
 ) -> None:
     script = r"""
+import asyncio
 import json
 import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from PyQt6.QtWidgets import QApplication, QDialogButtonBox, QPlainTextEdit
+from PyQt6.QtWidgets import QApplication, QDialogButtonBox, QPlainTextEdit, QScrollArea, QTabWidget
 from anki.collection import Collection
 from src.config import config_context
 from src.constants import GLOBAL_DECK_ID
@@ -41,6 +42,7 @@ import src.decks as decks_module
 import src.notes as notes_module
 import src.utils as utils_module
 import src.ui.prompt_dialog as prompt_module
+import src.ui.custom_prompt as palette_module
 from src.ui.chat_options import ChatOptions
 from src.ui.image_options import ImageOptions
 from src.ui.tts_options import TTSOptions
@@ -50,7 +52,7 @@ settings = json.loads(Path("config.json").read_text())
 settings.update(openai_api_key="test-key", chat_reasoning_effort="xhigh", prompts_map={"note_types": {}})
 config_context.set(settings)
 collection = Collection(str(Path(sys.argv[1]) / "nested.anki2"))
-for module in [decks_module, notes_module, utils_module, prompt_module]:
+for module in [decks_module, notes_module, utils_module, prompt_module, palette_module]:
     module.mw = SimpleNamespace(col=collection)
 messages = []
 prompt_module.show_message_box = lambda *args, **kwargs: messages.append(args)
@@ -103,6 +105,86 @@ for kind in ("chat", "image", "tts"):
         calls[-1][1]["on_finished"]()
         calls.clear()
     dialog.reject()
+
+speech_extras = deepcopy(DEFAULT_EXTRAS)
+speech_extras.update(type="tts", tts_style="Warm {{Front}}", tts_voice_pool=[{
+    "provider": "google", "model": "gemini-3.8-flash-tts", "voice": "Kore",
+    "language": None, "enabled": True,
+}], use_custom_model=True)
+speech_map = {"note_types": {"Basic": {str(GLOBAL_DECK_ID): {"fields": {"Back": "{{Front}}"}, "extras": {"Back": speech_extras}}}}}
+speech_original = deepcopy(speech_map)
+speech_saved = []
+speech = prompt_module.PromptDialog(speech_map, processor, speech_saved.append, field_type="tts", deck_id=GLOBAL_DECK_ID, card_type="Basic", field="Back", prompt="{{Front}}")
+speech.resize(800, 650)
+speech.show()
+app.processEvents()
+assert speech.state.s["tts_delivery"] == "custom"
+assert speech.tts_delivery_combo.currentText() == "Custom"
+assert not speech.tts_style_box.isHidden()
+speech.load_sample()
+assert "Sample source" in speech.sample_fields.toPlainText()
+speech.tts_delivery_combo.setCurrentIndex(speech.tts_delivery_combo.findData("automatic"))
+assert speech.state.s["tts_delivery"] == "automatic"
+assert speech.tts_style_box.isHidden()
+assert "one text request" in speech.tts_delivery_help.text()
+assert "Gemini 3.8" in speech.tts_delivery_help.text()
+assert speech.state.s["tts_style"] == "Warm {{Front}}"
+for index in range(3):
+    speech.findChild(QTabWidget).setCurrentIndex(index)
+    app.processEvents()
+    page = speech.findChild(QTabWidget).currentWidget()
+    assert isinstance(page, QScrollArea)
+    assert page.horizontalScrollBar().maximum() == 0
+    assert speech.standard_buttons.geometry().bottom() < speech.height()
+speech.findChild(QTabWidget).setCurrentIndex(0)
+app.processEvents()
+assert speech.grab().save(str(Path(sys.argv[1]) / "speech-delivery-800x650.png"))
+speech.on_accept()
+assert speech_saved[0]["note_types"]["Basic"][str(GLOBAL_DECK_ID)]["extras"]["Back"]["tts_delivery"] == "automatic"
+assert speech_map == speech_original
+cancelled = prompt_module.PromptDialog(speech_map, processor, speech_saved.append, field_type="tts", deck_id=GLOBAL_DECK_ID, card_type="Basic", field="Back", prompt="{{Front}}")
+cancelled.state.update({"tts_delivery": "natural", "tts_style": "Changed draft"})
+assert cancelled.tts_style_box.isHidden()
+cancelled.reject()
+assert len(speech_saved) == 1
+assert speech_map == speech_original
+preview = prompt_module.SpeechTestDialog(prompt_module.SpeechResult(b"audio", speech_extras["tts_voice_pool"][0], "Calm <sigh> delivery", "Text <sigh> stays literal."))
+preview.resize(800, 650)
+preview.show()
+app.processEvents()
+preview_text = preview.findChild(QPlainTextEdit).toPlainText()
+assert "Kore" in preview_text and "gemini-3.8-flash-tts" in preview_text
+assert "Direction: Calm <sigh> delivery" in preview_text
+assert "Text <sigh> stays literal." in preview_text
+assert preview.findChild(QPlainTextEdit).isReadOnly()
+assert preview.grab().save(str(Path(sys.argv[1]) / "speech-result-800x650.png"))
+preview.close()
+settings["prompts_map"] = speech_map
+palette_requests = []
+async def generate_speech(**kwargs):
+    palette_requests.append(kwargs)
+    return prompt_module.SpeechResult(b"audio", speech_extras["tts_voice_pool"][0], "Warm sample", "Sample source")
+palette_module.field_processor.generate_speech = generate_speech
+palette_jobs = []
+def launch_palette(operation, **callbacks):
+    palette_jobs.append((operation, callbacks))
+palette_module.run_async_in_background_with_sentry = launch_palette
+palette_module.play_audio = lambda data: None
+palette = palette_module.CustomTTSPrompt(note, GLOBAL_DECK_ID, "Back", lambda result: None)
+assert palette.tts_options.state.s["tts_voice_pool"] == speech_extras["tts_voice_pool"]
+palette._on_generate()
+operation, callbacks = palette_jobs[-1]
+result = asyncio.run(operation())
+callbacks["on_success"](result)
+callbacks["on_finished"]()
+assert palette_requests[-1]["extras"]["tts_style"] == "Warm {{Front}}"
+assert palette_requests[-1]["field"] == "Back"
+assert palette.audio == b"audio" and palette.audio_extension == "wav"
+assert "Kore" in palette.speech_details.text()
+assert "Warm sample" in palette.speech_details.text()
+assert palette._save_button.isEnabled()
+assert note["Back"] == ""
+settings["prompts_map"] = {"note_types": {}}
 
 extras = deepcopy(DEFAULT_EXTRAS)
 extras.update(type="chat", use_custom_model=True, chat_provider="openai", chat_model="custom-long-model-id", chat_temperature=0, regenerate_when_batching=True)
@@ -258,8 +340,10 @@ from PyQt6.QtWidgets import QApplication
 from src.job_context import JobCancelledError
 import src.config as config_module
 import src.ui.addon_options_dialog as options_module
+import src.ui.chatgpt_account as account_module
 
 app = QApplication([])
+account_module.chatgpt_auth.status = lambda: None
 defaults = json.loads(Path("config.json").read_text())
 defaults["mcp_servers"] = [
     {"id": name, "name": name, "enabled": True, "transport": "stdio", "command": "unused-test-command", "args": [], "cwd": "", "env": [], "env_passthrough": [], "url": "", "headers": [], "header_env_vars": []}

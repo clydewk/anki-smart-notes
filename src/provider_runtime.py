@@ -34,7 +34,7 @@ from .constants import MAX_RETRIES, MAX_RETRY_WAIT_SECONDS, RETRY_BASE_SECONDS
 from .logger import logger, redact_text
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping
+    from collections.abc import AsyncGenerator, Mapping
 
 
 class ProviderUnavailableError(Exception):
@@ -748,7 +748,7 @@ class ProviderRuntime:
         model: str,
         timeouts: RequestTimeouts,
         max_retries: int = MAX_RETRIES,
-    ) -> AsyncIterator[dict[str, Any]]:
+    ) -> AsyncGenerator[dict[str, Any]]:
         controller = self.controller(key, initial_window)
         client = await self.get_http_client()
 

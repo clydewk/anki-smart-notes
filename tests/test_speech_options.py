@@ -37,6 +37,13 @@ import src.ui.tts_options as speech
 
 app = QApplication([])
 config_context.set(json.loads(Path("config.json").read_text()))
+gemini = speech.get_gemini_voices()
+assert {voice["model"] for voice in gemini} == {
+    "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts",
+    "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts",
+}
+assert len(gemini) == 150
+assert {voice["voice"] for voice in gemini if voice["model"] == "gemini-3.8-flash-tts"} == {voice["voice"] for voice in gemini if voice["model"] == "gemini-2.5-pro-preview-tts"}
 options = speech.TTSOptions({"tts_voice_pool": [
     {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "marin", "enabled": True, "language": None},
 ]})

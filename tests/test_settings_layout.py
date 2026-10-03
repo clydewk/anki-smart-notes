@@ -35,6 +35,7 @@ from PyQt6.QtCore import QPersistentModelIndex, Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QLabel, QPushButton, QScrollArea
 from anki.collection import Collection
+from src.chatgpt_auth import ChatGPTAuth
 from src.config import config, config_context
 from src.constants import GLOBAL_DECK_ID
 from src.models import DEFAULT_EXTRAS
@@ -42,8 +43,10 @@ import src.decks as decks_module
 import src.notes as notes_module
 import src.utils as utils_module
 import src.ui.addon_options_dialog as options_module
+import src.ui.chatgpt_account as account_module
 
 app = QApplication([])
+account_module.chatgpt_auth = ChatGPTAuth(Path(sys.argv[1]) / "chatgpt.json")
 collection = Collection(str(Path(sys.argv[1]) / "layout.anki2"))
 collection_window = SimpleNamespace(col=collection)
 for module in [decks_module, notes_module, utils_module]:

@@ -56,29 +56,31 @@ from ..config import config, key_or_config_val
 from ..constants import API_KEY_MISSING_MESSAGE, GLOBAL_DECK_ID
 from ..dag import prompt_has_error
 from ..decks import deck_id_to_name_map, get_all_deck_ids
-from ..field_processor import PromptUsageContext
+from ..field_processor import PromptUsageContext, SpeechResult
 from ..logger import logger, redact_text
 from ..media_utils import image_preview_data
 from ..models import (
     DEFAULT_EXTRAS,
+    GEMINI_METADATA_TTS_MODELS,
     OverridableChatOptionsDict,
     OverridableImageOptionsDict,
     OverrideableTTSOptionsDict,
     PromptMap,
     SmartFieldType,
-    TTSModels,
-    TTSProviders,
+    TTSDeliveryMode,
     TTSVoiceTarget,
     openai_supports_temperature,
     overridable_chat_options,
     overridable_image_options,
     overridable_tts_options,
+    tts_delivery_mode,
 )
 from ..note_processor import NoteProcessor, snapshot_note
 from ..notes import get_note_types, get_random_note, get_valid_fields_for_prompt
 from ..prompts import (
     add_or_update_prompts,
     get_extras,
+    get_field_dependencies,
     get_prompt_fields,
     get_prompts_for_note,
     interpolate_prompt_with_values,
@@ -86,7 +88,7 @@ from ..prompts import (
 )
 from ..sentry import run_async_in_background_with_sentry
 from ..settings import resolve_field_settings, with_widget_settings
-from ..tts_routing import select_tts_target
+from ..tts_routing import eligible_tts_targets, select_tts_target
 from ..tts_utils import play_audio
 from ..utils import get_fields
 from .chat_options import ChatOptions, all_chat_providers
@@ -149,6 +151,7 @@ class State(TypedDict):
     decks: list[DeckId]
     regenerate_when_batching: bool
     tts_style: str
+    tts_delivery: TTSDeliveryMode
     tts_language: str
     chat_use_tools: bool
 
@@ -162,6 +165,7 @@ class PartialState(TypedDict):
     selected_note_type: str
     selected_deck: DeckId
     tts_style: str
+    tts_delivery: TTSDeliveryMode
     tts_language: str
 
 
@@ -268,6 +272,7 @@ class PromptDialog(QDialog):
             "tts_source_fields": default_note_state["tts_source_fields"],
             "selected_tts_source_field": selected_tts_source_field,
             "tts_style": extras.get("tts_style") or "",
+            "tts_delivery": tts_delivery_mode(extras),
             "tts_language": extras.get("tts_language") or "",
             # target fields
             "note_fields": target_fields,
@@ -318,6 +323,8 @@ class PromptDialog(QDialog):
     def render_ui(self) -> None:
         self.render_buttons()
         self.render_automatic_button()
+        if self.state.s["type"] == "tts":
+            self.render_tts_delivery()
         if hasattr(self, "token_usage_label"):
             self.render_token_usage()
         if hasattr(self, "effective_summary"):
@@ -398,32 +405,42 @@ class PromptDialog(QDialog):
         prompt_group = QGroupBox("Speech content" if field_type == "tts" else "Prompt")
         prompt_layout = QVBoxLayout()
 
-        # Style Instructions for Gemini TTS
-        if self.state.s["type"] == "tts":
-            style_label = QLabel("Voice style (optional)")
-            style_label.setFont(font_bold)
+        if field_type == "tts":
+            delivery_form = default_form_layout()
+            self.tts_delivery_combo = QComboBox()
+            for label, value in (
+                ("Natural", "natural"),
+                ("Custom", "custom"),
+                ("Automatic", "automatic"),
+            ):
+                self.tts_delivery_combo.addItem(label, value)
+            self.tts_delivery_combo.currentIndexChanged.connect(
+                lambda _: self.state.update(
+                    {"tts_delivery": self.tts_delivery_combo.currentData()}
+                )
+            )
+            delivery_form.addRow("Delivery:", self.tts_delivery_combo)
+            prompt_layout.addLayout(delivery_form)
+            self.tts_delivery_help = QLabel()
+            self.tts_delivery_help.setWordWrap(True)
+            self.tts_delivery_help.setTextFormat(Qt.TextFormat.PlainText)
+            prompt_layout.addWidget(self.tts_delivery_help)
             self.tts_style_box = ReactiveEditText(self.state, "tts_style")
+            self.tts_style_box.setAccessibleName("Custom speech direction")
             self.tts_style_box.setAlignment(Qt.AlignmentFlag.AlignTop)
             self.tts_style_box.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
             self.tts_style_box.setWordWrapMode(
                 QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
             )
             self.tts_style_box.setPlaceholderText(
-                'e.g. "Read aloud in a warm and friendly tone: "'
+                "Warm reassurance, with a measured pace. You can reference {{fields}}."
             )
             self.tts_style_box.setMinimumHeight(60)
             self.tts_style_box.setMaximumHeight(80)
             self.tts_style_box.on_change.connect(
                 lambda text: self.state.update({"tts_style": text})
             )
-
-            prompt_layout.addWidget(style_label)
             prompt_layout.addWidget(self.tts_style_box)
-            style_help = QLabel(
-                "Style applies to Google Gemini voices and OpenAI gpt-4o-mini-tts. Other models speak the content without these instructions."
-            )
-            style_help.setWordWrap(True)
-            prompt_layout.addWidget(style_help)
 
         # Prompt Label + Insert Button
         prompt_label_layout = QHBoxLayout()
@@ -504,6 +521,27 @@ class PromptDialog(QDialog):
             if hasattr(self, "tts_source_combo_box"):
                 self.tts_source_combo_box.setEnabled(False)
         return container
+
+    @with_widget_settings
+    def render_tts_delivery(self) -> None:
+        mode = self.state.s["tts_delivery"]
+        self.tts_delivery_combo.blockSignals(True)
+        self.tts_delivery_combo.setCurrentIndex(self.tts_delivery_combo.findData(mode))
+        self.tts_delivery_combo.blockSignals(False)
+        self.tts_style_box.setVisible(mode == "custom")
+        explanations = {
+            "natural": "Speaks the text as written using the selected voice’s natural delivery.",
+            "custom": (
+                "Describe tone and pacing. Supports Gemini voices and OpenAI gpt-4o-mini-tts. "
+                "Gemini 3.8 keeps this direction separate from the spoken text."
+            ),
+            "automatic": (
+                f"Uses your default text model ({config.chat_provider} / {config.chat_model}) "
+                "to choose tone and pacing, adding one text request before speech generation. "
+                "Keeps your text and voice unchanged. Requires Gemini 3.8 TTS voices."
+            ),
+        }
+        self.tts_delivery_help.setText(explanations[mode])
 
     def show_insert_field_menu(self):
         menu = QMenu(self)
@@ -614,9 +652,10 @@ class PromptDialog(QDialog):
                 provider = settings["chat_provider"]
                 effort = settings.get("chat_reasoning_effort")
                 supports_reasoning = (
-                    provider == "openai" or provider not in all_chat_providers
+                    provider in {"openai", "chatgpt"}
+                    or provider not in all_chat_providers
                 )
-                supports_temperature = (
+                supports_temperature = provider != "chatgpt" and (
                     not supports_reasoning
                     or openai_supports_temperature(settings["chat_model"], effort)
                 )
@@ -698,11 +737,22 @@ class PromptDialog(QDialog):
                 )
         except ValueError as error:
             destination = str(error)
-        self.sample_description.setText(
-            f"Sample: {self.state.s['selected_note_type']} · note {self.sample_note.id}\nProvider: {destination}"
-        )
+        description = f"Sample: {self.state.s['selected_note_type']} · note {self.sample_note.id}\nProvider: {destination}"
+        if kind == "tts":
+            description += f"\nDelivery: {self.state.s['tts_delivery'].title()}"
+            if self.state.s["tts_delivery"] == "automatic":
+                description += (
+                    f"\nText model: {config.chat_provider} / {config.chat_model}"
+                )
+        self.sample_description.setText(description)
         values = {name.lower(): value for name, value in self.sample_note.items()}
-        fields = get_prompt_fields(self.state.s["prompt"])
+        extras = DEFAULT_EXTRAS.copy()
+        extras.update(
+            type=kind,
+            tts_style=self.state.s["tts_style"],
+            tts_delivery=self.state.s["tts_delivery"],
+        )
+        fields = get_field_dependencies(self.state.s["prompt"], extras)
         self.sample_fields.setPlainText(
             "\n\n".join(
                 f"{name}:\n{values.get(name, '[Missing field]')}" for name in fields
@@ -793,6 +843,7 @@ class PromptDialog(QDialog):
         }
         if self.state.s["type"] == "tts":
             updates["tts_style"] = (extras.get("tts_style") or "") if extras else ""
+            updates["tts_delivery"] = tts_delivery_mode(extras or DEFAULT_EXTRAS)
             updates["tts_language"] = (
                 (extras.get("tts_language") or "") if extras else ""
             )
@@ -841,6 +892,7 @@ class PromptDialog(QDialog):
             "tts_source_fields": source_fields,
             "selected_tts_source_field": source_field,
             "tts_style": "",
+            "tts_delivery": "natural",
             "tts_language": "",
         }
 
@@ -853,6 +905,7 @@ class PromptDialog(QDialog):
         if self.repairing:
             new_state["prompt"] = self.state.s["prompt"]
             new_state["tts_style"] = self.state.s["tts_style"]
+            new_state["tts_delivery"] = self.state.s["tts_delivery"]
             new_state["tts_language"] = self.state.s["tts_language"]
         self.sample_note = None
         self.state.update(cast("dict[str, Any]", new_state))
@@ -870,6 +923,7 @@ class PromptDialog(QDialog):
         if self.repairing:
             new_state["prompt"] = self.state.s["prompt"]
             new_state["tts_style"] = self.state.s["tts_style"]
+            new_state["tts_delivery"] = self.state.s["tts_delivery"]
             new_state["tts_language"] = self.state.s["tts_language"]
         self.sample_note = None
         self.state.update(cast("dict[str, Any]", new_state))
@@ -1079,29 +1133,10 @@ class PromptDialog(QDialog):
         chat_provider = effective_settings["chat_provider"]
         chat_model = effective_settings["chat_model"]
 
-        tts_target: TTSVoiceTarget | None = None
-        tts_provider: TTSProviders | None = None
-        tts_model: TTSModels | None = None
-        tts_voice = ""
-        if self.state.s["type"] == "tts":
-            try:
-                tts_target = self.get_effective_tts_target(
-                    f"{snapshot.note_id}:{self.state.s['selected_note_field'].lower()}"
-                )
-            except ValueError as error:
-                show_message_box(str(error))
-                return
-            tts_provider = cast("TTSProviders", tts_target["provider"])
-            tts_model = cast("TTSModels", tts_target["model"])
-            tts_voice = tts_target["voice"]
-
         if self.state.s["type"] == "chat":
             if not self._ensure_api_key(chat_provider):
                 return
-        elif self.state.s["type"] == "tts":
-            if tts_provider is None or not self._ensure_api_key(tts_provider):
-                return
-        else:
+        elif self.state.s["type"] == "image":
             image_provider = (
                 self.image_options.state.s["image_provider"]
                 if self.state.s["use_custom_model"]
@@ -1111,7 +1146,16 @@ class PromptDialog(QDialog):
                 return
 
         field_state = deepcopy(self.state.s)
-        chat_settings = image_settings = tts_settings = effective_settings
+        chat_settings = image_settings = effective_settings
+        speech_extras = deepcopy(
+            get_extras(
+                note_type=field_state["selected_note_type"],
+                field=field_state["selected_note_field"],
+                deck_id=field_state["selected_deck"],
+                prompts=new_prompts_map,
+            )
+            or DEFAULT_EXTRAS
+        )
         daily_budget = config.openai_daily_token_budget
         budget_enabled = config.openai_daily_token_budget_enabled
         allow_empty_fields = config.allow_empty_fields
@@ -1123,7 +1167,13 @@ class PromptDialog(QDialog):
         )
 
         usage_scope_id = (
-            chat_usage_tracker.open_scope() if field_state["type"] == "chat" else None
+            chat_usage_tracker.open_scope()
+            if field_state["type"] == "chat"
+            or (
+                field_state["type"] == "tts"
+                and field_state["tts_delivery"] == "automatic"
+            )
+            else None
         )
 
         def finish() -> None:
@@ -1132,14 +1182,7 @@ class PromptDialog(QDialog):
                 self.state["is_loading_prompt"] = False
 
         def on_success(arg: bytes | None) -> None:
-            if field_state["type"] == "tts":
-                msg = f"Ran with fields: \n{stringified_vals}.\n Voice: {tts_provider} - {tts_voice} ({tts_model})\n\n"
-                if arg is not None:
-                    play_audio(arg)
-                else:
-                    msg += "No audio response received"
-                show_message_box(msg, custom_ok="Close")
-            elif arg is not None:
+            if arg is not None:
                 test_window = ImageTestDialog(
                     arg,
                     interpolate_prompt_with_values(prompt, values, allow_empty_fields)
@@ -1229,31 +1272,30 @@ class PromptDialog(QDialog):
         elif field_state["type"] == "tts":
 
             def tts_fn():
-                assert tts_provider is not None and tts_model is not None
-                prompt_to_use = prompt
-                style = field_state.get("tts_style")
-                if style and "gemini" in tts_model and tts_provider == "google":
-                    prompt_to_use = f"{style} {prompt}"
-                instructions = (
-                    style
-                    if style
-                    and tts_provider == "openai"
-                    and tts_model == "gpt-4o-mini-tts"
-                    else None
-                )
-
-                return self.processor.field_processor.get_tts_response(
+                return self.processor.field_processor.generate_speech(
                     note_id=snapshot.note_id,
+                    field=field_state["selected_note_field"],
                     values=values,
-                    input_text=prompt_to_use,
-                    provider=tts_provider,
-                    model=tts_model,
-                    voice=tts_voice,
-                    strip_html=tts_settings["tts_strip_html"],
-                    instructions=instructions,
+                    input_text=prompt,
+                    extras=speech_extras,
+                    show_error_box=False,
+                    usage_scope_id=usage_scope_id,
                 )
 
-            launch(tts_fn, on_success)
+            def on_speech_success(result: SpeechResult | None) -> None:
+                if result is None:
+                    show_message_box("No audio response received", custom_ok="Close")
+                    return
+                usage_summary = chat_usage_tracker.close_scope(usage_scope_id)
+                usage = (
+                    f"Delivery planning: {format_token_count(usage_summary.total_tokens)} reported tokens"
+                    if usage_summary.request_count
+                    else ""
+                )
+                play_audio(result.data)
+                SpeechTestDialog(result, usage=usage, parent=self).exec()
+
+            launch(tts_fn, on_speech_success)
         else:
 
             async def img_fn() -> bytes | None:
@@ -1395,6 +1437,23 @@ class PromptDialog(QDialog):
         if self.state.s["type"] == "tts":
             try:
                 self.get_effective_tts_target("validation")
+                if self.state.s["tts_delivery"] == "automatic":
+                    pool = (
+                        self.tts_options.state.s["tts_voice_pool"]
+                        if self.state.s["use_custom_model"]
+                        else config.tts_voice_pool
+                    )
+                    if any(
+                        voice["provider"] != "google"
+                        or voice["model"] not in GEMINI_METADATA_TTS_MODELS
+                        for voice in eligible_tts_targets(
+                            pool, self.state.s["tts_language"]
+                        )
+                    ):
+                        raise ValueError(
+                            "Automatic delivery requires Gemini 3.8 TTS voices. "
+                            "In Options, use a custom voice pool containing only Gemini 3.8 voices for this language."
+                        )
             except ValueError as error:
                 show_message_box(str(error))
                 return
@@ -1461,6 +1520,7 @@ class PromptDialog(QDialog):
             type=s["type"],
             tts_options=tts_options,
             tts_style=s.get("tts_style"),
+            tts_delivery=s["tts_delivery"],
             tts_language=s.get("tts_language"),
             chat_options={
                 k: self.chat_options.state.s[k] for k in overridable_chat_options
@@ -1490,6 +1550,29 @@ class TextTestDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         bound_dialog(self)
+
+
+class SpeechTestDialog(TextTestDialog):
+    def __init__(
+        self, speech: SpeechResult, *, usage: str = "", parent: QWidget | None = None
+    ) -> None:
+        target = speech.target
+        details = (
+            f"Voice: {target['voice']}\n"
+            f"Provider: {target['provider']}\n"
+            f"Model: {target['model']}\n\n"
+            f"Direction: {speech.style or 'Natural delivery'}\n\n"
+            f"Text to speak:\n{speech.transcript}"
+        )
+        if usage:
+            details += f"\n\n{usage}"
+        super().__init__(details, parent)
+        self.setWindowTitle("Speech preview")
+        buttons = self.findChild(QDialogButtonBox)
+        assert buttons is not None
+        play = buttons.addButton("Play again", QDialogButtonBox.ButtonRole.ActionRole)
+        assert play is not None
+        play.clicked.connect(lambda: play_audio(speech.data))
 
 
 class ImageTestDialog(QDialog):

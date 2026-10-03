@@ -80,6 +80,7 @@ from ..sentry import run_async_in_background_with_sentry
 from ..settings import with_widget_settings
 from ..utils import get_fields, get_file_path, get_version
 from .chat_options import ChatOptions
+from .chatgpt_account import ChatGPTAccountWidget
 from .custom_provider_dialog import CustomProviderDialog
 from .image_options import ImageOptions
 from .mcp_server_dialog import MCP_DOCS_URL, McpServerDialog
@@ -152,6 +153,7 @@ class AddonOptionsDialog(QDialog):
         self._mcp_job: JobHandle | None = None
         self.state = StateManager[State](self.make_initial_state())
         self.setup_ui()
+        self.finished.connect(self.chatgpt_account.cancel_sign_in)
 
     def setup_ui(self) -> None:
         self.setWindowTitle("Smart Notes Settings")
@@ -210,6 +212,8 @@ class AddonOptionsDialog(QDialog):
         self.scope_label.setText(
             f"Profile: {profile} · Changes apply when you save."
             if local
+            else "Shared across all profiles · Account actions apply immediately; other changes apply when you save."
+            if self.tabs.currentIndex() == 1
             else "Shared across all profiles · Changes apply when you save."
         )
 
@@ -303,8 +307,11 @@ class AddonOptionsDialog(QDialog):
     def render_providers_tab(self) -> QWidget:
         page, layout = self._page(
             "Providers",
-            "Manage shared credentials, OpenAI request options and custom endpoints.",
+            "Manage your ChatGPT account, shared API credentials and custom endpoints.",
         )
+        self.chatgpt_account = ChatGPTAccountWidget()
+        self.chatgpt_account.account_changed.connect(self._on_chatgpt_account_change)
+        layout.addWidget(self.chatgpt_account)
         credentials = QGroupBox("Credentials")
         form = default_form_layout()
         credentials.setLayout(form)
@@ -436,6 +443,10 @@ class AddonOptionsDialog(QDialog):
         layout.addWidget(custom)
         layout.addStretch()
         return page
+
+    def _on_chatgpt_account_change(self) -> None:
+        if self.chat_options.state.s["chat_provider"] == "chatgpt":
+            self.chat_options.refresh_custom_providers()
 
     def _update_custom_buttons(self) -> None:
         selected = bool(self.custom_table.selectedItems())

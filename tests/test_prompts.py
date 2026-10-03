@@ -22,7 +22,13 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 import src.prompts
-from src.prompts import add_or_update_prompts, get_prompt_fields, interpolate_prompt
+from src.models import DEFAULT_EXTRAS, TTSDeliveryMode
+from src.prompts import (
+    add_or_update_prompts,
+    get_field_dependencies,
+    get_prompt_fields,
+    interpolate_prompt,
+)
 from tests.mocks import MockConfig, MockNote
 
 if TYPE_CHECKING:
@@ -80,6 +86,25 @@ def test_get_prompt_fields(prompt: str, expected: list[str]) -> None:
 def test_get_prompt_fields_no_lower(prompt: str, expected: list[str]) -> None:
 
     assert get_prompt_fields(prompt, lower=False) == expected
+
+
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        (None, ["front", "tone"]),
+        ("custom", ["front", "tone"]),
+        ("natural", ["front"]),
+        ("automatic", ["front"]),
+    ],
+)
+def test_speech_direction_dependencies_follow_delivery_mode(
+    mode: TTSDeliveryMode | None, expected: list[str]
+) -> None:
+    extras = DEFAULT_EXTRAS.copy()
+    extras.update(type="tts", tts_style="{{Tone}} for {{Front}}", tts_delivery=mode)
+    assert get_field_dependencies("Read {{Front}}", extras) == expected
+    extras["type"] = "chat"
+    assert get_field_dependencies("Read {{Front}}", extras) == ["front"]
 
 
 @pytest.mark.parametrize(
@@ -210,6 +235,7 @@ def test_tts_language_is_independent_of_voice_pool_override() -> None:
     extras = updated["note_types"]["Basic"]["1"]["extras"]["Audio"]
     assert extras["tts_language"] == "Japanese"
     assert extras["tts_style"] == "Warm"
+    assert extras.get("tts_delivery") == "custom"
     assert extras["tts_voice_pool"] is None
     assert extras["tts_provider"] is None
     assert extras["tts_model"] is None
@@ -234,7 +260,9 @@ def test_tts_language_is_independent_of_voice_pool_override() -> None:
         image_options=cast("dict[OverridableImageOptions, Any]", {}),
         chat_use_tools=None,
         regenerate_when_batching=False,
+        tts_delivery="automatic",
     )
     override_extras = overridden["note_types"]["Basic"]["1"]["extras"]["Audio"]
     assert override_extras["tts_voice_pool"] == pool
     assert override_extras["tts_strip_html"] is True
+    assert override_extras.get("tts_delivery") == "automatic"
