@@ -65,6 +65,57 @@ def settle():
 """
 
 
+def test_prompt_file_dialogs_round_trip_numbered_json_names_in_the_draft(
+    tmp_path: Path,
+) -> None:
+    script = (
+        SETTINGS_SETUP
+        + """
+dialog = options_module.AddonOptionsDialog(MagicMock())
+options_module.mw = collection_window
+prompts = {"note_types": {"Basic": {str(GLOBAL_DECK_ID): {
+    "fields": {"Back": "Explain {{Front}}"},
+    "extras": {"Back": deepcopy(DEFAULT_EXTRAS)},
+}}}}
+dialog.state.update({"prompts_map": prompts})
+path = Path(sys.argv[1]) / "prompts.smart-notes-prompts (2).json"
+save_dialog = MagicMock(return_value=(str(path), ""))
+open_dialog = MagicMock(return_value=(str(path), ""))
+options_module.QFileDialog.getSaveFileName = save_dialog
+options_module.QFileDialog.getOpenFileName = open_dialog
+messages = []
+def message(text, *args, **kwargs):
+    messages.append(text)
+    return True
+options_module.show_message_box = message
+dialog.on_export_prompts(False)
+assert path.is_file()
+assert json.loads(path.read_text())["prompts_map"] == prompts
+assert save_dialog.call_args.args[2] == "prompts.smart-notes-prompts.json"
+dialog.state.update({"prompts_map": {"note_types": {}}})
+dialog.on_import_prompts(False)
+for file_dialog in (save_dialog, open_dialog):
+    name_filter = file_dialog.call_args.args[3]
+    assert name_filter.endswith("(*.json)"), name_filter
+    assert ";;" not in name_filter, "A compound-extension filter rejects numbered JSON names on macOS"
+assert dialog.state.s["prompts_map"] == prompts
+assert messages[-1] == "Prompts added to the draft. Save to keep them."
+assert settings["prompts_map"] == {"note_types": {}}
+dialog.reject()
+assert settings["prompts_map"] == {"note_types": {}}
+collection.close()
+"""
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize("size", [(800, 650), (640, 470)])
 @pytest.mark.parametrize("point_size", [13, 18])
 def test_every_settings_page_fits_native_viewport(

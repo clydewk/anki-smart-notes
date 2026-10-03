@@ -1075,7 +1075,7 @@ class AddonOptionsDialog(QDialog):
             self,
             "Export Smart Notes Prompts",
             "prompts.smart-notes-prompts.json",
-            "Smart Notes Prompt Export (*.smart-notes-prompts.json);;JSON (*.json)",
+            "JSON (*.json)",
         )
         if not file_path:
             return
@@ -1099,7 +1099,7 @@ class AddonOptionsDialog(QDialog):
             self,
             "Import Smart Notes Prompts",
             "",
-            "Smart Notes Prompt Export (*.smart-notes-prompts.json);;JSON (*.json)",
+            "JSON (*.json)",
         )
         if not file_path:
             return
