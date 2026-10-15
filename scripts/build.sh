@@ -108,7 +108,8 @@ for name in REQUIRED_RUNTIME_IMPORTS:
         raise SystemExit(f"Missing runtime dependency: {name}. Install requirements.txt first.")
     source = Path(next(iter(spec.submodule_search_locations))) if spec.submodule_search_locations else Path(spec.origin or "")
     if source.is_dir():
-        shutil.copytree(source, vendor / source.name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests", "_tests", "pytest_plugin.py"))
+        # WebSocket speedups are optional; ship the portable Python implementation.
+        shutil.copytree(source, vendor / source.name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.so", "*.pyd", "tests", "_tests", "pytest_plugin.py"))
     else:
         shutil.copy2(source, vendor / source.name)
     # Keep package metadata and license notices with the vendored modules.

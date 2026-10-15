@@ -38,7 +38,7 @@ jobs:
         run: '"${{ matrix.python }}" -m pytest'
       - name: Test independent MCP servers
         run: |
-          "${{ matrix.python }}" -m pip install mcp==1.12.4
+          "${{ matrix.python }}" -m pip install mcp==1.12.4 pydantic==2.11.10
           MCP_TEST_PYTHON="${{ github.workspace }}/${{ matrix.python }}" "${{ matrix.python }}" -m pytest tests/test_mcp.py
       - name: Build add-on
         run: ./scripts/build.sh build

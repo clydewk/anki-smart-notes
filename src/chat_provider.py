@@ -28,8 +28,6 @@ from contextlib import aclosing, asynccontextmanager, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
-from urllib.parse import urlparse
-from uuid import uuid4
 
 from .chat_usage import OpenAITurnPermit, chat_usage_tracker
 from .chatgpt_auth import chatgpt_auth
@@ -46,6 +44,7 @@ from .models import (
     openai_reasoning_efforts_for_model,
     openai_supports_chat_tools,
     openai_supports_temperature,
+    validate_openai_service_tier,
     validate_provider_model,
 )
 from .provider_runtime import (
@@ -288,7 +287,7 @@ def payload_length_metrics(payload: str | list[dict[str, Any]]) -> tuple[int, in
 
 def is_reasoning_model(model: str) -> bool:
     lowered = model.lower()
-    return lowered.startswith(("o", "gpt-5")) or lowered == "gpt-6-astra"
+    return lowered.startswith(("o", "gpt-5", "gpt-6"))
 
 
 def responses_timeouts(
@@ -793,10 +792,8 @@ class ChatProvider:
         usage: dict[str, Any] | None = None
         generated_bytes = 0
         async with asyncio.timeout(300), chatgpt_auth.session():
-            headers = await chatgpt_auth.headers()
-            headers["session-id"] = str(uuid4())
             for _ in range(13):
-                headers.update(await chatgpt_auth.headers())
+                headers = await chatgpt_auth.headers()
                 payload: dict[str, Any] = {
                     "model": request.model,
                     "instructions": "Generate the requested Anki field. Return only the final field content.",
@@ -805,9 +802,20 @@ class ChatProvider:
                     "store": False,
                     "include": ["reasoning.encrypted_content"],
                     "tools": [
-                        {**tool, "strict": False}
-                        for tool in self._responses_tools_payload(request.tools or [])
-                    ],
+                        {
+                            "type": "namespace",
+                            "name": "smart_notes",
+                            "description": "Smart Notes tools enabled for this field.",
+                            "tools": [
+                                {**tool, "strict": False}
+                                for tool in self._responses_tools_payload(
+                                    request.tools or []
+                                )
+                            ],
+                        }
+                    ]
+                    if definitions
+                    else [],
                 }
                 if request.reasoning_effort is not None:
                     payload["reasoning"] = {"effort": request.reasoning_effort}
@@ -872,6 +880,7 @@ class ChatProvider:
                     arguments = item.get("arguments")
                     if (
                         not isinstance(name, str)
+                        or item.get("namespace") != "smart_notes"
                         or name not in definitions
                         or not isinstance(call_id, str)
                         or not call_id
@@ -2039,13 +2048,17 @@ class ChatProvider:
             else "max_tokens": request.max_output_tokens,
         }
 
-        if request.model.lower() == "gpt-6-astra":
+        if request.model.lower().startswith("gpt-6"):
             payload["reasoning_effort"] = choose_reasoning_effort(
                 request.model, request.reasoning_effort
             )
         elif request.reasoning_effort and request.reasoning_effort != "none":
             payload["reasoning_effort"] = request.reasoning_effort
         else:
+            payload["temperature"] = request.temperature
+        if request.model.lower().startswith("gpt-6") and openai_supports_temperature(
+            request.model, payload.get("reasoning_effort")
+        ):
             payload["temperature"] = request.temperature
 
         if use_stream:
@@ -2267,17 +2280,20 @@ class ChatProvider:
             payload["tools"] = self._chat_tools_payload(request.tools)
             payload["tool_choice"] = "auto"
 
-        if request.model.lower() == "gpt-6-astra":
-            if request.tools and not openai_supports_chat_tools(request.model):
+        if request.model.lower().startswith("gpt-6"):
+            effort = choose_reasoning_effort(request.model, request.reasoning_effort)
+            if request.tools and not openai_supports_chat_tools(request.model, effort):
                 raise ValueError(
-                    "This model requires the Responses API for tool calling."
+                    "This model requires the Responses API for tool calling with the selected reasoning effort."
                 )
-            payload["reasoning_effort"] = choose_reasoning_effort(
-                request.model, request.reasoning_effort
-            )
+            payload["reasoning_effort"] = effort
         elif request.reasoning_effort and request.reasoning_effort != "none":
             payload["reasoning_effort"] = request.reasoning_effort
         else:
+            payload["temperature"] = request.temperature
+        if request.model.lower().startswith("gpt-6") and openai_supports_temperature(
+            request.model, payload.get("reasoning_effort")
+        ):
             payload["temperature"] = request.temperature
 
         response = await provider_runtime.request_json(
@@ -2801,29 +2817,23 @@ class ChatProvider:
             "tool_choice": "none",
         }
 
-        if (
-            request.provider == "openai"
-            and bool(getattr(config, "openai_fast_mode_enabled", False))
-            and not (
-                request.model.lower() == "gpt-6-astra"
-                and urlparse(config.openai_endpoint or OPENAI_BASE_URL).hostname
-                == "eu.api.openai.com"
+        if request.provider == "openai":
+            tier = getattr(config, "openai_service_tier", None) or (
+                "fast" if getattr(config, "openai_fast_mode_enabled", False) else "auto"
             )
-        ):
-            payload["service_tier"] = "fast"
+            validate_openai_service_tier(request.model, tier, config.openai_endpoint)
+            if tier != "auto":
+                payload["service_tier"] = tier
 
         if previous_response_id:
             payload["previous_response_id"] = previous_response_id
 
-        if request.model.lower() == "gpt-6-astra":
-            payload["reasoning"] = {
-                "effort": choose_reasoning_effort(
-                    request.model, request.reasoning_effort
-                )
-            }
-        elif request.reasoning_effort:
-            payload["reasoning"] = {"effort": request.reasoning_effort}
-        if openai_supports_temperature(request.model, request.reasoning_effort):
+        effort = request.reasoning_effort
+        if request.model.lower().startswith("gpt-6"):
+            effort = choose_reasoning_effort(request.model, effort)
+        if effort is not None:
+            payload["reasoning"] = {"effort": effort}
+        if openai_supports_temperature(request.model, effort):
             payload["temperature"] = request.temperature
 
         if request.tools and allow_tools:

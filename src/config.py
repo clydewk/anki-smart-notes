@@ -42,6 +42,7 @@ from .models import (
     McpServerConfig,
     OpenAIModels,
     OpenAIReasoningEffort,
+    OpenAIServiceTier,
     PromptMap,
     ProviderSettings,
     TTSModels,
@@ -123,6 +124,10 @@ def normalize_config(values: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("openai_fast_mode_enabled", "openai_daily_token_budget_enabled"):
         if not isinstance(normalized.get(key), bool):
             normalized[key] = False
+    if normalized.get("openai_service_tier") is None:
+        normalized["openai_service_tier"] = (
+            "fast" if normalized["openai_fast_mode_enabled"] else "auto"
+        )
     if not isinstance(normalized.get("openai_daily_token_budget"), int):
         normalized["openai_daily_token_budget"] = 1_000_000
     normalized["built_in_tools"] = normalize_built_in_tools_config(
@@ -180,6 +185,7 @@ class Config:
     last_message_id: int
     debug: bool
     openai_fast_mode_enabled: bool
+    openai_service_tier: OpenAIServiceTier
     openai_daily_token_budget_enabled: bool
     openai_daily_token_budget: int
 

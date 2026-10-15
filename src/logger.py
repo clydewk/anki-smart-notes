@@ -28,10 +28,11 @@ from aqt import mw
 from .utils import get_file_path, is_production
 
 SECRET_KEY_RE = re.compile(
-    r"(?:api.?key|authorization|password|secret|token|credential)", re.IGNORECASE
+    r"(?:api.?key|authorization|password|secret|token|credential|code_verifier)",
+    re.IGNORECASE,
 )
 SECRET_VALUE_RE = re.compile(
-    r"([\"']?(?:[\w-]*(?:api.?key|token|secret|password)|authorization)[\"']?\s*[:=]\s*)"
+    r"([\"']?(?:[\w-]*(?:api.?key|token|secret|password)|id_token_hint|code_verifier|authorization)[\"']?\s*[:=]\s*)"
     r"(?:[\"'][^\"']*[\"']|[^\s&,}]+)",
     re.IGNORECASE,
 )
@@ -51,7 +52,7 @@ def redact_text(value: str) -> str:
         r"(Bearer\s+)[^\s\"',}]+", r"\1[REDACTED]", value, flags=re.IGNORECASE
     )
     value = re.sub(
-        r"([?&](?:key|api_key|token|access_token|secret|password)=)[^&#\s]*",
+        r"([?&](?:key|api_key|token|access_token|refresh_token|id_token|id_token_hint|code|code_verifier|secret|password)=)[^&#\s]*",
         r"\1[REDACTED]",
         value,
         flags=re.IGNORECASE,

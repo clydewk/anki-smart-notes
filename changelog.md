@@ -1,10 +1,19 @@
-# Unreleased — Gemini speech delivery and native ChatGPT provider
+# Unreleased — Provider compatibility and speech delivery
+
+- Add GPT-6.1 Sol, GPT-6 Sol, and GPT-6 Luna with current reasoning, temperature, and tool capabilities.
+- Replace the API Fast checkbox with Project default, Standard, Fast, and Ultrafast; preserve legacy settings and validate model/region combinations.
+- Warn about announced OpenAI model shutdowns and reject retired models while preserving saved selections.
+- Add GPT Realtime 2.1 Mini speech with bounded, cancellable WebSocket generation and completion-validated WAV output; validate legacy Speech API input lengths.
+- Correct GPT Image size presets, allow slow generations, and avoid replaying ambiguously submitted image requests.
+- Recognize structured OpenAI billing and throttling errors and use jittered retry backoff without shortening server delays.
 
 - Add Gemini 3.8 Flash and Flash-Lite TTS with separate delivery metadata and validated WAV/PCM responses.
 - Offer Natural, Custom, and optional Automatic delivery using the default text model; preserve transcripts, voice routing, and existing styles.
 - Share speech preparation between previews and generation, retain inline vocal tags through HTML stripping, and include custom style references in field dependencies.
 
-- Sign in with ChatGPT directly from Providers, without installing Codex. The connection uses the native OAuth/backend approach used by OpenCode and may require compatibility updates.
+- Replace the legacy ChatGPT connection with OpenAI's documented native sign-in and public Responses API; existing connections require reauthorization.
+- Verify account identity, retain separate saved registrations, and revoke renewable sessions on sign-out.
+- Manage subscription caps in ChatGPT settings, pause new requests after a reported usage limit, and keep API token accounting separate.
 - Discover account models and reasoning options, check reported subscription limits, and use existing Anki/MCP tools for text generation.
 - Keep login credentials separate from profiles and exports; account actions apply immediately and invalidate stale generation jobs.
 - Require completed final answers, preserve stateless tool history, and bound requests, text, tool calls, and cancellation without automatic replay.

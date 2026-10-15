@@ -23,6 +23,8 @@ import io
 import json
 import wave
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
+from datetime import date
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -69,6 +71,9 @@ def test_curated_openai_chat_models_are_ordered_and_labeled() -> None:
     assert DEFAULT_CHAT_MODEL == "gpt-5.6-sol"
     assert models.openai_chat_models == [
         "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -169,6 +174,151 @@ def test_openai_reasoning_efforts_match_model_family() -> None:
     assert "max" not in efforts_55
 
 
+@pytest.mark.parametrize(
+    "model,effort,temperature,chat_tools",
+    [
+        ("gpt-6-astra", "low", False, False),
+        ("gpt-6.1-sol", "high", False, False),
+        ("gpt-6-sol", "none", True, True),
+        ("gpt-6-sol", "low", False, False),
+        ("gpt-6-luna", "none", True, True),
+        ("gpt-6-luna", "max", False, False),
+    ],
+)
+def test_gpt6_capabilities(
+    model: str, effort: str, temperature: bool, chat_tools: bool
+) -> None:
+    assert filter_openai_text_models([model]) == [model]
+    assert choose_reasoning_effort(model, effort) == effort
+    assert models.openai_supports_temperature(model, effort) is temperature
+    assert models.openai_supports_chat_tools(model, effort) is chat_tools
+
+
+@pytest.mark.parametrize("today", [date(2026, 10, 22), date(2026, 10, 23)])
+def test_retirement_warning_changes_to_failure_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch, today: date
+) -> None:
+    class FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return today
+
+    monkeypatch.setattr(models, "date", FixedDate)
+    warning = models.provider_model_warning("openai", "gpt-image-1")
+    assert warning
+    if today < date(2026, 10, 23):
+        assert "2026-10-23" in warning
+        models.validate_provider_model("openai", "gpt-image-1")
+    else:
+        with pytest.raises(ValueError, match="unavailable"):
+            models.validate_provider_model("openai", "gpt-image-1")
+    models.validate_provider_model("Custom", "gpt-image-1")
+    models.validate_provider_model("chatgpt", "gpt-5.2-chat-latest")
+    assert models.provider_model_warning("Custom", "gpt-image-1") is None
+    assert (
+        filter_openai_text_models(["gpt-5.2-chat-latest", "gpt-5.3-chat-latest"]) == []
+    )
+    assert (
+        models.openai_chat_models_for_display([], current_model="gpt-5.2-chat-latest")[
+            -1
+        ]
+        == "gpt-5.2-chat-latest"
+    )
+
+
+@pytest.mark.parametrize(
+    "model,tier,endpoint,valid",
+    [
+        ("opaque-model", "auto", None, True),
+        ("opaque-model", "default", None, True),
+        ("gpt-6-astra", "fast", "https://eu.api.openai.com/v1", False),
+        ("gpt-6-sol", "fast", "https://eu.api.openai.com/v1", True),
+        ("o3", "fast", None, True),
+        ("o4-mini", "fast", None, True),
+        ("gpt-5.3-codex", "fast", None, True),
+        ("gpt-6.1-sol", "ultrafast", "https://eu.api.openai.com/v1", True),
+        ("gpt-6-astra", "ultrafast", "https://us.api.openai.com/v1", True),
+        ("gpt-6-astra", "ultrafast", None, True),
+        ("gpt-6-astra", "ultrafast", "https://eu.api.openai.com/v1", False),
+        ("gpt-6.1-sol", "ultrafast", "https://au.api.openai.com/v1", False),
+        ("gpt-6-sol", "ultrafast", None, False),
+        ("gpt-5-nano", "fast", None, False),
+        ("gpt-6-astra", "unknown-tier", None, False),
+    ],
+)
+def test_openai_service_tier_validation(
+    model: str, tier: str, endpoint: str | None, valid: bool
+) -> None:
+    if valid:
+        models.validate_openai_service_tier(model, tier, endpoint)
+    else:
+        with pytest.raises(ValueError):
+            models.validate_openai_service_tier(model, tier, endpoint)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", ["auto", "default", "fast", "ultrafast"])
+async def test_openai_service_tier_reaches_only_openai_payload(
+    monkeypatch: pytest.MonkeyPatch, tier: str
+) -> None:
+    configuration = openai_test_config()
+    configuration.openai_service_tier = tier
+    monkeypatch.setattr("src.chat_provider.config", configuration)
+    captured: dict[str, Any] = {}
+
+    async def stream(**kwargs: Any):
+        captured.update(kwargs["json_payload"])
+        yield response_created_event("speed-test")
+        yield response_completed_event("speed-test", text="hello")
+
+    monkeypatch.setattr("src.chat_provider.provider_runtime.stream_sse_json", stream)
+    request = TextGenerationRequest("hi", "gpt-6.1-sol", "openai", 0.5, "low")
+    await ChatProvider().generate_text(request)
+    assert captured.get("service_tier") == (None if tier == "auto" else tier)
+    custom = custom_provider_test_config(model=request.model, streaming_mode="enabled")
+    custom.openai_service_tier = tier
+    monkeypatch.setattr("src.chat_provider.config", custom)
+    captured.clear()
+    await ChatProvider().generate_text(replace(request, provider="Compat"))
+    assert "service_tier" not in captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+@pytest.mark.parametrize("effort", ["none", "high"])
+async def test_gpt6_chat_tool_requests_require_non_reasoning(
+    monkeypatch: pytest.MonkeyPatch, model: str, effort: str
+) -> None:
+    monkeypatch.setattr(
+        "src.chat_provider.config",
+        custom_provider_test_config(model=model, chat_api_mode="chat_completions"),
+    )
+    request_json = AsyncMock(
+        return_value={
+            "choices": [{"finish_reason": "stop", "message": {"content": "hello"}}]
+        }
+    )
+    monkeypatch.setattr("src.chat_provider.provider_runtime.request_json", request_json)
+    request = TextGenerationRequest(
+        "hi",
+        model,
+        "Compat",
+        0.5,
+        effort,
+        tools=[TextToolDefinition("lookup", "Find notes", {"type": "object"})],
+    )
+    call = ChatProvider().generate_text(request, tool_executor=AsyncMock())
+    if effort == "none":
+        await call
+        payload = request_json.call_args.kwargs["json_payload"]
+        assert payload["reasoning_effort"] == "none"
+        assert payload["temperature"] == 0.5
+    else:
+        with pytest.raises(ValueError, match="Responses API"):
+            await call
+        request_json.assert_not_called()
+
+
 def test_filter_openai_text_models_excludes_non_text_models() -> None:
     models_to_filter = [
         "gpt-5.4",
@@ -212,6 +362,9 @@ def test_openai_chat_models_for_display_merges_available_models() -> None:
 
     assert models.openai_chat_models_for_display(available_models) == [
         "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -222,6 +375,9 @@ def test_openai_chat_models_for_display_merges_available_models() -> None:
         include_available=True,
     ) == [
         "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -412,6 +568,10 @@ def make_stream_sse_json(
         ("gpt-6-astra", "none", "low"),
         ("gpt-6-astra", "minimal", "low"),
         ("gpt-6-astra", "max", "max"),
+        ("gpt-6.1-sol", "high", "high"),
+        ("gpt-6.1-sol", None, "low"),
+        ("gpt-6-sol", "max", "max"),
+        ("gpt-6-luna", "low", "low"),
     ],
 )
 async def test_openai_payload_with_reasoning(
@@ -477,7 +637,7 @@ async def test_openai_payload_with_reasoning(
     [
         ("gpt-5.6-sol", None, True),
         ("gpt-6-astra", None, True),
-        ("gpt-6-astra", "https://eu.api.openai.com/v1", False),
+        ("gpt-6.1-sol", "https://eu.api.openai.com/v1", True),
     ],
 )
 async def test_openai_fast_mode_sets_service_tier(

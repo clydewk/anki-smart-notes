@@ -93,6 +93,27 @@ def test_recursive_and_traceback_redaction(monkeypatch: pytest.MonkeyPatch) -> N
     assert "ValueError: [REDACTED]" in rendered
 
 
+def test_chatgpt_oauth_diagnostics_redact_credentials() -> None:
+    diagnostic = redact_text(
+        "https://auth.openai.com/api/accounts/authorize?client_id=oaiapp_example"
+        "&id_token_hint=identity-secret&code=callback-secret&code_verifier=pkce-secret "
+        'id_token_hint="quoted-identity" code_verifier="quoted-verifier"'
+    )
+    for secret in (
+        "identity-secret",
+        "callback-secret",
+        "pkce-secret",
+        "quoted-identity",
+        "quoted-verifier",
+    ):
+        assert secret not in diagnostic
+    assert "client_id=oaiapp_example" in diagnostic
+    assert redact({"id_token_hint": "identity", "code_verifier": "verifier"}) == {
+        "id_token_hint": "[REDACTED]",
+        "code_verifier": "[REDACTED]",
+    }
+
+
 def test_logger_survives_unwritable_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("IS_TEST")
     monkeypatch.setattr("src.logger.mw", MagicMock())

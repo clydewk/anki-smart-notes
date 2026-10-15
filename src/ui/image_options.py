@@ -23,7 +23,6 @@ from aqt import QGroupBox, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from ..config import config, key_or_config_val
 from ..models import (
-    RETIRED_PROVIDER_MODELS,
     ImageAspectRatio,
     ImageGenerationQuality,
     ImageModels,
@@ -33,6 +32,8 @@ from ..models import (
     OverridableImageOptionsDict,
     image_generation_qualities,
     openai_image_size,
+    provider_model_unavailable,
+    provider_model_warning,
 )
 from .reactive_combo_box import ReactiveComboBox
 from .reactive_spin_box import ReactiveSpinBox
@@ -73,7 +74,7 @@ model_labels = {
     "gpt-image-1.5": "GPT Image 1.5",
     "gpt-image-1": "GPT Image 1",
     "gpt-image-1-mini": "GPT Image 1 Mini",
-    "dall-e-3": "DALL·E 3 (Deprecated)",
+    "dall-e-3": "DALL·E 3 (Retired)",
 }
 
 provider_models: dict[ImageProviders, list[ImageModels]] = {
@@ -193,7 +194,12 @@ class ImageOptions(QWidget):
 
     def _reset_to_base_models(self) -> None:
         self._provider_models = {
-            provider: list(models) for provider, models in provider_models.items()
+            provider: [
+                model
+                for model in models
+                if not provider_model_unavailable(provider, model)
+            ]
+            for provider, models in provider_models.items()
         }
         self._provider_labels = dict(provider_labels)
         self._model_labels = dict(model_labels)
@@ -346,16 +352,13 @@ class ImageOptions(QWidget):
 
     def _on_model_change(self, model: str) -> None:
         provider = self.state.s["image_provider"]
-        unavailable = (
-            provider not in self._provider_models
-            or (provider, model) in RETIRED_PROVIDER_MODELS
-        )
-        self.model_warning.setText(
+        warning = (
             "Saved provider or model is unavailable. Choose a supported selection before generating."
-            if unavailable
-            else ""
+            if provider not in self._provider_models
+            else provider_model_warning(provider, model) or ""
         )
-        self.model_warning.setVisible(unavailable)
+        self.model_warning.setText(warning)
+        self.model_warning.setVisible(bool(warning))
         self.model_picker.setToolTip(model)
         qualities = image_generation_qualities(model)
         quality = self.state.s["image_generation_quality"]
@@ -363,7 +366,7 @@ class ImageOptions(QWidget):
             qualities.append(quality)
             self.model_warning.setText(
                 self.model_warning.text()
-                + (" " if unavailable else "")
+                + (" " if warning else "")
                 + f"Saved rendering quality ‘{quality}’ is not supported by this model. Choose a supported quality."
             )
             self.model_warning.show()
@@ -383,6 +386,24 @@ class ImageOptions(QWidget):
         uses_resolution = provider == "google" or (uses_openai_sizes and flexible_size)
         self.resolution_picker.setVisible(uses_resolution)
         self.resolution_label.setVisible(uses_resolution)
+        resolution_labels = (
+            {
+                "1024x1024": "Small",
+                "2048x2048": "Medium",
+                "4096x4096": "Large (experimental)",
+            }
+            if uses_openai_sizes
+            else {
+                "1024x1024": "1K preset",
+                "2048x2048": "2K preset",
+                "4096x4096": "4K preset",
+            }
+        )
+        self.resolution_picker.state_to_ui = resolution_labels
+        self.resolution_picker.ui_to_state = {
+            label: preset for preset, label in resolution_labels.items()
+        }
+        self.resolution_picker.update_from_state(dict(self.state.s))
         ratios: list[ImageAspectRatio] = list(aspect_ratios)
         current = self.state.s["image_aspect_ratio"]
         labels: dict[str, str] = {}
@@ -392,13 +413,21 @@ class ImageOptions(QWidget):
                 if current not in ratios:
                     ratios.append(current)
             for ratio in ratios:
-                size = openai_image_size(model, ratio, resolution).replace("x", " × ")
-                shape = {"1:1": "square", "16:9": "landscape", "9:16": "portrait"}.get(
-                    ratio, f"saved {ratio}"
+                dimensions = openai_image_size(model, ratio, resolution)
+                size = dimensions.replace("x", " × ")
+                width, height = dimensions.split("x")
+                shape = (
+                    "square"
+                    if width == height
+                    else "landscape"
+                    if int(width) > int(height)
+                    else "portrait"
                 )
                 labels[ratio] = (
-                    f"{size} · {ratio} preset" if flexible_size else f"{size} · {shape}"
+                    f"{size} · {ratio}" if flexible_size else f"{size} · {shape}"
                 )
+                if not flexible_size and ratio not in {"1:1", "16:9", "9:16"}:
+                    labels[ratio] += f" (saved {ratio})"
         self.ratio_picker.state_to_ui = labels
         self.ratio_picker.ui_to_state = {
             label: ratio for ratio, label in labels.items()

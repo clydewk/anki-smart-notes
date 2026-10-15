@@ -46,6 +46,7 @@ from src.models import (
     tts_delivery_mode,
 )
 from src.provider_runtime import ResponseFormatError
+from src.tts_provider import TTSProvider
 from tests.mocks import MockConfig
 
 if TYPE_CHECKING:
@@ -116,6 +117,42 @@ def test_legacy_delivery_survives_normalization_and_explicit_natural_wins() -> N
     extras["tts_delivery"] = "natural"
     assert tts_delivery_mode(normalize_field_extras(extras)) == "natural"
     assert tts_delivery_mode(DEFAULT_EXTRAS) == "natural"
+
+
+@pytest.mark.parametrize("part", ["text", "direction"])
+async def test_openai_speech_limits_apply_after_field_substitution(
+    speech_processor: SpeechHarness, monkeypatch: pytest.MonkeyPatch, part: str
+) -> None:
+    speech_processor.processor.tts_provider = TTSProvider()
+    network = AsyncMock()
+    monkeypatch.setattr("src.tts_provider.provider_runtime.request_bytes", network)
+    extras = deepcopy(DEFAULT_EXTRAS)
+    extras.update(
+        use_custom_model=True,
+        tts_voice_pool=[
+            {
+                "provider": "openai",
+                "model": "gpt-4o-mini-tts",
+                "voice": "alloy",
+                "enabled": True,
+                "language": None,
+            }
+        ],
+        tts_delivery="custom",
+        tts_style="{{Direction}}",
+    )
+    values = {"text": "Hello", "direction": "Warm"}
+    values[part] = "x" * 4097
+    with pytest.raises(ValueError, match="4,096"):
+        await speech_processor.processor.generate_speech(
+            note_id=17,
+            field="Audio",
+            values=values,
+            input_text="{{Text}}",
+            extras=extras,
+            show_error_box=False,
+        )
+    network.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

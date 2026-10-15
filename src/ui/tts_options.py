@@ -55,6 +55,9 @@ from ..models import (
     TTSVoiceTarget,
     make_tts_voice_target,
     normalize_tts_voice_pool,
+    openai_tts_voices,
+    provider_model_unavailable,
+    provider_model_warning,
 )
 from ..sentry import run_async_in_background_with_sentry
 from ..settings import with_widget_settings
@@ -150,68 +153,23 @@ OPENAI_VOICE_GENDERS: dict[str, Literal["Male", "Female"]] = {
     "cedar": "Male",
 }
 
-# Voices available for each model
-OPENAI_TTS1_VOICES = [
-    "alloy",
-    "ash",
-    "coral",
-    "echo",
-    "fable",
-    "nova",
-    "onyx",
-    "sage",
-    "shimmer",
-]
-OPENAI_GPT4O_VOICES = OPENAI_TTS1_VOICES + ["ballad", "verse", "marin", "cedar"]
-
 
 def generate_openai_voices() -> list[TTSMeta]:
     """Generate OpenAI TTS voice entries for all models."""
-    voices: list[TTSMeta] = []
-
-    # gpt-4o-mini-tts voices (13 voices, recommended model)
-    for voice in OPENAI_GPT4O_VOICES:
-        voices.append(
-            {
-                "tts_provider": "openai",
-                "voice": voice,
-                "model": "gpt-4o-mini-tts",
-                "friendly_voice": f"{voice.capitalize()} (gpt-4o-mini-tts)",
-                "gender": OPENAI_VOICE_GENDERS[voice],
-                "language": ALL,
-                "price_tier": "standard",
-            }
-        )
-
-    # tts-1-hd voices (9 voices, higher quality)
-    for voice in OPENAI_TTS1_VOICES:
-        voices.append(
-            {
-                "tts_provider": "openai",
-                "voice": voice,
-                "model": "tts-1-hd",
-                "friendly_voice": f"{voice.capitalize()} (tts-1-hd)",
-                "gender": OPENAI_VOICE_GENDERS[voice],
-                "language": ALL,
-                "price_tier": "standard",
-            }
-        )
-
-    # tts-1 voices (9 voices, lower latency)
-    for voice in OPENAI_TTS1_VOICES:
-        voices.append(
-            {
-                "tts_provider": "openai",
-                "voice": voice,
-                "model": "tts-1",
-                "friendly_voice": f"{voice.capitalize()} (tts-1)",
-                "gender": OPENAI_VOICE_GENDERS[voice],
-                "language": ALL,
-                "price_tier": "low",
-            }
-        )
-
-    return voices
+    return [
+        {
+            "tts_provider": "openai",
+            "voice": voice,
+            "model": model,
+            "friendly_voice": f"{voice.capitalize()} ({model})",
+            "gender": OPENAI_VOICE_GENDERS[voice],
+            "language": ALL,
+            "price_tier": "low" if model == "tts-1" else "standard",
+        }
+        for model in ("gpt-realtime-2.1-mini", "gpt-4o-mini-tts", "tts-1-hd", "tts-1")
+        if not provider_model_unavailable("openai", model)
+        for voice in openai_tts_voices(model)
+    ]
 
 
 openai_voices: list[TTSMeta] = generate_openai_voices()
@@ -480,7 +438,10 @@ class SelectedVoiceLabel(QLabel):
 
     def update_text(self, meta: TTSMeta, *, filtered: bool = False) -> None:
         prefix = "Selected (outside current filters)" if filtered else "Selected"
-        self.setText(f"{prefix}: {format_voice(meta)}")
+        warning = provider_model_warning(meta["tts_provider"], meta["model"])
+        self.setText(
+            f"{prefix}: {format_voice(meta)}" + (f"\n{warning}" if warning else "")
+        )
         self.setToolTip(f"Model: {meta['model']}\nVoice ID: {meta['voice']}")
 
 
@@ -812,6 +773,9 @@ class TTSOptions(QWidget):
                 for voice in voices
                 if voice["tts_provider"] == state["catalog_provider"]
                 and voice["model"] == state["catalog_model"]
+                and not provider_model_unavailable(
+                    voice["tts_provider"], voice["model"]
+                )
                 and (
                     state["catalog_provider"] == "fish"
                     or voice["voice"] == state["catalog_voice"]
@@ -847,7 +811,7 @@ class TTSOptions(QWidget):
         if selected is None:
             self.selected_voice_label.setText(
                 f"Saved voice unavailable: {state['catalog_provider']} / "
-                f"{state['catalog_model']} / {state['catalog_voice']}"
+                f"{state['catalog_model']} / {state['catalog_voice']}. Choose a supported voice."
                 if state["catalog_voice"]
                 else "Select a voice to add or preview."
             )
@@ -911,6 +875,9 @@ class TTSOptions(QWidget):
             details = (
                 f"{identity}\nModel: {target['model']}\nVoice ID: {target['voice']}"
             )
+            warning = provider_model_warning(target["provider"], target["model"])
+            if warning:
+                details += f"\n{warning}"
             active = self.pool_table.item(row, 0)
             if active is None:
                 active = QTableWidgetItem()
@@ -1144,6 +1111,8 @@ class TTSOptions(QWidget):
         search_terms = state["search_text"].lower().strip().split()
 
         for voice in voices:
+            if provider_model_unavailable(voice["tts_provider"], voice["model"]):
+                continue
             matches_provider = (
                 state["selected_provider"] == ALL
                 or voice["tts_provider"] == state["selected_provider"]

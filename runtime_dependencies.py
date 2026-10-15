@@ -30,13 +30,19 @@ REQUIRED_RUNTIME_IMPORTS = (
     "anyio",
     "certifi",
     "dotenv",
+    "ecdsa",
     "h11",
     "httpcore",
     "httpx",
     "idna",
+    "jose",
     "markdown_it",
     "mdurl",
+    "pyasn1",
+    "rsa",
+    "six",
     "typing_extensions",
+    "websockets",
 )
 
 VIRTUAL_ENV_DIR_NAMES = (".venv", "venv", "env")

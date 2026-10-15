@@ -532,7 +532,7 @@ class PromptDialog(QDialog):
         explanations = {
             "natural": "Speaks the text as written using the selected voice’s natural delivery.",
             "custom": (
-                "Describe tone and pacing. Supports Gemini voices and OpenAI gpt-4o-mini-tts. "
+                "Describe tone and pacing. Supports Gemini voices and OpenAI mini-TTS or Realtime voices. "
                 "Gemini 3.8 keeps this direction separate from the spoken text."
             ),
             "automatic": (

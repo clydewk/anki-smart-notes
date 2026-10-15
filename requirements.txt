@@ -3,9 +3,16 @@ aqt[qt]==26.5
 
 # Add-on runtime dependencies; scripts/build.sh vendors only these modules.
 httpx==0.28.1
+websockets==15.0.1
 anyio==4.15.1
 python-dotenv==1.2.3
 markdown-it-py==4.2.0
+python-jose==3.5.0
+# Portable verification backend for OpenAI's RS256 ID tokens.
+rsa==4.9.1
+ecdsa==0.19.2
+pyasn1==0.6.4
+six==1.17.0
 
 # Development checks.
 pytest==9.1.1

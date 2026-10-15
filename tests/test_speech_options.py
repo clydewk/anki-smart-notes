@@ -34,6 +34,14 @@ from PyQt6.QtWidgets import QApplication, QLineEdit, QScrollArea
 from src.config import config_context
 from src.job_context import JobCancelledError
 import src.ui.tts_options as speech
+import src.models as models
+from datetime import date
+
+class FrozenDate(date):
+    @classmethod
+    def today(cls):
+        return cls(2026, 10, 13)
+models.date = FrozenDate
 
 app = QApplication([])
 config_context.set(json.loads(Path("config.json").read_text()))
@@ -43,6 +51,7 @@ assert {voice["model"] for voice in gemini} == {
     "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts",
 }
 assert len(gemini) == 150
+assert len([voice for voice in speech.generate_openai_voices() if voice["model"] == "gpt-realtime-2.1-mini"]) == 10
 assert {voice["voice"] for voice in gemini if voice["model"] == "gemini-3.8-flash-tts"} == {voice["voice"] for voice in gemini if voice["model"] == "gemini-2.5-pro-preview-tts"}
 options = speech.TTSOptions({"tts_voice_pool": [
     {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "marin", "enabled": True, "language": None},
@@ -59,6 +68,7 @@ assert options.minimumSizeHint().width() < 600
 assert options.pool_table.height() < 100
 assert "marin" in options.pool_table.item(0, 1).text().lower()
 assert "Voice ID: marin" in options.pool_table.item(0, 1).toolTip()
+assert "2027-01-06" in options.selected_voice_label.text()
 assert not options.remove_voice_button.isEnabled()
 options.pool_table.selectRow(0)
 assert options.remove_voice_button.isEnabled()
@@ -128,12 +138,30 @@ options.state.update({"catalog_provider": "azure", "catalog_model": "neural", "c
 assert "unavailable" in options.selected_voice_label.text().lower()
 assert not options.test_button.isEnabled()
 assert not options.add_voice_button.isEnabled()
+options.state.update({"catalog_provider": "openai", "catalog_model": "gpt-realtime-2.1-mini", "catalog_voice": "nova"})
+assert "Choose a supported voice" in options.selected_voice_label.text()
+assert not options.test_button.isEnabled()
+assert not options.add_voice_button.isEnabled()
 options.remove_selected_voice()
 assert options.state.s["tts_voice_pool"] == []
 assert "No voices yet" in options.pool_status.text()
 assert not options.pool_table.isVisible()
 assert not options.remove_voice_button.isEnabled()
 scroll.close()
+
+class RetiredDate(date):
+    @classmethod
+    def today(cls):
+        return cls(2027, 1, 6)
+models.date = RetiredDate
+assert all(voice["model"] not in {"tts-1", "tts-1-hd"} for voice in speech.generate_openai_voices())
+saved = {"provider": "openai", "model": "tts-1", "voice": "alloy", "enabled": True, "language": None}
+retired = speech.TTSOptions({"tts_voice_pool": [saved]})
+assert retired.state.s["tts_voice_pool"] == [saved]
+assert "Choose a supported voice" in retired.selected_voice_label.text()
+assert "unavailable" in retired.pool_table.item(0, 1).toolTip()
+assert all(voice["model"] != "tts-1" for voice in retired.get_visible_voice_filters())
+assert not retired.test_button.isEnabled() and not retired.add_voice_button.isEnabled()
 
 voice_ids = ["a1b2c3d4aaaaaaaaffff", "d4c3b2a1bbbbbbbbaaaa"]
 fish = speech.TTSOptions({"tts_voice_pool": [

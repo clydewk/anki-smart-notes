@@ -30,14 +30,14 @@ from aqt import (
     QWidget,
 )
 from aqt.qt import QShowEvent
+from aqt.utils import openLink
 from PyQt6 import sip
 
 from ..chat_provider import chat_provider
-from ..chatgpt_auth import chatgpt_auth
+from ..chatgpt_auth import ChatGPTAuthError, chatgpt_auth
 from ..config import config, key_or_config_val
 from ..logger import redact_text
 from ..models import (
-    RETIRED_PROVIDER_MODELS,
     ChatGPTModel,
     ChatModels,
     ChatProviders,
@@ -51,9 +51,12 @@ from ..models import (
     openai_supports_temperature,
     overridable_chat_options,
     provider_model_map,
+    provider_model_warning,
+    validate_openai_service_tier,
 )
 from ..sentry import run_async_in_background_with_sentry
 from ..settings import widget_settings, with_widget_settings
+from .chatgpt_account import CHATGPT_USAGE_URL
 from .reactive_check_box import ReactiveCheckBox
 from .reactive_combo_box import ReactiveComboBox
 from .reactive_spin_box import ReactiveDoubleSpinBox
@@ -181,6 +184,10 @@ class ChatOptions(QWidget):
         chat_box.setLayout(chat_form)
         chat_form.addRow("Provider:", self.chat_provider)
         chat_form.addRow("Model:", self.chat_model)
+        self.chatgpt_usage = QLabel()
+        self.chatgpt_usage.setWordWrap(True)
+        self.chatgpt_usage.linkActivated.connect(openLink)
+        chat_form.addRow(self.chatgpt_usage)
         self.model_warning = QLabel()
         self.model_warning.setWordWrap(True)
         chat_form.addRow(self.model_warning)
@@ -282,6 +289,7 @@ class ChatOptions(QWidget):
 
     def showEvent(self, a0: QShowEvent | None) -> None:
         super().showEvent(a0)
+        self.update_capabilities()
         self._refresh_models_if_needed(self.state.s["chat_provider"])
 
     def _refresh_models_if_needed(self, provider: str) -> None:
@@ -407,7 +415,7 @@ class ChatOptions(QWidget):
             }
         )
 
-        self._update_capabilities()
+        self.update_capabilities()
 
         self._update_provider_settings(
             text,
@@ -426,7 +434,7 @@ class ChatOptions(QWidget):
         current = self.state.s["chat_provider"]
         if current not in new_providers:
             self.state.update({"chat_providers": [*new_providers, current]})
-            self._update_capabilities()
+            self.update_capabilities()
         elif current in custom_provider_names:
             self._on_provider_change(current)
         elif current in {"openai", "chatgpt"}:
@@ -545,7 +553,7 @@ class ChatOptions(QWidget):
             self.state.update({"chat_reasoning_effort": new_effort})
             self._update_provider_settings(provider, reasoning_effort=new_effort)
 
-        self._update_capabilities()
+        self.update_capabilities()
 
     def _on_reasoning_effort_change(self, effort: str | None) -> None:
         self.state.update({"chat_reasoning_effort": effort})  # type: ignore
@@ -553,11 +561,25 @@ class ChatOptions(QWidget):
             self.state.s["chat_provider"], reasoning_effort=effort
         )  # type: ignore
 
-        self._update_capabilities()
+        self.update_capabilities()
 
     @with_widget_settings
-    def _update_capabilities(self) -> None:
+    def update_capabilities(self) -> None:
         provider = self.state.s["chat_provider"]
+        self.chatgpt_usage.setVisible(provider == "chatgpt")
+        if provider == "chatgpt":
+            try:
+                account = chatgpt_auth.status()
+            except ChatGPTAuthError:
+                self.chatgpt_usage.setText(
+                    "Check your ChatGPT connection on the Providers page."
+                )
+            else:
+                self.chatgpt_usage.setText(
+                    f'Using ChatGPT plan · <a href="{CHATGPT_USAGE_URL}">Manage usage</a>'
+                    if account and account.connected and account.sharing
+                    else "Enable your ChatGPT plan on the Providers page to generate text."
+                )
         model = self.state.s["chat_model"]
         effort = self.state.s["chat_reasoning_effort"]
         supports_reasoning = (
@@ -589,13 +611,23 @@ class ChatOptions(QWidget):
         supports_tools = (
             not custom
             or custom.get("chat_api_mode") != "chat_completions"
-            or openai_supports_chat_tools(model)
+            or openai_supports_chat_tools(model, effort)
         )
         if hasattr(self, "use_tools_box"):
             self.use_tools_box.setEnabled(supports_tools)
-        unavailable = (provider, model) in RETIRED_PROVIDER_MODELS or (
-            provider not in all_chat_providers and custom is None
-        )
+        warning = provider_model_warning(provider, model)
+        if provider not in all_chat_providers and custom is None:
+            warning = "Saved provider is unavailable. Choose a supported selection before generating."
+        if provider == "openai" and not warning:
+            try:
+                validate_openai_service_tier(
+                    model,
+                    config.openai_service_tier
+                    or ("fast" if config.openai_fast_mode_enabled else "auto"),
+                    config.openai_endpoint,
+                )
+            except ValueError as error:
+                warning = str(error)
         absent_from_connection = (
             provider == "openai"
             and self._available_openai_models is not None
@@ -612,8 +644,8 @@ class ChatOptions(QWidget):
             and effort not in self._reasoning_efforts(provider, model)
         )
         self.model_warning.setText(
-            "Saved provider or model is unavailable. Choose a supported selection before generating."
-            if unavailable
+            warning
+            if warning
             else "The saved model was not returned by this connection. It is preserved; verify access or choose a listed model."
             if absent_from_connection
             else "The saved reasoning effort was not returned for this model. Choose an available level before generating."
@@ -623,7 +655,7 @@ class ChatOptions(QWidget):
             else ""
         )
         self.model_warning.setVisible(
-            unavailable
+            bool(warning)
             or absent_from_connection
             or invalid_effort
             or not supports_tools
@@ -662,9 +694,15 @@ class ChatOptions(QWidget):
     def _refresh_chatgpt_models_if_needed(self) -> None:
         if not self.isVisible() or self._chatgpt_refresh_inflight:
             return
-        if chatgpt_auth.status() is None:
+        try:
+            account = chatgpt_auth.status()
+        except ChatGPTAuthError as error:
+            self.discovery_status.setText(redact_text(str(error)))
+            self.refresh_models.setEnabled(False)
+            return
+        if not account or not account.connected or not account.sharing:
             self.discovery_status.setText(
-                "Sign in with ChatGPT on the Providers page, then refresh model availability."
+                "Continue with ChatGPT on the Providers page and enable plan use, then refresh model availability."
             )
             self.refresh_models.setEnabled(False)
             return
@@ -774,7 +812,7 @@ class ChatOptions(QWidget):
             )
             self._sync_model_labels(display_models)
             self.state.update({"chat_models": display_models})
-            self._update_capabilities()
+            self.update_capabilities()
 
         def on_failure(error: Exception) -> None:
             if self.state.s["chat_provider"] != "openai":

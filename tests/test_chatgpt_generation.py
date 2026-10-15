@@ -110,6 +110,7 @@ def tool(
 ) -> dict[str, Any]:
     return {
         "type": "function_call",
+        "namespace": "smart_notes",
         "call_id": call_id,
         "name": name,
         "arguments": arguments,
@@ -164,7 +165,26 @@ async def test_native_payload_and_final_answer_only(
     assert payload["stream"] is True
     assert payload["tools"] == []
     assert "temperature" not in payload and "max_output_tokens" not in payload
-    assert "previous_response_id" not in payload
+    assert not set(payload) & {
+        "background",
+        "conversation",
+        "max_output_tokens",
+        "max_tool_calls",
+        "metadata",
+        "moderation",
+        "multi_agent",
+        "prompt",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "temperature",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "user",
+        "previous_response_id",
+        "service_tier",
+    }
+    assert isinstance(payload["input"], list)
 
 
 async def test_tool_history_retains_opaque_reasoning_and_deduplicates_calls(
@@ -192,13 +212,19 @@ async def test_tool_history_retains_opaque_reasoning_and_deduplicates_calls(
     assert {"type": "function_call_output", "call_id": "c1", "output": "found"} in sent[
         1
     ]["payload"]["input"]
-    assert len({item["headers"]["session-id"] for item in sent}) == 1
+    namespace = sent[0]["payload"]["tools"][0]
+    assert namespace["type"] == "namespace"
+    assert namespace["name"] == "smart_notes"
+    assert namespace["tools"][0]["name"] == "lookup"
+    assert "session-id" not in sent[0]["headers"]
 
 
 @pytest.mark.parametrize(
     "bad_tool",
     [
         tool(name="shell"),
+        {**tool(), "namespace": "other"},
+        {**tool(), "namespace": None},
         tool(arguments="[1]"),
         tool(arguments="bad"),
         {"type": "computer_call"},
@@ -346,7 +372,8 @@ async def test_concurrent_fields_have_separate_conversations(
         monkeypatch, [[completion([answer()], response_id=f"r{i}")] for i in range(2)]
     )
     await asyncio.gather(*(native_provider.generate_text(request()) for _ in range(2)))
-    assert sent[0]["headers"]["session-id"] != sent[1]["headers"]["session-id"]
+    assert sent[0]["payload"]["input"] is not sent[1]["payload"]["input"]
+    assert all("session-id" not in item["headers"] for item in sent)
     assert all(len(item["payload"]["input"]) == 1 for item in sent)
 
 
@@ -449,7 +476,7 @@ async def test_stateless_history_omits_unencrypted_reasoning(
         request(tools=True), AsyncMock(return_value="found")
     )
     assert summary not in sent[1]["payload"]["input"]
-    assert sent[0]["payload"]["tools"][0]["strict"] is False
+    assert sent[0]["payload"]["tools"][0]["tools"][0]["strict"] is False
 
 
 async def test_conflicting_duplicate_in_same_round_never_executes(

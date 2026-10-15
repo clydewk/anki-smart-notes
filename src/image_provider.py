@@ -123,6 +123,7 @@ class ImageProvider:
         headers: dict[str, str] | None = None,
         json_payload: dict[str, Any] | None = None,
         data: object | None = None,
+        retry_ambiguous: bool = True,
     ) -> bytes:
         return await provider_runtime.request_bytes(
             key=f"image:{provider}:{model}",
@@ -136,11 +137,10 @@ class ImageProvider:
             model=model,
             timeouts=RequestTimeouts(
                 connect_timeout_sec=10.0,
-                sock_read_timeout_sec=180.0
-                if model.startswith("gpt-image-2.5-")
-                else 60.0,
+                sock_read_timeout_sec=180.0 if model.startswith("gpt-image-") else 60.0,
             ),
             max_retries=MAX_RETRIES,
+            retry_ambiguous=retry_ambiguous,
         )
 
     async def _get_replicate_image(
@@ -417,6 +417,7 @@ class ImageProvider:
             json_payload=payload,
             provider=provider_name,
             model=model,
+            retry_ambiguous=False,
         )
 
         data = json.loads(data_bytes)

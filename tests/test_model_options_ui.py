@@ -49,6 +49,7 @@ async def test_discovery_failure_preserves_cache_and_reports_failure(
 def test_native_model_options_explain_discovery_and_effective_image_output() -> None:
     script = """
 import json
+from datetime import date
 from pathlib import Path
 from PyQt6.QtWidgets import QApplication, QDialog, QVBoxLayout, QSizePolicy
 from PyQt6.QtGui import QFont
@@ -56,7 +57,14 @@ from src.config import config_context
 from src.models import openai_image_size
 from src.ui.image_options import ImageOptions
 from src.ui.ui_utils import scroll_page
+import src.models as models
 import src.ui.chat_options as chat_module
+
+class Today(date):
+    @classmethod
+    def today(cls):
+        return cls(2026, 10, 13)
+models.date = Today
 
 app = QApplication([])
 settings = json.loads(Path("config.json").read_text())
@@ -143,17 +151,19 @@ images._on_model_change("gpt-image-2")
 assert not images.resolution_picker.isHidden()
 assert "3840 × 2160" in images.output_summary.text()
 assert openai_image_size("gpt-image-2", "16:9", "4096x4096") == "3840x2160"
-images.resolution_picker.setCurrentText("2K preset")
+images.resolution_picker.setCurrentText("Medium")
 assert "2048 × 1152" in images.ratio_picker.currentText()
 assert "2048 × 1152" in images.output_summary.text()
-images.resolution_picker.setCurrentText("4K preset")
+images.resolution_picker.setCurrentText("Large (experimental)")
 assert "3840 × 2160" in images.ratio_picker.currentText()
 images.state.update({"image_model": "gpt-image-1.5", "image_generation_quality": "xhigh"})
 images._on_model_change("gpt-image-1.5")
 assert images.state.s["image_generation_quality"] == "xhigh"
 assert "not supported" in images.model_warning.text()
 images.generation_quality_picker.setCurrentText("High")
-assert images.model_warning.isHidden()
+assert "not supported" not in images.model_warning.text()
+assert "2026-12-01" in images.model_warning.text()
+assert not images.model_warning.isHidden()
 images.state.update({"image_provider": "google", "image_model": "gemini-3-pro-image"})
 images._on_model_change("gemini-3-pro-image")
 assert "4K requested" in images.output_summary.text()

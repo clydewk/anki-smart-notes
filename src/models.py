@@ -19,7 +19,9 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Literal, NotRequired, TypedDict, cast
+from urllib.parse import urlparse
 
 # Providers
 
@@ -71,6 +73,7 @@ class OpenAIChatModelSpec:
     reasoning_efforts: tuple[OpenAIReasoningEffort, ...]
     temperature_without_reasoning: bool = True
     chat_tools: bool = True
+    chat_tools_without_reasoning_only: bool = False
 
 
 OPENAI_CHAT_MODEL_CATALOG: tuple[OpenAIChatModelSpec, ...] = (
@@ -80,6 +83,25 @@ OPENAI_CHAT_MODEL_CATALOG: tuple[OpenAIChatModelSpec, ...] = (
         ("low", "medium", "high", "xhigh", "max"),
         temperature_without_reasoning=False,
         chat_tools=False,
+    ),
+    OpenAIChatModelSpec(
+        "gpt-6.1-sol",
+        "GPT-6.1 Sol",
+        ("low", "medium", "high", "xhigh", "max"),
+        temperature_without_reasoning=False,
+        chat_tools=False,
+    ),
+    OpenAIChatModelSpec(
+        "gpt-6-sol",
+        "GPT-6 Sol",
+        OPENAI_REASONING_EFFORTS_WITH_MAX,
+        chat_tools_without_reasoning_only=True,
+    ),
+    OpenAIChatModelSpec(
+        "gpt-6-luna",
+        "GPT-6 Luna",
+        OPENAI_REASONING_EFFORTS_WITH_MAX,
+        chat_tools_without_reasoning_only=True,
     ),
     OpenAIChatModelSpec(
         "gpt-5.6-sol", "GPT-5.6 Sol", OPENAI_REASONING_EFFORTS_WITH_MAX
@@ -142,10 +164,166 @@ RETIRED_PROVIDER_MODELS: set[tuple[str, str]] = {
 }
 
 
+OPENAI_MODEL_SHUTDOWN_DATES: dict[str, date] = {
+    model: shutdown
+    for shutdown, model_ids in (
+        (date(2025, 10, 27), ("o1-mini",)),
+        (date(2026, 2, 17), ("chatgpt-4o-latest",)),
+        (date(2026, 5, 12), ("dall-e-2", "dall-e-3")),
+        (
+            date(2026, 7, 23),
+            (
+                "gpt-5-chat-latest",
+                "gpt-5-codex",
+                "gpt-5.1-chat-latest",
+                "gpt-5.1-codex",
+                "gpt-5.1-codex-max",
+                "gpt-5.1-codex-mini",
+                "gpt-5.2-codex",
+                "o3-deep-research",
+                "o3-deep-research-2025-06-26",
+                "o4-mini-deep-research",
+                "o4-mini-deep-research-2025-06-26",
+            ),
+        ),
+        (date(2026, 8, 10), ("gpt-5.2-chat-latest", "gpt-5.3-chat-latest")),
+        (
+            date(2026, 10, 23),
+            (
+                "gpt-3.5-turbo-0125",
+                "gpt-3.5-turbo",
+                "gpt-3.5-turbo-completions",
+                "gpt-4-0613",
+                "gpt-4",
+                "gpt-4-0613-completions",
+                "gpt-4-completions",
+                "gpt-4-1106-preview",
+                "gpt-4-turbo",
+                "gpt-4-turbo-2024-04-09",
+                "gpt-4-turbo-completions",
+                "gpt-4.1-nano",
+                "gpt-4.1-nano-2025-04-14",
+                "gpt-4o-2024-05-13",
+                "gpt-image-1",
+                "o1-2024-12-17",
+                "o1",
+                "o1-pro-2025-03-19",
+                "o1-pro",
+                "o3-mini-2025-01-31",
+                "o3-mini",
+                "o4-mini-2025-04-16",
+                "o4-mini",
+            ),
+        ),
+        (
+            date(2026, 12, 1),
+            ("gpt-image-1.5", "gpt-image-1-mini", "chatgpt-image-latest"),
+        ),
+        (
+            date(2026, 12, 11),
+            (
+                "gpt-5-2025-08-07",
+                "gpt-5-mini-2025-08-07",
+                "gpt-5-nano-2025-08-07",
+                "gpt-5-pro-2025-10-06",
+                "o3-2025-04-16",
+                "o3-pro-2025-06-10",
+            ),
+        ),
+        (
+            date(2027, 1, 6),
+            (
+                "tts-1",
+                "tts-1-hd",
+                "gpt-4o-mini-tts-2025-03-20",
+                "gpt-4o-mini-tts-2025-12-15",
+            ),
+        ),
+        (date(2027, 4, 1), ("gpt-5.1", "gpt-5.4-nano", "gpt-5.3-codex")),
+    )
+    for model in model_ids
+}
+
+
+def provider_model_unavailable(provider: str, model: str) -> bool:
+    shutdown = OPENAI_MODEL_SHUTDOWN_DATES.get(model) if provider == "openai" else None
+    return (provider, model) in RETIRED_PROVIDER_MODELS or (
+        shutdown is not None and date.today() >= shutdown
+    )
+
+
+def provider_model_warning(provider: str, model: str) -> str | None:
+    if provider_model_unavailable(provider, model):
+        return f"{provider} model {model} is unavailable. Choose a supported model in settings."
+    shutdown = OPENAI_MODEL_SHUTDOWN_DATES.get(model) if provider == "openai" else None
+    if shutdown is not None:
+        return f"{model} retires on {shutdown.isoformat()}. Choose a supported model before then."
+    if provider == "openai" and model == "gpt-4o-mini-tts":
+        return (
+            "This alias currently uses a speech snapshot that retires on 2027-01-06. "
+            "Consider gpt-realtime-2.1-mini; OpenAI has not announced an alias shutdown date."
+        )
+    return None
+
+
 def validate_provider_model(provider: str, model: str) -> None:
-    if (provider, model) in RETIRED_PROVIDER_MODELS:
+    if provider_model_unavailable(provider, model):
+        raise ValueError(provider_model_warning(provider, model))
+
+
+OpenAIServiceTier = Literal["auto", "default", "fast", "ultrafast"]
+OPENAI_SERVICE_TIERS: dict[OpenAIServiceTier, str] = {
+    "auto": "Project default",
+    "default": "Standard",
+    "fast": "Fast (premium pricing)",
+    "ultrafast": "Ultrafast (premium pricing)",
+}
+OPENAI_FAST_MODELS = frozenset(
+    [spec.model for spec in OPENAI_CHAT_MODEL_CATALOG]
+    + [
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.2",
+        "gpt-5.1",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4o",
+        "gpt-4o-2024-05-13",
+        "gpt-4o-mini",
+        "o3",
+        "o4-mini",
+        "gpt-5.3-codex",
+    ]
+)
+
+
+def validate_openai_service_tier(model: str, tier: str, endpoint: str | None) -> None:
+    if tier not in OPENAI_SERVICE_TIERS:
         raise ValueError(
-            f"{provider} model {model} is unavailable. Choose a supported model in settings."
+            "Choose a supported OpenAI service tier in Providers settings."
+        )
+    if tier in {"auto", "default"}:
+        return
+    hostname = urlparse(endpoint or "https://api.openai.com").hostname
+    if tier == "ultrafast":
+        regions = {"api.openai.com", "us.api.openai.com"}
+        if model == "gpt-6.1-sol":
+            regions.add("eu.api.openai.com")
+        if model not in {"gpt-6-astra", "gpt-6.1-sol"} or hostname not in regions:
+            raise ValueError(
+                "Ultrafast requires GPT-6 Astra (global/US) or GPT-6.1 Sol "
+                "(global/US/EU) on the OpenAI Responses API. Change the model, host, or service tier."
+            )
+    elif model not in OPENAI_FAST_MODELS:
+        raise ValueError(
+            f"Fast mode is not supported for {model}. Change the model or service tier."
+        )
+    elif model == "gpt-6-astra" and hostname == "eu.api.openai.com":
+        raise ValueError(
+            "GPT-6 Astra Fast mode is unavailable with EU processing. Change the model or service tier."
         )
 
 
@@ -189,12 +367,15 @@ def openai_supports_temperature(model: str, reasoning_effort: str | None) -> boo
     )
 
 
-def openai_supports_chat_tools(model: str) -> bool:
+def openai_supports_chat_tools(model: str, reasoning_effort: str | None = None) -> bool:
     spec = next(
         (spec for spec in OPENAI_CHAT_MODEL_CATALOG if spec.model == model.lower()),
         None,
     )
-    return spec is None or spec.chat_tools
+    return spec is None or (
+        spec.chat_tools
+        and (not spec.chat_tools_without_reasoning_only or reasoning_effort == "none")
+    )
 
 
 def openai_model_label(model: str) -> str:
@@ -224,6 +405,8 @@ def is_dated_openai_model_snapshot(model: str) -> bool:
 
 def is_available_openai_chat_model(model: str) -> bool:
     normalized = model.lower()
+    if provider_model_unavailable("openai", normalized):
+        return False
     if normalized in openai_chat_models:
         return True
     if is_dated_openai_model_snapshot(normalized):
@@ -297,7 +480,48 @@ def openai_chat_models_for_display(
 
 # TTS Models
 
-OpenAITTSModels = Literal["tts-1", "tts-1-hd", "gpt-4o-mini-tts"]
+OpenAITTSModels = Literal[
+    "tts-1",
+    "tts-1-hd",
+    "gpt-4o-mini-tts",
+    "gpt-4o-mini-tts-2025-03-20",
+    "gpt-4o-mini-tts-2025-12-15",
+    "gpt-realtime-2.1-mini",
+]
+OPENAI_LEGACY_TTS_VOICES = (
+    "alloy",
+    "ash",
+    "coral",
+    "echo",
+    "fable",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+)
+OPENAI_SPEECH_VOICES = (*OPENAI_LEGACY_TTS_VOICES, "ballad", "verse", "marin", "cedar")
+OPENAI_REALTIME_VOICES = (
+    "alloy",
+    "ash",
+    "ballad",
+    "coral",
+    "echo",
+    "sage",
+    "shimmer",
+    "verse",
+    "marin",
+    "cedar",
+)
+
+
+def openai_tts_voices(model: str) -> tuple[str, ...]:
+    if model == "gpt-realtime-2.1-mini":
+        return OPENAI_REALTIME_VOICES
+    if model in {"tts-1", "tts-1-hd"}:
+        return OPENAI_LEGACY_TTS_VOICES
+    return OPENAI_SPEECH_VOICES
+
+
 ElevenTTSModels = Literal["eleven_multilingual_v2"]
 FishTTSModels = Literal["s2.1-pro-free", "s2.1-pro", "s2-pro", "s1"]
 GoogleModels = Literal[
@@ -410,12 +634,12 @@ def openai_image_2_size(
         if aspect_ratio == "16:9":
             return "3840x2160"
         if aspect_ratio == "4:3":
-            return "2736x2048"
+            return "3264x2448"
         if aspect_ratio == "9:16":
             return "2160x3840"
         if aspect_ratio == "3:4":
-            return "2048x2736"
-        return "2048x2048"
+            return "2448x3264"
+        return "2880x2880"
 
     if resolution == "2048x2048":
         if aspect_ratio == "16:9":
@@ -428,10 +652,14 @@ def openai_image_2_size(
             return "1536x2048"
         return "2048x2048"
 
-    if aspect_ratio == "16:9" or aspect_ratio == "4:3":
-        return "1536x1024"
-    if aspect_ratio == "9:16" or aspect_ratio == "3:4":
-        return "1024x1536"
+    if aspect_ratio == "16:9":
+        return "1536x864"
+    if aspect_ratio == "4:3":
+        return "1024x768"
+    if aspect_ratio == "9:16":
+        return "864x1536"
+    if aspect_ratio == "3:4":
+        return "768x1024"
     return "1024x1024"
 
 

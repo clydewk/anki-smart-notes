@@ -103,6 +103,10 @@ def select_tts_target(
 def tts_audio_extension(target: TTSVoiceTarget) -> str:
     return (
         "wav"
-        if target["provider"] == "google" and "gemini" in target["model"]
+        if (target["provider"] == "google" and "gemini" in target["model"])
+        or (
+            target["provider"] == "openai"
+            and target["model"] == "gpt-realtime-2.1-mini"
+        )
         else "mp3"
     )

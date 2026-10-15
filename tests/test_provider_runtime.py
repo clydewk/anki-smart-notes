@@ -37,6 +37,8 @@ from src.provider_runtime import (
     TrafficController,
     extract_provider_error_detail,
     format_provider_http_error_for_log,
+    is_shared_capacity_error,
+    is_terminal_quota_error,
     parse_google_retry_delay,
     request_accounting,
 )
@@ -665,3 +667,168 @@ async def test_http_errors_preserve_reported_usage(
             assert accounting.usage == usage
         finally:
             request_accounting.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code",
+    [
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+    ],
+)
+async def test_openai_billing_errors_stop_without_retry(
+    monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    runtime = ProviderRuntimeHarness()
+    controller = TrafficController(initial_window=2)
+    sleep = AsyncMock()
+    monkeypatch.setattr("src.provider_runtime.asyncio.sleep", sleep)
+
+    with pytest.raises(ProviderUnavailableError, match=code):
+        await runtime.handle_http_error(
+            controller=controller,
+            provider="openai",
+            model="gpt-6.1-sol",
+            attempt=0,
+            max_retries=5,
+            error=ProviderHTTPError(
+                429,
+                "Request rejected",
+                json_body({"error": {"code": code}}),
+                "https://api.openai.com/v1/responses",
+            ),
+        )
+
+    sleep.assert_not_awaited()
+    with pytest.raises(ProviderUnavailableError):
+        await controller.acquire()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "code", "ramp_blocked"),
+    [(429, "slow_down", True), (503, "server_is_overloaded", False)],
+)
+async def test_openai_throttling_uses_error_code_and_respects_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    code: str,
+    ramp_blocked: bool,
+) -> None:
+    runtime = ProviderRuntimeHarness()
+    controller = TrafficController(initial_window=4)
+    sleep = AsyncMock()
+    monkeypatch.setattr("src.provider_runtime.asyncio.sleep", sleep)
+    body = json_body({"error": {"code": code, "message": "Temporary quota limit"}})
+    assert not is_terminal_quota_error("openai", body)
+    assert is_shared_capacity_error("openai", body) is ramp_blocked
+
+    assert await runtime.handle_http_error(
+        controller=controller,
+        provider="openai",
+        model="gpt-6.1-sol",
+        attempt=0,
+        max_retries=2,
+        error=ProviderHTTPError(
+            status,
+            "Try again later",
+            body,
+            "https://api.openai.com/v1/responses",
+            {"Retry-After": "180"},
+        ),
+    )
+
+    sleep.assert_awaited_once_with(180.0)
+    assert controller.snapshot()["window"] == 2
+    assert ("ramp_blocked_remaining" in controller.snapshot()) is ramp_blocked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("attempt", "expected"), [(0, 5.0), (1, 10.0), (5, 60.0)])
+async def test_retry_backoff_is_jittered_bounded_and_matches_cooldown(
+    monkeypatch: pytest.MonkeyPatch, attempt: int, expected: float
+) -> None:
+    runtime = ProviderRuntimeHarness()
+    sleep = AsyncMock()
+    monkeypatch.setattr("src.provider_runtime.asyncio.sleep", sleep)
+    monkeypatch.setattr("src.provider_runtime.random.uniform", lambda low, high: low)
+    controller = TrafficController(initial_window=1)
+    before = time.time()
+    await runtime.handle_http_error(
+        controller=controller,
+        provider="openai",
+        model="gpt-6.1-sol",
+        attempt=attempt,
+        max_retries=6,
+        error=ProviderHTTPError(
+            503,
+            "Try again later",
+            json_body({"error": {"code": "server_is_overloaded"}}),
+            "https://api.openai.com/v1/responses",
+        ),
+    )
+    sleep.assert_awaited_once_with(expected * 0.8)
+    cooldown = controller.snapshot()["cooldown_remaining"]
+    assert expected * 0.8 - (time.time() - before) <= cooldown <= expected * 0.8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "retries"),
+    [
+        (httpx.ReadTimeout, False),
+        (httpx.WriteTimeout, False),
+        (httpx.ReadError, False),
+        (httpx.RemoteProtocolError, False),
+        (httpx.ConnectTimeout, True),
+        (httpx.ConnectError, True),
+    ],
+)
+async def test_media_network_failures_only_retry_before_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[httpx.TransportError],
+    retries: bool,
+) -> None:
+    runtime = ProviderRuntime()
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise error_type("Connection interrupted", request=request)
+        return httpx.Response(200, content=b"image")
+
+    monkeypatch.setattr("src.provider_runtime.asyncio.sleep", AsyncMock())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(runtime, "get_http_client", AsyncMock(return_value=client))
+
+        async def generate() -> bytes:
+            return await runtime.request_bytes(
+                key="image:openai:gpt-image-2",
+                initial_window=1,
+                method="POST",
+                url="https://api.openai.com/v1/images/generations",
+                provider="openai",
+                model="gpt-image-2",
+                timeouts=RequestTimeouts(),
+                max_retries=2,
+                retry_ambiguous=False,
+            )
+
+        if retries:
+            assert await generate() == b"image"
+        else:
+            with pytest.raises((ProviderTimeoutError, httpx.TransportError)):
+                await generate()
+            assert calls == 1
+            assert await generate() == b"image"
+        assert calls == 2
+        assert (
+            runtime.controller("image:openai:gpt-image-2", 1).snapshot()["inflight"]
+            == 0
+        )

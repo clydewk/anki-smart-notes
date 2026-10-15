@@ -244,6 +244,16 @@ def test_normalization_preserves_explicit_empty_pool_and_is_idempotent() -> None
     assert "did_deck_filter_migration" not in values
 
 
+@pytest.mark.parametrize("fast,expected", [(False, "auto"), (True, "fast")])
+def test_normalization_migrates_legacy_openai_speed(fast: bool, expected: str) -> None:
+    normalized = normalize_config({"openai_fast_mode_enabled": fast})
+    assert normalized["openai_service_tier"] == expected
+    assert normalize_config(normalized) == normalized
+    for saved in ("default", "ultrafast", "future-tier"):
+        normalized["openai_service_tier"] = saved
+        assert normalize_config(normalized)["openai_service_tier"] == saved
+
+
 def test_atomic_replace_failure_keeps_previous_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

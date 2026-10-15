@@ -28,11 +28,11 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from src.chatgpt_auth import account_epoch
 from src.chatgpt_transport import (
-    CATALOG_CLIENT_VERSION,
+    USAGE_LIMIT_CODE,
     ChatGPTTransport,
     ChatGPTTransportError,
-    format_limits,
     parse_models,
 )
 from src.provider_runtime import (
@@ -64,10 +64,10 @@ class TestAccount:
         yield
 
     async def headers(self) -> dict[str, str]:
-        return {"Authorization": "Bearer test-token", "ChatGPT-Account-Id": "account-a"}
+        return {"Authorization": "Bearer test-token"}
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def account(monkeypatch: pytest.MonkeyPatch) -> TestAccount:
     value = TestAccount()
     monkeypatch.setattr("src.chatgpt_transport.chatgpt_auth", value)
@@ -263,8 +263,8 @@ async def test_catalog_is_authenticated_preserves_reasoning_and_invalidates_cach
     account: TestAccount, http_client: Callable[[httpx.AsyncClient], None]
 ) -> None:
     def respond(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/backend-api/codex/models"
-        assert request.url.params["client_version"] == CATALOG_CLIENT_VERSION
+        assert str(request.url) == "https://api.openai.com/v1/models"
+        assert not request.url.params
         assert request.headers["Authorization"] == "Bearer test-token"
         return httpx.Response(
             200,
@@ -302,27 +302,6 @@ async def test_catalog_is_authenticated_preserves_reasoning_and_invalidates_cach
 def test_malformed_catalog_never_becomes_empty_success(payload: dict[str, Any]) -> None:
     with pytest.raises(ResponseFormatError):
         parse_models(payload)
-
-
-def test_subscription_limits_distinguish_missing_and_zero() -> None:
-    assert format_limits({}) == "Subscription limits are unavailable."
-    assert (
-        format_limits(
-            {
-                "rate_limit": {
-                    "primary_window": {
-                        "used_percent": 0,
-                        "limit_window_seconds": 18000,
-                    },
-                    "secondary_window": {
-                        "used_percent": 100,
-                        "limit_window_seconds": 604800,
-                    },
-                }
-            }
-        )
-        == "5-hour window: 100% remaining; 7-day window: 0% remaining"
-    )
 
 
 async def test_control_request_bound_and_account_change(
@@ -383,29 +362,6 @@ async def test_non_stream_response_is_unsuccessful_but_usage_is_retained(
         request_accounting.reset(token)
 
 
-async def test_limits_use_separate_subscription_endpoint(
-    account: TestAccount, http_client: Callable[[httpx.AsyncClient], None]
-) -> None:
-    def respond(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/backend-api/wham/usage"
-        assert request.headers["ChatGPT-Account-Id"] == "account-a"
-        return httpx.Response(
-            200,
-            json={
-                "rate_limit": {
-                    "primary_window": {
-                        "used_percent": 40,
-                        "limit_window_seconds": 18000,
-                    }
-                }
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        http_client(client)
-        assert await ChatGPTTransport().fetch_limits() == "5-hour window: 60% remaining"
-
-
 async def test_outgoing_message_bound_precedes_dispatch(
     monkeypatch: pytest.MonkeyPatch, http_client: Callable[[httpx.AsyncClient], None]
 ) -> None:
@@ -427,6 +383,7 @@ async def test_stream_request_content_type_and_accept_headers(
     http_client: Callable[[httpx.AsyncClient], None],
 ) -> None:
     def respond(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.openai.com/v1/responses"
         assert request.headers["Accept"] == "text/event-stream"
         assert request.headers["Content-Type"] == "application/json"
         assert json.loads(request.content) == {"model": "test"}
@@ -439,3 +396,292 @@ async def test_stream_request_content_type_and_accept_headers(
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         http_client(client)
         assert await collect(ChatGPTTransport()) == [{"type": "done"}]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_usage_limit_pauses_every_model_until_explicit_resume(
+    account: TestAccount,
+    http_client: Callable[[httpx.AsyncClient], None],
+    streamed: bool,
+) -> None:
+    requests = 0
+    error = {"error": {"code": USAGE_LIMIT_CODE, "param": None, "message": "secret"}}
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            if streamed:
+                event = {"type": "response.failed", "response": error}
+                return httpx.Response(
+                    200,
+                    headers={
+                        "content-type": "text/event-stream",
+                        "x-request-id": "req_limit",
+                    },
+                    content=b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+                    + b"data: "
+                    + json.dumps(event).encode()
+                    + b"\n\n",
+                )
+            return httpx.Response(
+                429, json=error, headers={"x-request-id": "req_limit"}
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"data: [DONE]\n\n",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        http_client(client)
+        transport = ChatGPTTransport()
+        with pytest.raises(ChatGPTTransportError) as caught:
+            await collect(transport)
+        assert caught.value.code == USAGE_LIMIT_CODE
+        assert caught.value.request_id == "req_limit"
+        assert "secret" not in str(caught.value)
+        assert transport.usage_limit_reached
+        with pytest.raises(ChatGPTTransportError, match="paused"):
+            _ = [
+                event
+                async for event in transport.stream_response(
+                    {"model": "another-model"}, {}
+                )
+            ]
+        assert requests == 1
+        transport.resume_after_usage_review()
+        assert not transport.usage_limit_reached
+        assert await collect(transport) == [{"type": "done"}]
+        assert requests == 2
+
+
+async def test_usage_limit_prevents_already_queued_requests_from_dispatching(
+    http_client: Callable[[httpx.AsyncClient], None],
+) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+    requests = 0
+
+    async def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        current = requests
+        if requests == 4:
+            started.set()
+        await release.wait()
+        if current == 1:
+            return httpx.Response(429, json={"error": {"code": USAGE_LIMIT_CODE}})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"data: [DONE]\n\n",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        http_client(client)
+        transport = ChatGPTTransport()
+        tasks = [asyncio.create_task(collect(transport)) for _ in range(6)]
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert requests == 4
+        assert sum(isinstance(result, ChatGPTTransportError) for result in results) == 3
+        transport.resume_after_usage_review()
+        assert await collect(transport) == [{"type": "done"}]
+
+
+async def test_old_account_limit_does_not_block_new_account(
+    account: TestAccount,
+    http_client: Callable[[httpx.AsyncClient], None],
+) -> None:
+    requests = 0
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            account.generation += 1
+            return httpx.Response(429, json={"error": {"code": USAGE_LIMIT_CODE}})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"data: [DONE]\n\n",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        http_client(client)
+        transport = ChatGPTTransport()
+        with pytest.raises(ChatGPTTransportError):
+            await collect(transport)
+        assert not transport.usage_limit_reached
+        assert await collect(transport) == [{"type": "done"}]
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "message", "code", "shape"),
+    [
+        (401, {"detail": "Bearer secret"}, "selected account", None, "detail"),
+        (403, {"detail": "secret"}, "policy", None, "detail"),
+        (503, {"detail": "secret"}, "temporarily unavailable", None, "detail"),
+        (
+            403,
+            {"error": {"code": "subscription_sharing_user_not_eligible"}},
+            "unavailable",
+            "subscription_sharing_user_not_eligible",
+            "error object",
+        ),
+        (
+            400,
+            {
+                "error": {
+                    "code": "subscription_sharing_unsupported_capability",
+                    "param": "tools[0]",
+                }
+            },
+            "requested option",
+            "subscription_sharing_unsupported_capability",
+            "error object",
+        ),
+        (
+            503,
+            {"error": {"code": "subscription_sharing_usage_unavailable"}},
+            "checked",
+            "subscription_sharing_usage_unavailable",
+            "error object",
+        ),
+    ],
+)
+async def test_structured_and_admission_errors_preserve_safe_diagnostics(
+    account: TestAccount,
+    http_client: Callable[[httpx.AsyncClient], None],
+    status: int,
+    body: dict[str, Any],
+    message: str,
+    code: str | None,
+    shape: str,
+) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                status, json=body, headers={"x-request-id": "req_diagnostic"}
+            )
+        )
+    ) as client:
+        http_client(client)
+        transport = ChatGPTTransport()
+        with pytest.raises(ChatGPTTransportError, match=message) as caught:
+            await collect(transport)
+        assert caught.value.status_code == status
+        assert caught.value.code == code
+        assert caught.value.request_id == "req_diagnostic"
+        assert caught.value.body_shape == shape
+        assert "secret" not in str(caught.value)
+        assert not transport.usage_limit_reached
+        assert account.generation == 1
+
+
+async def test_stale_account_context_is_rejected_before_dispatch(
+    account: TestAccount,
+    http_client: Callable[[httpx.AsyncClient], None],
+) -> None:
+    calls = 0
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200)
+
+    token = account_epoch.set(account.generation)
+    try:
+        account.generation += 1
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            http_client(client)
+            with pytest.raises(ChatGPTTransportError, match="account changed"):
+                await collect(ChatGPTTransport())
+        assert calls == 0
+    finally:
+        account_epoch.reset(token)
+
+
+async def test_top_level_sse_error_sets_subscription_pause(
+    http_client: Callable[[httpx.AsyncClient], None],
+) -> None:
+    event = {
+        "type": "error",
+        "code": USAGE_LIMIT_CODE,
+        "param": "model",
+        "message": "secret",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"data: " + json.dumps(event).encode() + b"\n\n",
+            )
+        )
+    ) as client:
+        http_client(client)
+        transport = ChatGPTTransport()
+        with pytest.raises(ChatGPTTransportError) as caught:
+            await collect(transport)
+        assert caught.value.code == USAGE_LIMIT_CODE
+        assert caught.value.param == "model"
+        assert transport.usage_limit_reached
+        assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_late_usage_error_cannot_undo_explicit_resume(
+    http_client: Callable[[httpx.AsyncClient], None], streamed: bool
+) -> None:
+    started, first_failure, late_failure = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    requests = 0
+    error = {"error": {"code": USAGE_LIMIT_CODE}}
+
+    async def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        current = requests
+        if current == 2:
+            started.set()
+        if current <= 2:
+            await (first_failure if current == 1 else late_failure).wait()
+            if streamed:
+                event = {"type": "response.failed", "response": error}
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    content=b"data: " + json.dumps(event).encode() + b"\n\n",
+                )
+            return httpx.Response(429, json=error)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"data: [DONE]\n\n",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        http_client(client)
+        transport = ChatGPTTransport()
+        first = asyncio.create_task(collect(transport))
+        late = asyncio.create_task(collect(transport))
+        await asyncio.wait_for(started.wait(), 1)
+        first_failure.set()
+        with pytest.raises(ChatGPTTransportError):
+            await first
+        assert transport.usage_limit_reached
+        transport.resume_after_usage_review()
+        assert await collect(transport) == [{"type": "done"}]
+        late_failure.set()
+        with pytest.raises(ChatGPTTransportError) as caught:
+            await late
+        assert caught.value.code == USAGE_LIMIT_CODE
+        assert not transport.usage_limit_reached
+        assert await collect(transport) == [{"type": "done"}]
+        assert requests == 4

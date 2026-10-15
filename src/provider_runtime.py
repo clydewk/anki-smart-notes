@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import time
 from contextvars import ContextVar
@@ -184,13 +185,19 @@ class TrafficController:
         self._window = max(1, self._window // 2)
         self._metrics.concurrency_window = self._window
 
-        cooldown_sec = retry_after_sec or reset_after_sec or RETRY_BASE_SECONDS
+        cooldown_sec = (
+            retry_after_sec
+            if retry_after_sec is not None
+            else reset_after_sec
+            if reset_after_sec is not None
+            else RETRY_BASE_SECONDS
+        )
         next_cooldown = now + cooldown_sec
         if self._cooldown_until is None or next_cooldown > self._cooldown_until:
             self._cooldown_until = next_cooldown
             self._metrics.cooldown_until = next_cooldown
 
-        if shared_capacity and retry_after_sec is None and reset_after_sec is None:
+        if shared_capacity:
             self._ramp_blocked_until = now + 900
             self._metrics.ramp_blocked_until = self._ramp_blocked_until
 
@@ -275,9 +282,23 @@ def parse_rate_limit_reset(headers: Mapping[str, str] | None) -> float | None:
     return max(resets)
 
 
+def provider_error_code(body_text: str) -> str | None:
+    try:
+        payload = json.loads(body_text)
+    except json.JSONDecodeError:
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
 def is_shared_capacity_error(provider: str, body_text: str) -> bool:
     if provider != "openai":
         return False
+
+    code = provider_error_code(body_text)
+    if code is not None:
+        return code == "slow_down"
 
     text = body_text.lower()
     return (
@@ -354,6 +375,17 @@ def has_daily_quota_violation(body_text: str) -> bool:
 
 
 def is_terminal_quota_error(provider: str, body_text: str) -> bool:
+    if provider == "openai":
+        code = provider_error_code(body_text)
+        if code is not None:
+            return code in {
+                "insufficient_quota",
+                "credit_balance_exhausted",
+                "organization_spend_limit_exceeded",
+                "project_spend_limit_exceeded",
+                "organization_usage_limit_exceeded",
+            }
+
     text = body_text.lower()
     if provider in {"google", "google_tts"}:
         return (
@@ -656,6 +688,7 @@ class ProviderRuntime:
         model: str,
         timeouts: RequestTimeouts,
         max_retries: int = MAX_RETRIES,
+        retry_ambiguous: bool = True,
     ) -> bytes:
         controller = self.controller(key, initial_window)
         client = await self.get_http_client()
@@ -717,14 +750,17 @@ class ProviderRuntime:
                     attempt=attempt,
                     max_retries=max_retries,
                     error=timeout_error,
-                    allow_retry=True,
+                    allow_retry=retry_ambiguous
+                    or isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)),
                 )
                 if retry:
                     continue
                 raise timeout_error from exc
             except httpx.TransportError as exc:
                 controller.note_timeout()
-                if attempt < max_retries:
+                if attempt < max_retries and (
+                    retry_ambiguous or isinstance(exc, httpx.ConnectError)
+                ):
                     controller.note_retry()
                     await asyncio.sleep(self._retry_delay(attempt, None, None))
                     continue
@@ -1035,9 +1071,10 @@ class ProviderRuntime:
             )
             raise ProviderUnavailableError(unavailable_message) from error
 
+        retry_delay = self._retry_delay(attempt, retry_after, reset_after)
         controller.note_throttle(
             retry_after_sec=retry_after,
-            reset_after_sec=reset_after,
+            reset_after_sec=reset_after if reset_after is not None else retry_delay,
             shared_capacity=is_shared_capacity_error(provider, error.body),
         )
 
@@ -1053,7 +1090,7 @@ class ProviderRuntime:
                 will_retry=True,
             )
             controller.note_retry()
-            await asyncio.sleep(self._retry_delay(attempt, retry_after, reset_after))
+            await asyncio.sleep(retry_delay)
             return True
 
         self._log_http_error(
@@ -1226,7 +1263,8 @@ class ProviderRuntime:
             return retry_after_sec
         if reset_after_sec is not None:
             return min(reset_after_sec, MAX_RETRY_WAIT_SECONDS)
-        return min((2**attempt) * RETRY_BASE_SECONDS, MAX_RETRY_WAIT_SECONDS)
+        delay = min((2**attempt) * RETRY_BASE_SECONDS, MAX_RETRY_WAIT_SECONDS)
+        return random.uniform(delay * 0.8, delay)
 
     @staticmethod
     def _parse_sse_payload(lines: list[str]) -> dict[str, Any] | None:

@@ -21,13 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
+import re
 from contextlib import suppress
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from .chatgpt_auth import chatgpt_auth
+from .chatgpt_auth import account_epoch, chatgpt_auth
+from .logger import redact_text
 from .models import ChatGPTModel
 from .provider_runtime import ResponseFormatError, provider_runtime, request_accounting
 
@@ -35,16 +37,93 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator
 
 
-RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
-MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
-LIMITS_URL = "https://chatgpt.com/backend-api/wham/usage"
-CATALOG_CLIENT_VERSION = "0.149.0"
+RESPONSES_URL = "https://api.openai.com/v1/responses"
+MODELS_URL = "https://api.openai.com/v1/models"
+USAGE_LIMIT_CODE = "subscription_sharing_usage_limit_exceeded"
+USAGE_LIMIT_MESSAGE = (
+    "ChatGPT plan requests are paused. Review ChatGPT settings → Usage, then choose "
+    "Resume requests in Providers. An app-specific limit may apply."
+)
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 CONTROL_TIMEOUT = 60.0
 
 
 class ChatGPTTransportError(RuntimeError):
-    """A transport failure safe to display without provider diagnostics."""
+    """A transport failure containing only bounded, redacted diagnostic fields."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        param: str | None = None,
+        request_id: str | None = None,
+        body_shape: str | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.code = code
+        self.param = param
+        self.request_id = request_id
+        self.body_shape = body_shape
+        details = [f"HTTP {status_code}"] if status_code is not None else []
+        details.extend(
+            f"{name}: {value}"
+            for name, value in (
+                ("code", code),
+                ("param", param),
+                ("request ID", request_id),
+                ("body", body_shape),
+            )
+            if value is not None
+        )
+        super().__init__(message + (f" ({'; '.join(details)})" if details else ""))
+
+
+def diagnostic_field(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9_.\[\]-]{1,200}", value) is None
+    ):
+        return None
+    return redact_text(value)
+
+
+def response_error(
+    payload: dict[str, Any], status: int | None, request_id: str | None
+) -> ChatGPTTransportError:
+    error = payload.get("error")
+    error = error if isinstance(error, dict) else {}
+    code = diagnostic_field(error.get("code"))
+    messages = {
+        USAGE_LIMIT_CODE: USAGE_LIMIT_MESSAGE,
+        "subscription_sharing_user_not_eligible": "ChatGPT plan usage is unavailable for this account, workspace, or policy.",
+        "subscription_sharing_usage_unavailable": "ChatGPT usage availability could not be checked. Try again later.",
+        "subscription_sharing_unsupported_capability": "ChatGPT plan usage does not support a requested option. Review the indicated setting.",
+        "subscription_sharing_route_not_supported": "ChatGPT plan usage rejected this API route. Check the integration.",
+        "subscription_sharing_invalid_user": "ChatGPT could not validate the selected account. Check its connection and permissions.",
+        "chatpass_v2_scope_not_authorized": "ChatGPT plan permission was not accepted. Check the connection and client configuration.",
+        "chatpass_v2_invalid_authorization_context": "ChatGPT plan permission was not accepted. Check the connection and client configuration.",
+        "subscription_sharing_user_unavailable": "ChatGPT account information is temporarily unavailable. Try again later.",
+    }
+    fallback = {
+        401: "ChatGPT did not accept the selected account or its plan permission. Check the connection.",
+        403: "A ChatGPT policy or permission restriction prevented this request. Check the connection and serving region.",
+        429: "ChatGPT temporarily limited this request. Try again later.",
+        503: "ChatGPT plan routing is temporarily unavailable. Try again later.",
+    }.get(status or 0, "ChatGPT did not complete the request. No text was saved.")
+    return ChatGPTTransportError(
+        messages.get(code or "", fallback),
+        status_code=status,
+        code=code,
+        param=diagnostic_field(error.get("param")),
+        request_id=diagnostic_field(request_id),
+        body_shape="error object"
+        if error
+        else "detail"
+        if "detail" in payload
+        else "other",
+    )
 
 
 def parse_event(lines: list[bytes]) -> dict[str, Any] | None:
@@ -107,18 +186,6 @@ async def bounded_json(response: httpx.Response) -> dict[str, Any]:
     return payload
 
 
-def require_success(response: httpx.Response) -> None:
-    if response.status_code == 200:
-        return
-    if response.status_code in {401, 403}:
-        message = "ChatGPT authorization failed. Sign in again in Providers."
-    elif response.status_code == 429:
-        message = "ChatGPT usage limit reached. Check your subscription limits."
-    else:
-        message = f"ChatGPT request failed (HTTP {response.status_code})."
-    raise ChatGPTTransportError(message)
-
-
 def parse_models(payload: dict[str, Any]) -> list[ChatGPTModel]:
     entries = payload.get("models")
     if not isinstance(entries, list):
@@ -151,39 +218,56 @@ def parse_models(payload: dict[str, Any]) -> list[ChatGPTModel]:
     return list(models.values())
 
 
-def format_limits(payload: dict[str, Any]) -> str:
-    limits = payload.get("rate_limit")
-    parts: list[str] = []
-    if isinstance(limits, dict):
-        for key in ("primary_window", "secondary_window"):
-            window = limits.get(key)
-            if not isinstance(window, dict):
-                continue
-            used = window.get("used_percent")
-            seconds = window.get("limit_window_seconds")
-            if (
-                isinstance(used, bool)
-                or not isinstance(used, (int, float))
-                or not math.isfinite(used)
-                or isinstance(seconds, bool)
-                or not isinstance(seconds, int)
-                or seconds <= 0
-            ):
-                continue
-            if seconds % 86400 == 0:
-                label = f"{seconds // 86400}-day"
-            elif seconds % 3600 == 0:
-                label = f"{seconds // 3600}-hour"
-            else:
-                label = f"{seconds / 60:g}-minute"
-            parts.append(f"{label} window: {max(0, min(100, 100 - used)):g}% remaining")
-    return "; ".join(parts) if parts else "Subscription limits are unavailable."
-
-
 class ChatGPTTransport:
     def __init__(self) -> None:
         self._models: tuple[ChatGPTModel, ...] = ()
         self._models_generation: int | None = None
+        self._usage_lock = Lock()
+        self._usage_limit_generation: int | None = None
+        self._usage_revision = 0
+
+    @property
+    def usage_limit_reached(self) -> bool:
+        with self._usage_lock:
+            return self._usage_limit_generation == chatgpt_auth.generation
+
+    def resume_after_usage_review(self) -> None:
+        with self._usage_lock:
+            self._usage_limit_generation = None
+            self._usage_revision += 1
+
+    def _check_available(self, generation: int, revision: int | None = None) -> int:
+        with self._usage_lock:
+            if generation != chatgpt_auth.generation:
+                raise ChatGPTTransportError(
+                    "The ChatGPT account changed. Run generation again."
+                )
+            if self._usage_limit_generation == generation:
+                raise ChatGPTTransportError(USAGE_LIMIT_MESSAGE, code=USAGE_LIMIT_CODE)
+            if revision is not None and revision != self._usage_revision:
+                raise ChatGPTTransportError(
+                    "ChatGPT usage settings changed. Run generation again."
+                )
+            return self._usage_revision
+
+    def _raise_response_error(
+        self,
+        payload: dict[str, Any],
+        generation: int,
+        status: int | None,
+        request_id: str | None,
+        revision: int,
+    ) -> None:
+        error = response_error(payload, status, request_id)
+        if error.code == USAGE_LIMIT_CODE:
+            with self._usage_lock:
+                if (
+                    generation == chatgpt_auth.generation
+                    and revision == self._usage_revision
+                ):
+                    self._usage_limit_generation = generation
+                    self._usage_revision += 1
+        raise error
 
     def get_cached_models(self) -> list[ChatGPTModel]:
         if self._models_generation != chatgpt_auth.generation:
@@ -192,9 +276,7 @@ class ChatGPTTransport:
 
     async def fetch_models(self) -> list[ChatGPTModel]:
         generation = chatgpt_auth.generation
-        payload = await self._get_json(
-            MODELS_URL, params={"client_version": CATALOG_CLIENT_VERSION}
-        )
+        payload = await self._get_json(MODELS_URL)
         models = parse_models(payload)
         if generation != chatgpt_auth.generation:
             raise ChatGPTTransportError(
@@ -204,12 +286,10 @@ class ChatGPTTransport:
         self._models_generation = generation
         return models
 
-    async def fetch_limits(self) -> str:
-        return format_limits(await self._get_json(LIMITS_URL))
-
-    async def _get_json(
-        self, url: str, *, params: dict[str, str] | None = None
-    ) -> dict[str, Any]:
+    async def _get_json(self, url: str) -> dict[str, Any]:
+        generation = chatgpt_auth.generation
+        with self._usage_lock:
+            revision = self._usage_revision
         try:
             async with asyncio.timeout(CONTROL_TIMEOUT), chatgpt_auth.session():
                 headers = await chatgpt_auth.headers()
@@ -217,12 +297,21 @@ class ChatGPTTransport:
                 async with client.stream(
                     "GET",
                     url,
-                    params=params,
                     headers=headers,
                     follow_redirects=False,
                     timeout=CONTROL_TIMEOUT,
                 ) as response:
-                    require_success(response)
+                    payload: dict[str, Any] = {}
+                    if response.status_code != 200:
+                        with suppress(ResponseFormatError):
+                            payload = await bounded_json(response)
+                        self._raise_response_error(
+                            payload,
+                            generation,
+                            response.status_code,
+                            response.headers.get("x-request-id"),
+                            revision,
+                        )
                     return await bounded_json(response)
         except (TimeoutError, httpx.TransportError):
             raise ChatGPTTransportError(
@@ -242,12 +331,15 @@ class ChatGPTTransport:
             ) from None
         if len(body) > MAX_MESSAGE_BYTES:
             raise ResponseFormatError("ChatGPT request exceeded the size limit.")
-        controller = provider_runtime.controller(
-            f"chatgpt:{payload.get('model', '')}", 4
-        )
+        generation = account_epoch.get()
+        generation = chatgpt_auth.generation if generation is None else generation
+        revision = self._check_available(generation)
+        controller = provider_runtime.controller(f"chatgpt:{generation}", 4)
         await controller.acquire()
         try:
+            self._check_available(generation, revision)
             client = await provider_runtime.get_http_client()
+            self._check_available(generation, revision)
             accounting = request_accounting.get()
             if accounting is not None:
                 accounting.start_request()
@@ -263,10 +355,20 @@ class ChatGPTTransport:
                 follow_redirects=False,
                 timeout=httpx.Timeout(60.0, connect=10.0),
             ) as response:
-                if response.status_code != 200 and accounting is not None:
+                request_id = response.headers.get("x-request-id")
+                if response.status_code != 200:
+                    error_payload: dict[str, Any] = {}
                     with suppress(ResponseFormatError):
-                        accounting.observe(await bounded_json(response))
-                require_success(response)
+                        error_payload = await bounded_json(response)
+                    if accounting is not None:
+                        accounting.observe(error_payload)
+                    self._raise_response_error(
+                        error_payload,
+                        generation,
+                        response.status_code,
+                        request_id,
+                        revision,
+                    )
                 if (
                     response.headers.get("content-type", "")
                     .split(";", 1)[0]
@@ -283,6 +385,28 @@ class ChatGPTTransport:
                 async for event in response_events(response):
                     if accounting is not None:
                         accounting.observe(event)
+                    if event.get("type") in {
+                        "error",
+                        "response.failed",
+                        "response.incomplete",
+                    }:
+                        failure = event.get("response", event)
+                        if event.get("type") == "error" and "code" in event:
+                            failure = {"error": event}
+                        if isinstance(failure, dict) and isinstance(
+                            failure.get("error"), dict
+                        ):
+                            self._raise_response_error(
+                                failure,
+                                generation,
+                                response.status_code,
+                                request_id,
+                                revision,
+                            )
+                    if generation != chatgpt_auth.generation:
+                        raise ChatGPTTransportError(
+                            "The ChatGPT account changed. Run generation again."
+                        )
                     yield event
         except (TimeoutError, httpx.TransportError):
             raise ChatGPTTransportError(

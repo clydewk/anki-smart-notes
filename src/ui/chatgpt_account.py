@@ -19,14 +19,18 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
+from collections.abc import Coroutine
 from functools import partial
 from typing import TYPE_CHECKING
 
 from aqt.qt import (
+    QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QShowEvent,
+    QSizePolicy,
     Qt,
     QVBoxLayout,
     pyqtSignal,
@@ -34,14 +38,17 @@ from aqt.qt import (
 from aqt.utils import openLink
 from PyQt6 import sip
 
-from ..chatgpt_auth import ChatGPTAccount, chatgpt_auth
+from ..chatgpt_auth import ChatGPTAccount, ChatGPTAuthError, chatgpt_auth
 from ..chatgpt_transport import chatgpt_transport
 from ..logger import redact_text
 from ..sentry import run_async_in_background_with_sentry
 from ..utils import run_on_main
+from .ui_utils import show_message_box
 
 if TYPE_CHECKING:
     from ..tasks import JobHandle
+
+CHATGPT_USAGE_URL = "https://chatgpt.com/settings/usage"
 
 
 class ChatGPTAccountWidget(QGroupBox):
@@ -51,64 +58,148 @@ class ChatGPTAccountWidget(QGroupBox):
         super().__init__("ChatGPT account")
         self._job: JobHandle | None = None
         self._signing_in = False
-        self._limits_inflight = False
+        self._signing_out = False
         layout = QVBoxLayout(self)
+        self.account_picker = QComboBox()
+        self.account_picker.setAccessibleName("Active ChatGPT account")
+        self.account_picker.setMinimumContentsLength(16)
+        self.account_picker.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.account_picker.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.account_picker.currentIndexChanged.connect(self._select_account)
+        layout.addWidget(self.account_picker)
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setAccessibleName("ChatGPT account status")
         layout.addWidget(self.status_label)
         explanation = QLabel(
-            "Account actions apply immediately across all profiles, including when you cancel settings. "
-            "Sign-in opens your browser. This connection is separate from the Codex app and the OpenAI API."
+            "Use your ChatGPT plan for text generation. Account actions apply immediately "
+            "across all profiles, including when you cancel settings. Sign-in opens your browser."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
-        self.limits_label = QLabel(
-            "Uses your ChatGPT subscription. The OpenAI API estimated token guard does not apply."
-        )
+        self.limits_label = QLabel()
         self.limits_label.setWordWrap(True)
         self.limits_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.limits_label)
-        self.sign_in_button = QPushButton("Sign in with ChatGPT")
+        self.sign_in_button = QPushButton("Continue with ChatGPT")
         self.cancel_button = QPushButton("Cancel sign-in")
+        self.add_account_button = QPushButton("Add account…")
         self.sign_out_button = QPushButton("Sign out")
-        self.limits_button = QPushButton("Check limits")
-        actions = QHBoxLayout()
-        for button in (
-            self.sign_in_button,
-            self.cancel_button,
-            self.sign_out_button,
-            self.limits_button,
+        self.manage_usage_button = QPushButton("Manage usage")
+        self.resume_button = QPushButton("Resume requests after reviewing usage")
+        for buttons in (
+            (self.sign_in_button, self.cancel_button, self.add_account_button),
+            (self.manage_usage_button, self.sign_out_button),
+            (self.resume_button,),
         ):
-            actions.addWidget(button)
-        actions.addStretch()
-        layout.addLayout(actions)
-        self.sign_in_button.clicked.connect(self._sign_in)
+            actions = QHBoxLayout()
+            for button in buttons:
+                actions.addWidget(button)
+            actions.addStretch()
+            layout.addLayout(actions)
+        self.sign_in_button.clicked.connect(lambda: self._sign_in())
+        self.add_account_button.clicked.connect(lambda: self._sign_in(new_account=True))
         self.cancel_button.clicked.connect(self.cancel_sign_in)
         self.sign_out_button.clicked.connect(self._sign_out)
-        self.limits_button.clicked.connect(self._check_limits)
+        self.manage_usage_button.clicked.connect(lambda: openLink(CHATGPT_USAGE_URL))
+        self.resume_button.clicked.connect(self._resume_requests)
         self.refresh_status()
 
+    def showEvent(self, a0: QShowEvent | None) -> None:
+        self.refresh_status()
+        super().showEvent(a0)
+
     def refresh_status(self) -> None:
-        account = chatgpt_auth.status()
+        try:
+            account = chatgpt_auth.status()
+            accounts = chatgpt_auth.list_accounts()
+            needs_reauthorization = chatgpt_auth.needs_reauthorization
+        except ChatGPTAuthError as error:
+            self.status_label.setText(redact_text(str(error)))
+            self.limits_label.setText("Your other provider settings remain available.")
+            for control in (
+                self.account_picker,
+                self.sign_in_button,
+                self.add_account_button,
+                self.cancel_button,
+                self.sign_out_button,
+                self.manage_usage_button,
+                self.resume_button,
+            ):
+                control.hide()
+            return
+        self.account_picker.blockSignals(True)
+        self.account_picker.clear()
+        for index, saved in enumerate(accounts, 1):
+            label = f"Account {index} · {saved.email or 'Not signed in'}"
+            if saved.plan:
+                label += f" · {saved.plan}"
+            self.account_picker.addItem(label, saved.account_id)
+            if account and saved.account_id == account.account_id:
+                self.account_picker.setCurrentIndex(index - 1)
+        self.account_picker.blockSignals(False)
+        self.account_picker.setVisible(bool(accounts))
+        busy = self._signing_in or self._signing_out
+        connected = bool(account and account.connected)
+        sharing = bool(connected and account and account.sharing)
+        limited = sharing and chatgpt_transport.usage_limit_reached
+        self.account_picker.setEnabled(not busy)
         self.status_label.setText(
             "Waiting for browser sign-in…"
             if self._signing_in
-            else f"Signed in: {account.email or account.account_id}"
+            else "Signing out…"
+            if self._signing_out
+            else f"Signed in: {account.email or 'ChatGPT account'}"
             + (f" · {account.plan}" if account.plan else "")
-            if account
+            if connected and account
+            else "Sign in again to migrate your ChatGPT connection."
+            if needs_reauthorization
             else "Not signed in."
         )
-        self.sign_in_button.setVisible(not self._signing_in and account is None)
+        self.limits_label.setText(
+            "Usage limit reached. Review your plan or app limit in ChatGPT settings. "
+            "New ChatGPT requests are paused."
+            if limited
+            else "Using ChatGPT plan. The OpenAI API estimated token guard does not apply."
+            if sharing
+            else "ChatGPT plan use is not enabled. Enable it to generate text."
+            if connected
+            else "ChatGPT plan usage is separate from the OpenAI API estimated token guard."
+        )
+        self.sign_in_button.setText(
+            "Enable ChatGPT plan"
+            if connected and not sharing
+            else "Continue with ChatGPT"
+        )
+        self.sign_in_button.setVisible(not busy and not sharing)
         self.cancel_button.setVisible(self._signing_in)
         self.cancel_button.setEnabled(True)
-        self.sign_out_button.setVisible(account is not None and not self._signing_in)
-        self.limits_button.setVisible(account is not None and not self._signing_in)
-        self.limits_button.setEnabled(not self._limits_inflight)
+        self.add_account_button.setVisible(bool(accounts) and not busy)
+        self.sign_out_button.setVisible(connected and not busy)
+        self.manage_usage_button.setVisible(connected and not busy)
+        self.resume_button.setVisible(limited and not busy)
+        self.manage_usage_button.setAutoDefault(limited)
 
-    def _sign_in(self) -> None:
-        if self._signing_in:
+    def _select_account(self, index: int) -> None:
+        account_id = self.account_picker.itemData(index)
+        if not isinstance(account_id, str):
+            return
+        try:
+            chatgpt_auth.select_account(account_id)
+        except Exception as error:
+            self.refresh_status()
+            self.status_label.setText(redact_text(str(error)))
+            return
+        self.refresh_status()
+        self.account_changed.emit()
+
+    def _sign_in(self, *, new_account: bool = False) -> None:
+        if self._signing_in or self._signing_out:
             return
         self._signing_in = True
         self.refresh_status()
@@ -117,12 +208,23 @@ class ChatGPTAccountWidget(QGroupBox):
             run_on_main(partial(openLink, url))
 
         async def sign_in() -> ChatGPTAccount:
-            return await chatgpt_auth.sign_in(open_browser)
+            return await chatgpt_auth.sign_in(open_browser, new_account=new_account)
 
         def success(_: ChatGPTAccount) -> None:
             self._signing_in = False
             self.refresh_status()
             self.account_changed.emit()
+            if chatgpt_auth.welcome_needed:
+                show_message_box(
+                    "You’re using your ChatGPT plan",
+                    "Eligible text generation in Smart Notes uses your ChatGPT plan. "
+                    "Review usage and set this app’s limits in ChatGPT Settings → Usage.",
+                    custom_ok="Got it",
+                )
+                try:
+                    chatgpt_auth.mark_welcome_seen()
+                except ChatGPTAuthError as error:
+                    self.status_label.setText(redact_text(str(error)))
 
         def failure(error: Exception) -> None:
             self._signing_in = False
@@ -133,13 +235,8 @@ class ChatGPTAccountWidget(QGroupBox):
             self._job = None
             interrupted = self._signing_in
             self._signing_in = False
-            if not sip.isdeleted(self):
-                if interrupted:
-                    self.refresh_status()
-                self.cancel_button.hide()
-                account = chatgpt_auth.status()
-                self.sign_in_button.setVisible(account is None)
-                self.sign_out_button.setVisible(account is not None)
+            if not sip.isdeleted(self) and interrupted:
+                self.refresh_status()
 
         try:
             self._job = run_async_in_background_with_sentry(
@@ -164,48 +261,45 @@ class ChatGPTAccountWidget(QGroupBox):
         self.status_label.setText("Cancelling sign-in…")
 
     def _sign_out(self) -> None:
-        error_message: str | None = None
-        try:
-            chatgpt_auth.sign_out()
-        except Exception as error:
-            error_message = redact_text(str(error))
-        self.refresh_status()
-        if error_message:
-            self.status_label.setText(error_message)
-        self.limits_label.setText(
-            "Uses your ChatGPT subscription. The OpenAI API estimated token guard does not apply."
-        )
-        self.account_changed.emit()
-
-    def _check_limits(self) -> None:
-        if self._limits_inflight:
+        if self._signing_in or self._signing_out:
             return
-        self._limits_inflight = True
-        self.limits_button.setEnabled(False)
-        self.limits_label.setText("Checking subscription limits…")
-        generation = chatgpt_auth.generation
+        try:
+            revocation = chatgpt_auth.sign_out()
+        except Exception as error:
+            self.refresh_status()
+            self.status_label.setText(redact_text(str(error)))
+            self.account_changed.emit()
+            return
+        self._signing_out = True
+        self.refresh_status()
+        self.account_changed.emit()
+        started = False
 
-        def success(limits: str) -> None:
-            if generation == chatgpt_auth.generation:
-                self.limits_label.setText(
-                    f"{limits}. The OpenAI API estimated token guard does not apply."
-                )
+        async def revoke() -> None:
+            nonlocal started
+            started = True
+            await revocation
 
-        def failure(error: Exception) -> None:
-            if generation == chatgpt_auth.generation:
-                self.limits_label.setText(
-                    f"Could not check subscription limits: {redact_text(str(error))}"
-                )
+        def failure(_: Exception) -> None:
+            self.status_label.setText(
+                "Signed out locally. Remote revocation was not confirmed; "
+                "disconnect Smart Notes in ChatGPT Settings → Usage."
+            )
 
         def finish() -> None:
-            self._limits_inflight = False
+            if not started and isinstance(revocation, Coroutine):
+                revocation.close()
+            self._signing_out = False
             if not sip.isdeleted(self):
-                self.limits_button.setEnabled(True)
+                message = self.status_label.text()
+                self.refresh_status()
+                if message != "Signing out…":
+                    self.status_label.setText(message)
 
         try:
             run_async_in_background_with_sentry(
-                chatgpt_transport.fetch_limits,
-                success,
+                revoke,
+                lambda _: None,
                 failure,
                 owner=self,
                 on_finished=finish,
@@ -214,3 +308,8 @@ class ChatGPTAccountWidget(QGroupBox):
         except Exception as error:
             failure(error)
             finish()
+
+    def _resume_requests(self) -> None:
+        chatgpt_transport.resume_after_usage_review()
+        self.refresh_status()
+        self.account_changed.emit()

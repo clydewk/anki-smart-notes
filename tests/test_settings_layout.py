@@ -116,6 +116,42 @@ collection.close()
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_openai_speed_is_drafted_validated_and_restored(tmp_path: Path) -> None:
+    script = (
+        SETTINGS_SETUP
+        + """
+settings.pop("openai_service_tier", None)
+settings.update(openai_fast_mode_enabled=True, openai_endpoint=None,
+                chat_provider="openai", chat_model="gpt-6-astra", chat_reasoning_effort="low")
+dialog = options_module.AddonOptionsDialog(MagicMock())
+dialog.show()
+settle()
+assert dialog.state.s["openai_service_tier"] == "fast"
+dialog.openai_service_tier.setCurrentIndex(3)
+settle()
+assert dialog.draft_settings()["openai_service_tier"] == "ultrafast"
+dialog.state.update({"openai_endpoint": "https://eu.api.openai.com/v1"})
+settle()
+assert "Ultrafast requires" in dialog.chat_options.model_warning.text()
+assert settings.get("openai_service_tier") is None
+dialog.on_restore_defaults()
+assert dialog.state.s["openai_service_tier"] == "auto"
+dialog.reject()
+assert settings.get("openai_service_tier") is None
+assert settings["openai_fast_mode_enabled"] is True
+collection.close()
+"""
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize("size", [(800, 650), (640, 470)])
 @pytest.mark.parametrize("point_size", [13, 18])
 def test_every_settings_page_fits_native_viewport(

@@ -22,6 +22,14 @@ Enable only the built-in tools and MCP servers you intend providers to call. MCP
 
 The OpenAI token setting is an **estimated token guard**, not an exact billing ceiling. Actual usage may remain unknown when a dispatched request fails or is cancelled. Check provider billing for charges.
 
+## OpenAI models and processing
+
+The Text page includes GPT-6 Astra, GPT-6.1 Sol, GPT-6 Sol, and GPT-6 Luna alongside supported older models. Reasoning, temperature, and tool controls follow each model's capabilities. Existing selections are preserved. Models with announced shutdown dates display warnings; retired selections remain visible for correction and cannot generate.
+
+Choose processing speed on **Providers → OpenAI text requests**. **Project default** follows the API project's setting, **Standard** explicitly requests standard processing, and **Fast** and **Ultrafast** request premium processing. Ultrafast supports Astra with global/US processing and 6.1 Sol with global/US/EU processing. Unsupported combinations fail before generation rather than switching tiers. These controls apply to API-key text requests; the native ChatGPT connection retains its account-provided models and options. See [OpenAI's speed documentation](https://developers.openai.com/api/docs/guides/ultrafast-mode) for availability and pricing.
+
+GPT Image 2.5 Sunburst and Flare support all six rendering qualities, including `xhigh` and `max`. Image size choices show the requested dimensions and aspect ratio; large sizes are experimental. GPT Image requests allow three minutes for a response. A network failure after possible submission is not automatically replayed, since the original generation may have succeeded.
+
 ## Speech delivery
 
 Gemini 3.8 Flash TTS and Flash-Lite TTS are available alongside the existing Google voices. Add a voice on the Speech page and choose a delivery mode in its field prompt:
@@ -34,11 +42,19 @@ Gemini 3.8 receives directions separately from the transcript using Google's [sp
 
 Automatic delivery has a 60-second deadline, a 4,096-character response bound, and a 1,024-output-token limit where the text provider supports it. Directions are limited to 400 characters. Reported text usage is recorded through the existing usage tracker; these bounds do not guarantee a billing ceiling. Automatic delivery is off by default. No model or voice is automatically upgraded or selected by the text model.
 
+OpenAI's **GPT Realtime 2.1 Mini** is available in the Speech voice catalog for Natural or Custom delivery. It reads the supplied text in an isolated audio response and produces a WAV file only after successful completion. Requests are bounded to five minutes, cancellation closes the connection, and interrupted requests are not automatically replayed. Existing Speech API models remain available until their announced shutdown dates; text and instructions are each limited to 4,096 characters after field substitution.
+
+OpenAI schedules `tts-1`, `tts-1-hd`, and the dated mini-TTS snapshots to shut down on **January 6, 2027**. The undated mini-TTS alias has no separately announced shutdown date, but its current snapshot is affected. Realtime voices differ: saved `fable`, `nova`, and `onyx` selections require an explicit replacement if changing to Realtime. See the [deprecation notice](https://developers.openai.com/api/docs/deprecations#2026-10-01-text-to-speech-models). No saved voice is automatically replaced.
+
 ## ChatGPT connection
 
-Choose **Sign in with ChatGPT** on the Providers page, finish sign-in in your browser, then select **ChatGPT** on the Text page and refresh its model list. No Codex executable or other application is required. Speech and image generation still use their existing providers. Account actions take effect immediately across profiles; Save and Cancel apply to ordinary settings and prompts. Sign out cancels active ChatGPT work and prevents pending results from being written.
+Choose **Continue with ChatGPT** on the Providers page, finish sign-in in your browser, and allow Smart Notes to use your ChatGPT plan. Then select **ChatGPT** on the Text page and refresh its model list. The connection follows OpenAI's [native Sign in with ChatGPT reference](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt) and uses the public Responses API. No API key, Codex executable, or other application is required. Speech and image generation still use their existing providers.
 
-This native connection uses the OAuth and ChatGPT backend approach implemented by [OpenCode](https://github.com/anomalyco/opencode/blob/696f41bc8e7586657375d53390925fc54c25d34c/packages/opencode/src/plugin/openai/codex.ts). It is not a documented public OpenAI API and may require compatibility updates. Sign-in requires the local callback port 1455 to be available. Refresh tokens belong only to Smart Notes: they are stored in a private `AnkiSmartNotes/chatgpt.json` file under macOS Application Support or Windows AppData/Roaming, outside Anki profiles, prompt exports, and add-on packages. This file contains credentials; do not share it.
+Older Smart Notes ChatGPT connections require a new sign-in. Their credentials cannot be reused for the new app registration. Saved prompts and model choices are preserved. Saved ChatGPT accounts can be selected independently of Anki profiles; each registration retains its own identity and credentials, even when email addresses match. Account actions apply immediately across Anki profiles. Save and Cancel continue to govern ordinary settings and prompts.
+
+**Manage usage** opens ChatGPT's usage settings, where you can review plan usage and set Smart Notes' weekly app limit. A cap does not reserve a portion of your allowance. When OpenAI reports a subscription limit, Smart Notes stops starting new ChatGPT requests; after reviewing or changing the limit, explicitly resume requests in Providers. The add-on does not infer remaining percentages or reset times, switch to API billing, or count ChatGPT usage against the OpenAI API estimated token guard. See [OpenAI's usage guidance](https://learn.chatgpt.com/docs/sign-in-with-chatgpt#see-and-manage-usage).
+
+Credentials and the installation's host ID are stored in private application data, outside Anki profiles and exports. ID tokens are verified before account identity is accepted. Signing out cancels active work and invalidates pending note writes, attempts to revoke the renewable session, and clears that account's local tokens while retaining its registration for later sign-in. If remote revocation cannot be confirmed, disconnect the app in ChatGPT settings.
 
 ChatGPT uses its subscription limits, separately from the OpenAI API estimated token guard. Model discovery preserves saved unavailable model IDs and reasoning settings. Temperature and output-token limits are not sent. Only completed final answers can be saved; interrupted or incomplete streams are discarded without automatic replay. Existing built-in and MCP tools run through Smart Notes, with a maximum of 12 calls per generated field. Each field has a separate conversation and a five-minute timeout.
 
@@ -57,7 +73,7 @@ The script detects `.venv/bin/python` on macOS and `.venv/Scripts/python.exe` on
 
 Builds bundle the selected pure Python runtime dependencies and their license notices. They package committed `config.json` defaults, never a source checkout's modified runtime configuration. Commit intentional default changes before a release build. Backups, usage ledgers, logs, environment files, tests, and installed Anki folders are excluded. Building or cleaning never installs the add-on or changes an Anki profile.
 
-For independent MCP integration tests, install `mcp==1.12.4` in a separate Python environment and set `MCP_TEST_PYTHON` to its interpreter before running `python -m pytest tests/test_mcp.py`. These tests start local subprocess/HTTP servers. The SDK is a test dependency only and is never bundled. CI runs checks, unit tests, SDK integration tests, and packaging on Windows and macOS.
+For independent MCP integration tests, install `mcp==1.12.4 pydantic==2.11.10` in a separate Python environment and set `MCP_TEST_PYTHON` to its interpreter before running `python -m pytest tests/test_mcp.py`. The Pydantic pin preserves compatibility with this SDK version. These tests start local subprocess/HTTP servers. The SDK is a test dependency only and is never bundled. CI runs checks, unit tests, SDK integration tests, and packaging on Windows and macOS.
 
 Before release, verify the built add-on in disposable Windows and macOS profiles at an 800×650 logical viewport: profile switching, active shutdown, unsaved editors, undo, sync, settings migration, and media updates. Paid-provider smoke tests require separate authorization.
 

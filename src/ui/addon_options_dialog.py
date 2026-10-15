@@ -61,9 +61,11 @@ from ..job_context import JobCancelledError
 from ..logger import logger, redact_text
 from ..mcp_runtime import McpServerProbeResult, mcp_runtime
 from ..models import (
+    OPENAI_SERVICE_TIERS,
     BuiltInToolsConfig,
     CustomProvider,
     McpServerConfig,
+    OpenAIServiceTier,
     PromptMap,
     SmartFieldType,
     normalize_built_in_tools_config,
@@ -86,6 +88,7 @@ from .image_options import ImageOptions
 from .mcp_server_dialog import MCP_DOCS_URL, McpServerDialog
 from .prompt_dialog import PromptDialog
 from .reactive_check_box import ReactiveCheckBox
+from .reactive_combo_box import ReactiveComboBox
 from .reactive_line_edit import ReactiveLineEdit
 from .reactive_spin_box import ReactiveSpinBox
 from .state_manager import StateManager
@@ -117,7 +120,8 @@ class State(TypedDict):
     openai_endpoint: str | None
     allow_empty_fields: bool
     debug: bool
-    openai_fast_mode_enabled: bool
+    openai_service_tier: OpenAIServiceTier
+    openai_service_tiers: list[str]
     openai_daily_token_budget_enabled: bool
     openai_daily_token_budget: int
 
@@ -359,16 +363,21 @@ class AddonOptionsDialog(QDialog):
         requests = QGroupBox("OpenAI text requests")
         request_form = default_form_layout()
         requests.setLayout(request_form)
-        self.openai_fast_mode_checkbox = ReactiveCheckBox(
-            self.state, "openai_fast_mode_enabled"
+        self.openai_service_tier = ReactiveComboBox(
+            self.state,
+            "openai_service_tiers",
+            "openai_service_tier",
+            {str(key): label for key, label in OPENAI_SERVICE_TIERS.items()},
         )
-        self.openai_fast_mode_checkbox.setText("Use Fast mode (premium pricing)")
-        request_form.addRow(self.openai_fast_mode_checkbox)
-        request_form.addRow(
-            QLabel(
-                "Request faster responses from supported OpenAI models at a higher per-token price."
-            )
+        request_form.addRow("Processing speed", self.openai_service_tier)
+        speed_help = QLabel(
+            "Project default follows your OpenAI project setting. Standard overrides it. "
+            "Fast and Ultrafast cost more; availability depends on model and processing region. "
+            "Ultrafast supports GPT-6 Astra (global/US) and GPT-6.1 Sol (global/US/EU). "
+            "This setting applies only to OpenAI API text requests."
         )
+        speed_help.setWordWrap(True)
+        request_form.addRow(speed_help)
         layout.addWidget(requests)
 
         budget = QGroupBox("OpenAI text · estimated token guard")
@@ -856,6 +865,11 @@ class AddonOptionsDialog(QDialog):
             current[key] != previous[key] for key in ["prompts_map", "search_text"]
         ):
             self.render_table()
+        if previous is not None and any(
+            current[key] != previous[key]
+            for key in ("openai_service_tier", "openai_endpoint")
+        ):
+            self.chat_options.update_capabilities()
         self.openai_budget_spinbox.setEnabled(
             current["openai_daily_token_budget_enabled"]
         )
@@ -1336,7 +1350,9 @@ class AddonOptionsDialog(QDialog):
             "generate_at_review": config.generate_at_review,
             "regenerate_notes_when_batching": config.regenerate_notes_when_batching,
             "openai_endpoint": config.openai_endpoint,
-            "openai_fast_mode_enabled": bool(config.openai_fast_mode_enabled),
+            "openai_service_tier": config.openai_service_tier
+            or ("fast" if config.openai_fast_mode_enabled else "auto"),
+            "openai_service_tiers": list(OPENAI_SERVICE_TIERS),
             "openai_daily_token_budget_enabled": bool(
                 config.openai_daily_token_budget_enabled
             ),
@@ -1355,6 +1371,7 @@ class AddonOptionsDialog(QDialog):
         defaults = {
             "image_output_format": "webp",
             "image_quality": 85,
+            "openai_service_tier": "auto",
             **(config.defaults() or {}),
         }
         preserve = {

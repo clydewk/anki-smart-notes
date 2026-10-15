@@ -183,6 +183,9 @@ def test_build_excludes_runtime_state_and_bundles_rendering_dependencies(
         ".env",
         "src/chat_usage.json",
         "src/debug.log",
+        "chatgpt.json",
+        "chatgpt-host.json",
+        "chatgpt-auth.json",
     ):
         (project / name).write_text("private-state", encoding="utf-8")
     result = run_build(project, "build")
@@ -191,12 +194,16 @@ def test_build_excludes_runtime_state_and_bundles_rendering_dependencies(
         names = archive.namelist()
         assert "vendor/markdown_it/__init__.py" in names
         assert "vendor/mdurl/__init__.py" in names
+        assert "vendor/websockets/asyncio/client.py" in names
+        assert "vendor/jose/jwt.py" in names
+        assert "vendor/rsa/pkcs1.py" in names
         assert not any(
             "private-state" in archive.read(name).decode("utf-8", errors="ignore")
             for name in names
         )
         assert not any(
-            name.endswith((".log", ".pyc", ".ankiaddon")) or "__pycache__" in name
+            name.endswith((".log", ".pyc", ".so", ".pyd", ".ankiaddon"))
+            or "__pycache__" in name
             for name in names
         )
         packaged_defaults = json.loads(archive.read("config.json"))
@@ -210,11 +217,34 @@ def test_build_excludes_runtime_state_and_bundles_rendering_dependencies(
             "-I",
             "-S",
             "-c",
-            "import sys; sys.path.insert(0, sys.argv[1]); import httpx; from markdown_it import MarkdownIt; assert '<strong>safe</strong>' in MarkdownIt('commonmark', {'html': False}).render('**safe**')",
+            """
+import sys
+sys.path.insert(0, sys.argv[1])
+import httpx
+import rsa
+from jose import jwt
+from jose.exceptions import JWTError
+from websockets.asyncio.client import connect
+from websockets.frames import apply_mask
+from markdown_it import MarkdownIt
+assert apply_mask(b'hello', b'1234') == b'YW_X^'
+assert '<strong>safe</strong>' in MarkdownIt('commonmark', {'html': False}).render('**safe**')
+public, private = rsa.newkeys(2048)
+token = jwt.encode({'sub': 'test', 'iss': 'issuer', 'aud': 'client', 'exp': 4102444800}, private.save_pkcs1(), algorithm='RS256')
+assert jwt.decode(token, public.save_pkcs1(), algorithms=['RS256'], issuer='issuer', audience='client')['sub'] == 'test'
+header, body, signature = token.split('.')
+altered = f"{header}.{body}.{'A' if signature[0] != 'A' else 'B'}{signature[1:]}"
+try:
+    jwt.decode(altered, public.save_pkcs1(), algorithms=['RS256'], issuer='issuer', audience='client')
+except JWTError:
+    pass
+else:
+    raise AssertionError('Invalid signature accepted')
+""",
             str(project / "dist/vendor"),
         ],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     assert isolated.returncode == 0, isolated.stderr
