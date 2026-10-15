@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from functools import wraps
+from inspect import signature
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar, cast
 
 from aqt.qt import QWidget
@@ -89,5 +90,14 @@ def with_widget_settings(
         finally:
             ui_job_owner.reset(owner_token)
             config_context.reset(token)
+
+    if len(signature(function).parameters) == 1:
+        # PyQt uses the callable's arity to discard unused signal arguments.
+        # A variadic wrapper would forward clicked(bool) to a no-argument action.
+        @wraps(function)
+        def wrapped_no_args(self: W) -> R:
+            return cast("Callable[[W], R]", wrapped)(self)
+
+        return cast("Callable[Concatenate[W, P], R]", wrapped_no_args)
 
     return wrapped

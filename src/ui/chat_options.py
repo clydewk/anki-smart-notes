@@ -226,7 +226,7 @@ class ChatOptions(QWidget):
         self.convert_box.setText("Render Markdown formatting in Anki fields")
         text_layout.addRow(self.convert_box)
         convert_explainer = QLabel(
-            "Render lists, emphasis and code blocks safely. When off, responses are saved as plain text."
+            "Render lists, emphasis and code blocks safely. Basic HTML formatting is preserved with either setting."
         )
         convert_explainer.setWordWrap(True)
         convert_explainer.setFont(font_small)

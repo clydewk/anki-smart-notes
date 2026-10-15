@@ -681,6 +681,11 @@ class NoteProcessor:
             )
             total_notes = len(snapshots)
             run_on_main(lambda: progress.set_maximum(total_notes))
+            preflight = self.estimate_openai_batch_preflight_for_snapshots(
+                snapshots, overwrite_fields=overwrite_fields
+            )
+            # Finish each earlier note before later notes can use a tight budget.
+            max_active_notes = 1 if preflight is not None else MAX_ACTIVE_NOTE_TASKS
 
             updated: list[NoteId] = []
             partial: list[NoteId] = []
@@ -738,8 +743,7 @@ class NoteProcessor:
 
             def schedule_more() -> None:
                 while (
-                    not cancel_event.is_set()
-                    and len(active_tasks) < MAX_ACTIVE_NOTE_TASKS
+                    not cancel_event.is_set() and len(active_tasks) < max_active_notes
                 ):
                     try:
                         snapshot = next(snapshots_to_schedule)

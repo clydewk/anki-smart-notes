@@ -17,11 +17,38 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+from __future__ import annotations
+
+import re
 from html import escape
+from typing import TYPE_CHECKING
 
 from markdown_it import MarkdownIt
 
+if TYPE_CHECKING:
+    from markdown_it.rules_inline.state_inline import StateInline
+
+SAFE_FORMATTING_HTML_TAG = re.compile(
+    r"(</?(?:b|strong|i|em|u|s|sub|sup|br)[ \t]*/?>)", re.IGNORECASE
+)
+
+
+def parse_formatting_html(state: StateInline, silent: bool) -> bool:
+    """Recognize only basic formatting tags without attributes."""
+    match = SAFE_FORMATTING_HTML_TAG.match(state.src, state.pos)
+    if match is None or match.end() > state.posMax:
+        return False
+    if not silent:
+        token = state.push("html_inline", "", 0)
+        token.content = match.group()
+    state.pos = match.end()
+    return True
+
+
 markdown_parser = MarkdownIt("commonmark", {"html": False, "breaks": True})
+markdown_parser.inline.ruler.before(
+    "html_inline", "formatting_html", parse_formatting_html
+)
 
 
 def convert_markdown_to_html(markdown: str) -> str:
@@ -29,4 +56,8 @@ def convert_markdown_to_html(markdown: str) -> str:
 
 
 def convert_text_to_html(text: str) -> str:
-    return escape(text).replace("\r\n", "\n").replace("\n", "<br>")
+    formatted = "".join(
+        part if SAFE_FORMATTING_HTML_TAG.fullmatch(part) else escape(part)
+        for part in SAFE_FORMATTING_HTML_TAG.split(text)
+    )
+    return formatted.replace("\r\n", "\n").replace("\n", "<br>")

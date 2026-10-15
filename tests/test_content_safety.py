@@ -18,6 +18,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import logging
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,6 +31,43 @@ from src.logger import (
     setup_logger,
 )
 from src.markdown import convert_markdown_to_html, convert_text_to_html
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+@pytest.mark.parametrize("convert", [convert_markdown_to_html, convert_text_to_html])
+def test_generated_sentence_hint_preserves_basic_html_formatting(
+    convert: "Callable[[str], str]",
+) -> None:
+    sentence = "明日<b>食べます</b>。<br>田中さんの<strong>お子さん</strong>です。"
+    rendered = convert(sentence)
+    assert sentence in rendered
+    assert "&lt;b&gt;" not in rendered
+    assert "&lt;/b&gt;" not in rendered
+
+
+@pytest.mark.parametrize("convert", [convert_markdown_to_html, convert_text_to_html])
+def test_generated_html_formatting_does_not_allow_attributes_or_active_tags(
+    convert: "Callable[[str], str]",
+) -> None:
+    rendered = convert('<b onclick="alert(1)">unsafe</b><script>alert(2)</script>')
+    assert "<b onclick" not in rendered
+    assert "<script>" not in rendered
+    assert "&lt;b onclick=" in rendered
+    assert "&lt;script&gt;" in rendered
+
+
+def test_markdown_keeps_html_literal_in_code_and_escaped_text() -> None:
+    rendered = convert_markdown_to_html(
+        "`<b>inline code</b>`\n\n```html\n<b>block code</b>\n```\n\n"
+        r"\<b>escaped\</b> &lt;b&gt;entity&lt;/b&gt;"
+    )
+    assert "<code>&lt;b&gt;inline code&lt;/b&gt;</code>" in rendered
+    assert "&lt;b&gt;block code&lt;/b&gt;" in rendered
+    assert "&lt;b&gt;escaped&lt;/b&gt;" in rendered
+    assert "&lt;b&gt;entity&lt;/b&gt;" in rendered
+    assert "<b>" not in rendered
 
 
 def test_markdown_preserves_code_and_escapes_active_content() -> None:

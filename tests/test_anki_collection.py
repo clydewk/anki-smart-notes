@@ -131,6 +131,81 @@ finally:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_browser_batch_selection_preserves_row_order_in_both_modes(
+    tmp_path: Path,
+) -> None:
+    script = """
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+import aqt
+from PyQt6.QtCore import QItemSelectionModel
+from PyQt6.QtWidgets import QApplication, QTableView
+from anki.collection import Collection
+from aqt.browser.table.model import DataModel
+from aqt.browser.table.state import CardState, NoteState
+from src.hooks import selected_cards_in_browser_order
+from src.note_processor import snapshot_cards
+
+app = QApplication([])
+collection = Collection(str(Path(sys.argv[1]) / "selection.anki2"))
+try:
+    notes = []
+    model = collection.models.by_name("Basic (and reversed card)")
+    for due in (40, 30, 10, 20):
+        note = collection.new_note(model)
+        note["Front"] = str(due)
+        note["Back"] = "reverse"
+        collection.add_note(note, 1)
+        assert len(note.cards()) == 2
+        for card in note.cards():
+            card.queue = 2
+            card.type = 2
+            card.due = due
+            collection.update_card(card)
+        notes.append(note)
+    ordered_notes = [notes[index] for index in (2, 3, 1, 0)]
+    aqt.mw = SimpleNamespace(pm=SimpleNamespace(show_browser_table_tooltips=lambda: False))
+    for state_type in (CardState, NoteState):
+        view = QTableView()
+        table_model = DataModel(view, collection, state_type(collection), lambda *args: None, lambda *args: None)
+        if state_type is CardState:
+            row_items = [note.cards()[0].id for note in ordered_notes]
+            row_items.append(ordered_notes[1].cards()[1].id)
+            selected_rows = [4, 3, 1, 2]
+        else:
+            row_items = [note.id for note in ordered_notes]
+            selected_rows = [3, 1, 2]
+        table_model._items = row_items
+        view.setModel(table_model)
+        selection = view.selectionModel()
+        assert selection is not None
+        flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        for row in selected_rows:
+            selection.select(table_model.index(row, 0), flags)
+        browser = SimpleNamespace(form=SimpleNamespace(tableView=view))
+        cards = selected_cards_in_browser_order(browser)
+        snapshots = snapshot_cards(collection, cards)
+        assert [snapshot.note_id for snapshot in snapshots] == [notes[index].id for index in (3, 1, 0)]
+        assert [snapshot.fields["Front"] for snapshot in snapshots] == ["20", "30", "40"]
+        if state_type is NoteState:
+            assert len(cards) == 6
+        selection.clearSelection()
+        assert selected_cards_in_browser_order(browser) == []
+        view.setModel(None)
+finally:
+    collection.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_real_profiles_with_matching_ids_reject_late_jobs_and_media(
     tmp_path: Path,
 ) -> None:

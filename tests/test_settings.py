@@ -135,3 +135,24 @@ def test_widget_action_uses_ancestor_draft_and_restores_context(fail: bool) -> N
     draft["openai_api_key"] = "later-edit"
     assert captured["openai_api_key"] == "unsaved-provider-key"
     assert captured["custom_providers"][0]["api_key"] == "unsaved-local-key"
+
+
+@pytest.mark.parametrize("checked", [False, True])
+def test_widget_action_preserves_positional_and_keyword_arguments(
+    checked: bool,
+) -> None:
+    draft = {"chat_temperature": 0}
+    ancestor = SimpleNamespace(draft_settings=lambda: deepcopy(draft))
+    child = cast("QWidget", SimpleNamespace(parentWidget=lambda: ancestor))
+
+    @with_widget_settings
+    def launch(widget: "QWidget", checked: bool, *, label: str) -> tuple[bool, str]:
+        assert config_context.get() == draft
+        assert ui_job_owner.get() is widget
+        return checked, label
+
+    previous_settings = config_context.get()
+    previous_owner = ui_job_owner.get()
+    assert launch(child, checked, label="preview") == (checked, "preview")
+    assert config_context.get() is previous_settings
+    assert ui_job_owner.get() is previous_owner

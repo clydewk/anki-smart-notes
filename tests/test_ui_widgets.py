@@ -382,7 +382,8 @@ parent.chat_options.state.update({"chat_model": "gpt-5.6-terra"})
 assert child.get_current_prompt_signature() != initial_signature
 before_scopes = set(chat_usage_tracker._scopes)
 child.load_sample()
-child.on_test()
+assert child.test_button.isEnabled()
+child.test_button.click()
 assert child.state.s["is_loading_prompt"]
 assert set(chat_usage_tracker._scopes) != before_scopes
 parent.state.update({"openai_api_key": "later-key"})

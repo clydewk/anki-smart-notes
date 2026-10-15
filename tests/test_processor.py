@@ -24,7 +24,7 @@ from graphlib import CycleError
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from anki.errors import NotFoundError
@@ -1135,6 +1135,123 @@ async def test_batch_cancellation_stops_scheduling_new_notes(
     assert not processor.req_in_progress
     assert FakeProgressDialog.instance is not None
     assert FakeProgressDialog.instance.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("budget_enabled", "budget_limit", "expected_completed"),
+    [(True, 10_000, 2), (True, 5_000, 1), (True, 50_000, 3), (False, 5_000, 3)],
+)
+async def test_budget_limited_batch_prioritizes_earlier_notes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    budget_enabled: bool,
+    budget_limit: int,
+    expected_completed: int,
+) -> None:
+    note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
+    processor = setup_data(
+        monkeypatch, note, {"Back": "{{Front}}"}, {}, allow_empty_fields=False
+    )
+    processor.config.debug = False
+    processor.config.openai_daily_token_budget_enabled = budget_enabled
+    processor.config.openai_daily_token_budget = budget_limit
+    tracker = setup_tracker(monkeypatch, tmp_path)
+    tracker.finalize_request(
+        provider="openai",
+        model="gpt-4o-mini",
+        reasoning_effort=None,
+        use_tools=False,
+        prompt_chars=6,
+        raw_usage={"input_tokens": 10, "output_tokens": 4_990},
+        record_openai_daily_usage=False,
+    )
+    note_ids = [cast("NoteId", note_id) for note_id in (30, 10, 20)]
+    snapshots = []
+    for note_id in note_ids:
+        selected_note = MockNote(NOTE_TYPE_NAME, {"Front": "source", "Back": ""})
+        selected_note.id = note_id
+        snapshots.append(make_snapshot(selected_note))
+
+    completed: list[NoteId] = []
+    active = 0
+    peak_active = 0
+
+    async def resolve(node: Any, *, note_id: "NoteId", **kwargs: Any) -> ResolvedField:
+        nonlocal active, peak_active
+        del node, kwargs
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            await asyncio.sleep(0)
+            if note_id == note_ids[0]:
+                # Later notes become ready first when the batch runs concurrently.
+                await asyncio.sleep(0)
+            permit = await tracker.acquire_openai_turn_permit(
+                provider="openai",
+                model="gpt-4o-mini",
+                reasoning_effort=None,
+                use_tools=False,
+                prompt_chars=6,
+                prompt_bytes=6,
+                transport_key="text:openai:gpt-4o-mini",
+                transport_window=4,
+                budget_enabled=budget_enabled,
+                budget_limit=budget_limit,
+            )
+            await tracker.finalize_openai_turn(
+                provider="openai",
+                raw_usage={"input_tokens": 10, "output_tokens": 4_990},
+                permit=permit,
+            )
+            completed.append(note_id)
+            return ResolvedField("generated")
+        finally:
+            active -= 1
+
+    background = MagicMock()
+    monkeypatch.setattr(note_processor, "mw", SimpleNamespace(col=object()))
+    monkeypatch.setattr(note_processor, "ProgressDialog", MagicMock())
+    monkeypatch.setattr(
+        note_processor, "query_collection", AsyncMock(return_value=snapshots)
+    )
+    monkeypatch.setattr(
+        note_processor,
+        "mutate_collection",
+        AsyncMock(side_effect=lambda operation: operation(None)),
+    )
+    monkeypatch.setattr(
+        note_processor,
+        "commit_processed_notes",
+        lambda collection, results: SimpleNamespace(
+            committed=[result.note_id for result in results], conflicted=[]
+        ),
+    )
+    monkeypatch.setattr(note_processor, "run_on_main", lambda operation: operation())
+    monkeypatch.setattr(note_processor, "bump_usage_counter", lambda: None)
+    monkeypatch.setattr(
+        note_processor, "run_async_in_background_with_sentry", background
+    )
+    monkeypatch.setattr(processor.field_processor, "resolve", resolve)
+
+    processor.process_cards_with_progress([cast("CardId", 1)], on_success=None)
+    try:
+        stats = await background.call_args.args[0]()
+    finally:
+        background.call_args.kwargs["on_finished"]()
+
+    assert len(completed) == expected_completed
+    assert set(stats.updated) == set(completed)
+    if expected_completed < len(note_ids):
+        assert completed == note_ids[:expected_completed]
+        assert stats.updated == completed
+        assert peak_active == 1
+        assert set(stats.blocked) == set(note_ids[expected_completed:])
+    else:
+        assert peak_active > 1
+        assert not stats.blocked
+    assert not stats.failed
+    assert not processor.req_in_progress
 
 
 def test_process_card_failure_releases_request(

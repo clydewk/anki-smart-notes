@@ -23,7 +23,7 @@ Setup the hooks for the Anki plugin
 
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from anki.cards import Card, CardId
 from aqt import QAction, QDialog, QMenu, browser, editor, gui_hooks, mw, sound
@@ -50,6 +50,10 @@ from .ui.mcp_server_dialog import McpServerDialog
 from .ui.prompt_dialog import PromptDialog
 from .ui.sparkle import Sparkle
 from .ui.ui_utils import editor_is_current, show_message_box
+
+if TYPE_CHECKING:
+    from aqt.browser.browser import Browser
+    from aqt.browser.table.model import DataModel
 
 SMART_NOTES_PLAY_AUDIO_PREFIX = "smartnotes-play-audio:"
 
@@ -373,7 +377,7 @@ def confirm_openai_batch_preflight(
             f"Remaining today: {format_token_count(preflight.remaining_tokens)}",
             f"Fast-run budget: {format_token_count(preflight.fast_budget_tokens)}",
             f"Recommended fast batch size: {recommendation}",
-            "Near the limit, Smart Notes drains in-flight OpenAI requests before starting more, which slows the batch down.",
+            "Near the limit, notes run one at a time in their current order, so earlier notes get priority for the remaining tokens.",
         ]
     )
     return show_message_box(
@@ -384,13 +388,28 @@ def confirm_openai_batch_preflight(
     )
 
 
+def selected_cards_in_browser_order(browser_window: "Browser") -> list[CardId]:
+    view = browser_window.form.tableView
+    selection = view.selectionModel()
+    if selection is None:
+        return []
+    model = cast("DataModel", view.model())
+    # Resolve each row separately: Notes mode converts note IDs to card IDs via
+    # a database query that does not preserve the browser's sort order.
+    return [
+        card_id
+        for index in sorted(selection.selectedRows(), key=lambda index: index.row())
+        for card_id in model.get_card_ids([index])
+    ]
+
+
 @with_processor  # type: ignore
 def on_browser_context(processor: NoteProcessor, browser: browser.Browser, menu: QMenu):  # type: ignore
     item = QAction("✨ Generate Smart Fields", menu)
     menu.addSeparator()
     menu.addAction(item)
 
-    cards = browser.selected_cards()
+    cards = selected_cards_in_browser_order(browser)
 
     def wrapped():
         if not confirm_openai_batch_preflight(

@@ -99,7 +99,8 @@ def run(operation, **callbacks):
     return handle
 speech.run_async_in_background_with_sentry = run
 speech.play_audio = Mock()
-options.test_and_play()
+options.test_button.click()
+assert len(requests) == 1
 request = requests[-1]
 assert request["show_error"] is False
 assert not options.test_button.isEnabled()

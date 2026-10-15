@@ -172,7 +172,8 @@ palette_module.run_async_in_background_with_sentry = launch_palette
 palette_module.play_audio = lambda data: None
 palette = palette_module.CustomTTSPrompt(note, GLOBAL_DECK_ID, "Back", lambda result: None)
 assert palette.tts_options.state.s["tts_voice_pool"] == speech_extras["tts_voice_pool"]
-palette._on_generate()
+assert palette._generate_button.isEnabled()
+palette._generate_button.click()
 operation, callbacks = palette_jobs[-1]
 result = asyncio.run(operation())
 callbacks["on_success"](result)
@@ -281,7 +282,7 @@ mcp = mcp_module.McpServerDialog()
 mcp.name_edit.setText("Local tools")
 mcp.command_edit.setText("npx")
 mcp.cwd_edit.setText("~/project")
-mcp._on_test_connection()
+mcp.test_button.click()
 assert "absolute" in mcp.status_label.text()
 assert len(requests) == 2
 mcp.cwd_edit.setText("")
