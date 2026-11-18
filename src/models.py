@@ -47,6 +47,7 @@ OPENAI_REASONING_EFFORTS_WITH_MAX: tuple[OpenAIReasoningEffort, ...] = (
     *OPENAI_REASONING_EFFORTS_WITH_NONE_AND_XHIGH,
     "max",
 )
+OPENAI_REASONING_EFFORTS_WITHOUT_NONE = OPENAI_REASONING_EFFORTS_WITH_MAX[1:]
 
 
 # Chat Models
@@ -78,16 +79,36 @@ class OpenAIChatModelSpec:
 
 OPENAI_CHAT_MODEL_CATALOG: tuple[OpenAIChatModelSpec, ...] = (
     OpenAIChatModelSpec(
+        "gpt-6.2-astra",
+        "GPT-6.2 Astra",
+        OPENAI_REASONING_EFFORTS_WITHOUT_NONE,
+        temperature_without_reasoning=False,
+        chat_tools=False,
+    ),
+    OpenAIChatModelSpec(
+        "gpt-6.2-sol",
+        "GPT-6.2 Sol",
+        OPENAI_REASONING_EFFORTS_WITHOUT_NONE,
+        temperature_without_reasoning=False,
+        chat_tools=False,
+    ),
+    OpenAIChatModelSpec(
+        "gpt-6.1-terra",
+        "GPT-6.1 Terra",
+        OPENAI_REASONING_EFFORTS_WITH_MAX,
+        chat_tools=False,
+    ),
+    OpenAIChatModelSpec(
         "gpt-6-astra",
         "GPT-6 Astra",
-        ("low", "medium", "high", "xhigh", "max"),
+        OPENAI_REASONING_EFFORTS_WITHOUT_NONE,
         temperature_without_reasoning=False,
         chat_tools=False,
     ),
     OpenAIChatModelSpec(
         "gpt-6.1-sol",
         "GPT-6.1 Sol",
-        ("low", "medium", "high", "xhigh", "max"),
+        OPENAI_REASONING_EFFORTS_WITHOUT_NONE,
         temperature_without_reasoning=False,
         chat_tools=False,
     ),
@@ -121,24 +142,27 @@ OPENAI_CHAT_MODEL_CATALOG: tuple[OpenAIChatModelSpec, ...] = (
 
 # Order that the models are displayed in the curated OpenAI UI
 openai_chat_models: list[ChatModels] = [
-    spec.model for spec in OPENAI_CHAT_MODEL_CATALOG
+    spec.model for spec in OPENAI_CHAT_MODEL_CATALOG if spec.model != "gpt-5.5"
 ]
 OPENAI_CHAT_MODEL_LABELS: dict[str, str] = {
     spec.model: spec.label for spec in OPENAI_CHAT_MODEL_CATALOG
 }
 
 anthropic_chat_models: list[ChatModels] = [
-    "claude-opus-4-8",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+    "claude-opus-5-5",
 ]
 
-deepseek_chat_models: list[ChatModels] = ["deepseek-v4-flash", "deepseek-v4-pro"]
+deepseek_chat_models: list[ChatModels] = ["deepseek-flash", "deepseek-v4-pro"]
 
-google_chat_models: list[ChatModels] = [
-    "gemini-3-flash-preview",
-    "gemini-3.1-pro-preview",
-]
+# The first thinking level is the provider default for a new selection.
+GOOGLE_THINKING_LEVELS: dict[str, tuple[str, ...]] = {
+    "gemini-4-hydrogen": ("high", "low", "medium", "xhigh"),
+    "gemini-4-carbon": ("medium", "low", "high"),
+    "gemini-3.5-flash-lite": ("minimal", "low", "medium", "high"),
+}
+google_chat_models: list[ChatModels] = list(GOOGLE_THINKING_LEVELS)
 
 provider_model_map: dict[ChatProviders, list[ChatModels]] = {
     "openai": openai_chat_models,
@@ -161,11 +185,12 @@ RETIRED_PROVIDER_MODELS: set[tuple[str, str]] = {
     ("deepseek", "deepseek-reasoner"),
     ("google", "gemini-3-pro-preview"),
     ("google", "gemini-3-pro-image-preview"),
+    ("google", "gemini-nano-banana-pro"),
 }
 
 
-OPENAI_MODEL_SHUTDOWN_DATES: dict[str, date] = {
-    model: shutdown
+PROVIDER_SHUTDOWN_DATES: dict[tuple[str, str], date] = {
+    ("openai", model): shutdown
     for shutdown, model_ids in (
         (date(2025, 10, 27), ("o1-mini",)),
         (date(2026, 2, 17), ("chatgpt-4o-latest",)),
@@ -217,7 +242,12 @@ OPENAI_MODEL_SHUTDOWN_DATES: dict[str, date] = {
         ),
         (
             date(2026, 12, 1),
-            ("gpt-image-1.5", "gpt-image-1-mini", "chatgpt-image-latest"),
+            (
+                "gpt-image-1.5",
+                "gpt-image-1.5-2025-12-16",
+                "gpt-image-1-mini",
+                "chatgpt-image-latest",
+            ),
         ),
         (
             date(2026, 12, 11),
@@ -235,18 +265,63 @@ OPENAI_MODEL_SHUTDOWN_DATES: dict[str, date] = {
             (
                 "tts-1",
                 "tts-1-hd",
+                "gpt-4o-mini-tts",
                 "gpt-4o-mini-tts-2025-03-20",
                 "gpt-4o-mini-tts-2025-12-15",
             ),
         ),
-        (date(2027, 4, 1), ("gpt-5.1", "gpt-5.4-nano", "gpt-5.3-codex")),
+        (
+            date(2027, 1, 14),
+            (
+                "gpt-4o-2024-08-06",
+                "gpt-4o-2024-11-20",
+                "gpt-4o-mini-2024-07-18",
+                "gpt-4.1-2025-04-14",
+                "gpt-4.1-mini-2025-04-14",
+            ),
+        ),
+        (date(2027, 2, 10), ("gpt-image-2", "gpt-image-2-2026-04-21")),
+        (
+            date(2027, 4, 1),
+            (
+                "gpt-5.1",
+                "gpt-5.1-2025-11-13",
+                "gpt-5.4-nano",
+                "gpt-5.4-nano-2026-03-17",
+                "gpt-5.3-codex",
+            ),
+        ),
     )
     for model in model_ids
+} | {
+    ("anthropic", "claude-sonnet-4-5"): date(2026, 11, 30),
+    ("anthropic", "claude-sonnet-4-5-20250929"): date(2026, 11, 30),
+    ("google", "gemini-3.1-flash-tts-preview"): date(2026, 12, 18),
+    ("google", "gemini-2.5-flash-preview-tts"): date(2026, 12, 18),
+    ("google", "gemini-2.5-pro-preview-tts"): date(2026, 12, 18),
 }
 
 
+def supports_sampling_temperature(provider: str, model: str) -> bool:
+    if provider == "google":
+        return not model.startswith("gemini-4-")
+    if provider == "anthropic":
+        return not model.startswith(
+            (
+                "claude-fable-",
+                "claude-mythos-",
+                "claude-sonnet-5",
+                "claude-opus-5",
+                "claude-haiku-5",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+            )
+        )
+    return True
+
+
 def provider_model_unavailable(provider: str, model: str) -> bool:
-    shutdown = OPENAI_MODEL_SHUTDOWN_DATES.get(model) if provider == "openai" else None
+    shutdown = PROVIDER_SHUTDOWN_DATES.get((provider, model))
     return (provider, model) in RETIRED_PROVIDER_MODELS or (
         shutdown is not None and date.today() >= shutdown
     )
@@ -255,14 +330,16 @@ def provider_model_unavailable(provider: str, model: str) -> bool:
 def provider_model_warning(provider: str, model: str) -> str | None:
     if provider_model_unavailable(provider, model):
         return f"{provider} model {model} is unavailable. Choose a supported model in settings."
-    shutdown = OPENAI_MODEL_SHUTDOWN_DATES.get(model) if provider == "openai" else None
+    shutdown = PROVIDER_SHUTDOWN_DATES.get((provider, model))
     if shutdown is not None:
         return f"{model} retires on {shutdown.isoformat()}. Choose a supported model before then."
-    if provider == "openai" and model == "gpt-4o-mini-tts":
-        return (
-            "This alias currently uses a speech snapshot that retires on 2027-01-06. "
-            "Consider gpt-realtime-2.1-mini; OpenAI has not announced an alias shutdown date."
-        )
+    if provider == "fish" and model == "s1":
+        return "Fish Audio retires S1 on 2026-12-31 and reroutes requests after retirement. Choose a current Fish model to control which voice model runs."
+    if provider == "deepseek" and model in {
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+    }:
+        return f"DeepSeek temporarily routes {model} to V4.1 Flash. Select deepseek-flash to use the current ID."
     return None
 
 
@@ -312,18 +389,20 @@ def validate_openai_service_tier(model: str, tier: str, endpoint: str | None) ->
         regions = {"api.openai.com", "us.api.openai.com"}
         if model == "gpt-6.1-sol":
             regions.add("eu.api.openai.com")
-        if model not in {"gpt-6-astra", "gpt-6.1-sol"} or hostname not in regions:
+        if (
+            model not in {"gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol"}
+            or hostname not in regions
+        ):
             raise ValueError(
-                "Ultrafast requires GPT-6 Astra (global/US) or GPT-6.1 Sol "
-                "(global/US/EU) on the OpenAI Responses API. Change the model, host, or service tier."
+                f"Ultrafast is unavailable for {model} on {hostname}. Change the model, host, or service tier."
             )
     elif model not in OPENAI_FAST_MODELS:
         raise ValueError(
             f"Fast mode is not supported for {model}. Change the model or service tier."
         )
-    elif model == "gpt-6-astra" and hostname == "eu.api.openai.com":
+    elif model in {"gpt-6-astra", "gpt-6-sol"} and hostname == "eu.api.openai.com":
         raise ValueError(
-            "GPT-6 Astra Fast mode is unavailable with EU processing. Change the model or service tier."
+            f"Fast mode for {model} is unavailable with EU processing. Change the model or service tier."
         )
 
 
@@ -487,7 +566,9 @@ OpenAITTSModels = Literal[
     "gpt-4o-mini-tts-2025-03-20",
     "gpt-4o-mini-tts-2025-12-15",
     "gpt-realtime-2.1-mini",
+    "gpt-realtime-2.1",
 ]
+OPENAI_REALTIME_TTS_MODELS = ("gpt-realtime-2.1-mini", "gpt-realtime-2.1")
 OPENAI_LEGACY_TTS_VOICES = (
     "alloy",
     "ash",
@@ -515,16 +596,49 @@ OPENAI_REALTIME_VOICES = (
 
 
 def openai_tts_voices(model: str) -> tuple[str, ...]:
-    if model == "gpt-realtime-2.1-mini":
+    if model in OPENAI_REALTIME_TTS_MODELS:
         return OPENAI_REALTIME_VOICES
     if model in {"tts-1", "tts-1-hd"}:
         return OPENAI_LEGACY_TTS_VOICES
     return OPENAI_SPEECH_VOICES
 
 
-ElevenTTSModels = Literal["eleven_multilingual_v2"]
-FishTTSModels = Literal["s2.1-pro-free", "s2.1-pro", "s2-pro", "s1"]
+# Former ElevenLabs default voices previously included in the add-on catalog.
+ELEVENLABS_EXPIRING_VOICES = {
+    "EXAVITQu4vr4xnSDxMaL",  # Sarah
+    "IKne3meq5aSn9XLyUdCD",  # Charlie
+    "JBFqnCBsd6RMkjVDRZzb",  # George
+    "XrExE9yKIg1WjnnlVkGX",  # Matilda
+    "pFZP5JQG7iQjIQuC4Bku",  # Lily
+}
+
+
+def tts_voice_unavailable(provider: str, model: str, voice: str) -> bool:
+    return provider_model_unavailable(provider, model) or (
+        provider == "elevenLabs"
+        and voice in ELEVENLABS_EXPIRING_VOICES
+        and date.today() > date(2026, 12, 31)
+    )
+
+
+def tts_voice_warning(provider: str, model: str, voice: str) -> str | None:
+    if provider == "elevenLabs" and voice in ELEVENLABS_EXPIRING_VOICES:
+        if date.today() > date(2026, 12, 31):
+            return f"ElevenLabs voice {voice} is unavailable. Choose a current voice in settings."
+        return "This ElevenLabs voice expires on 2026-12-31. Choose a current voice in settings."
+    return provider_model_warning(provider, model)
+
+
+ElevenTTSModels = Literal[
+    "eleven_v4",
+    "eleven_v4_turbo",
+    "eleven_v3",
+    "eleven_multilingual_v2",
+    "eleven_flash_v2_5",
+]
+FishTTSModels = Literal["drama-3", "s2.1-pro-free", "s2.1-pro", "s2-pro", "s1"]
 GoogleModels = Literal[
+    "chirp",
     "standard",
     "wavenet",
     "neural",
@@ -576,9 +690,16 @@ SmartFieldType = Literal["chat", "tts", "image"]
 
 # Image Models
 
-ReplicateImageModels = Literal["flux-dev", "flux-schnell"]
-GoogleImageModels = Literal["gemini-3-pro-image", "gemini-3-pro-image-preview"]
+ReplicateImageModels = Literal["flux-2-pro", "flux-dev", "flux-schnell"]
+GoogleImageModels = Literal[
+    "gemini-nano-banana-2.1",
+    "gemini-3.1-flash-lite-image",
+    "gemini-3-pro-image",
+    "gemini-3-pro-image-preview",
+]
 OpenAIImageModels = Literal[
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
     "gpt-image-2",
@@ -597,11 +718,17 @@ ImageGenerationQuality = Literal["auto", "low", "medium", "high", "xhigh", "max"
 
 
 def image_generation_qualities(model: str) -> list[ImageGenerationQuality]:
-    if model.startswith("gpt-image-2.5-"):
+    if model.startswith(("gpt-image-2.5-", "gpt-image-2.6-")):
         return ["auto", "low", "medium", "high", "xhigh", "max"]
     if model.startswith("gpt-image-"):
         return ["auto", "low", "medium", "high"]
     return ["auto"]
+
+
+def openai_image_has_flexible_size(model: str) -> bool:
+    return model == "gpt-image-2" or model.startswith(
+        ("gpt-image-2-", "gpt-image-2.5-", "gpt-image-2.6-")
+    )
 
 
 def openai_image_size(
@@ -609,7 +736,7 @@ def openai_image_size(
     aspect_ratio: ImageAspectRatio | None,
     resolution: ImageResolution | None,
 ) -> str:
-    if model == "gpt-image-2" or model.startswith("gpt-image-2.5-"):
+    if openai_image_has_flexible_size(model):
         return openai_image_2_size(aspect_ratio, resolution)
 
     if "gpt-image" in model:

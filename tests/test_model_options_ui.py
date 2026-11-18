@@ -129,6 +129,24 @@ chat.chat_provider.setCurrentText("Anthropic")
 assert chat.discovery.isHidden()
 assert not chat.reasoning_effort.isEnabled()
 assert "not sent to Anthropic" in chat.reasoning_help.text()
+assert chat.temperature.isHidden()
+assert chat.state.s["chat_model"] == "claude-sonnet-5-5"
+chat.chat_provider.setCurrentText("Google")
+assert chat.state.s["chat_model"] == "gemini-4-hydrogen"
+assert chat.reasoning_effort.isEnabled()
+assert chat.temperature.isHidden()
+chat.reasoning_effort.setCurrentText("Extra High")
+assert chat.state.s["chat_reasoning_effort"] == "xhigh"
+chat.chat_model.setCurrentText("Gemini 3.5 Flash-Lite")
+assert chat.state.s["chat_reasoning_effort"] == "minimal"
+assert chat.temperature.isEnabled() and not chat.temperature.isHidden()
+assert "xhigh" not in chat.state.s["chat_reasoning_efforts"]
+saved = chat_module.ChatOptions({"chat_provider": "deepseek", "chat_model": "deepseek-v4-flash"})
+assert saved.state.s["chat_model"] == "deepseek-v4-flash"
+assert "temporarily routes" in saved.model_warning.text()
+saved.chat_provider.setCurrentText("Google")
+saved.chat_provider.setCurrentText("DeepSeek")
+assert saved.state.s["chat_model"] == "deepseek-v4-flash"
 host.close()
 
 images = ImageOptions({

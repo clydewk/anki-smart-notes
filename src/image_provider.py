@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from .chat_provider import build_v1_endpoint
 from .config import config
@@ -49,9 +49,9 @@ if TYPE_CHECKING:
     )
 
 REPLICATE_API_BASE = "https://api.replicate.com/v1"
-LegacyGoogleImageModel = Literal["gemini-nano-banana-pro"]
 
 MODEL_MAP = {
+    "flux-2-pro": "black-forest-labs/flux-2-pro",
     "flux-dev": "black-forest-labs/flux-dev",
     "flux-schnell": "black-forest-labs/flux-schnell",
 }
@@ -169,7 +169,7 @@ class ImageProvider:
                 repl_format = "png"
 
         repl_quality = 80
-        if quality is not None and quality > 0:
+        if quality is not None and quality >= 0:
             repl_quality = quality
 
         return await self._get_replicate_image_with_retry(
@@ -214,27 +214,35 @@ class ImageProvider:
                 sock_read_timeout_sec=60.0,
             ),
             max_retries=MAX_RETRIES,
+            retry_ambiguous=False,
         )
-        if not isinstance(prediction, dict):
-            raise Exception("Replicate returned an invalid prediction payload.")
-
-        if prediction.get("status") == "succeeded":
-            output = prediction.get("output", [])
-            if not isinstance(output, list) or not output:
-                raise Exception("Replicate response did not include an output image.")
-            return await self._download_image(str(output[0]), provider, model)
-
-        get_url = prediction.get("urls", {}).get("get")
-        if not isinstance(get_url, str):
-            raise Exception("Replicate response did not include a polling URL.")
-
-        start_time = asyncio.get_event_loop().time()
-        while True:
-            if asyncio.get_event_loop().time() - start_time > 900:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 900
+        while isinstance(prediction, dict):
+            status = prediction.get("status")
+            if status == "succeeded":
+                output = prediction.get("output")
+                if isinstance(output, list) and output:
+                    output = output[0]
+                if not isinstance(output, str) or not output:
+                    raise ValueError(
+                        "Replicate response did not include an output image."
+                    )
+                return await self._download_image(output, provider, model)
+            if status == "failed":
+                raise ValueError(
+                    f"Replicate prediction failed: {prediction.get('error')}"
+                )
+            if status == "canceled":
+                raise ValueError("Replicate prediction canceled.")
+            get_url = prediction.get("urls", {}).get("get")
+            if not isinstance(get_url, str):
+                raise ValueError("Replicate response did not include a polling URL.")
+            if loop.time() >= deadline:
                 raise TimeoutError("Replicate prediction timed out.")
 
             await asyncio.sleep(1)
-            polled = await provider_runtime.request_json(
+            prediction = await provider_runtime.request_json(
                 key=f"image-poll:{provider}:{model}",
                 initial_window=1,
                 method="GET",
@@ -248,19 +256,7 @@ class ImageProvider:
                 ),
                 max_retries=2,
             )
-            if not isinstance(polled, dict):
-                raise Exception("Replicate polling returned an invalid payload.")
-
-            status = polled.get("status")
-            if status == "succeeded":
-                output = polled.get("output", [])
-                if not isinstance(output, list) or not output:
-                    raise Exception("Replicate polling response had no output.")
-                return await self._download_image(str(output[0]), provider, model)
-            if status == "failed":
-                raise Exception(f"Replicate prediction failed: {polled.get('error')}")
-            if status == "canceled":
-                raise Exception("Replicate prediction canceled.")
+        raise ValueError("Replicate returned an invalid prediction payload.")
 
     async def _download_image(self, url: str, provider: str, model: str) -> bytes:
         return await provider_runtime.request_bytes(
@@ -280,16 +276,13 @@ class ImageProvider:
     async def _get_google_image(
         self,
         prompt: str,
-        model: ImageModels | LegacyGoogleImageModel,
+        model: ImageModels,
         aspect_ratio: ImageAspectRatio | None = None,
         resolution: ImageResolution | None = None,
     ) -> bytes:
         api_key = config.google_api_key
         if not api_key:
             raise Exception("Google API key not found.")
-
-        if model == "gemini-nano-banana-pro":
-            model = "gemini-3-pro-image-preview"
 
         data_bytes = await self._execute_request(
             url=f"{GOOGLE_IMAGE_BASE_URL}/{model}:generateContent",
@@ -299,10 +292,13 @@ class ImageProvider:
                 "generationConfig": {
                     "imageConfig": self._google_image_config(
                         aspect_ratio=aspect_ratio,
-                        resolution=resolution,
+                        resolution=None
+                        if model == "gemini-3.1-flash-lite-image"
+                        else resolution,
                     )
                 },
             },
+            retry_ambiguous=False,
             provider="google_image",
             model=model,
         )
@@ -346,6 +342,8 @@ class ImageProvider:
                 parts := content.get("parts")
             ):
                 for part in parts:
+                    if part.get("thought"):
+                        continue
                     if (inline_data := part.get("inlineData")) and (
                         image_bytes := inline_data.get("data")
                     ):

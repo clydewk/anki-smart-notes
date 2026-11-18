@@ -373,7 +373,6 @@ class AddonOptionsDialog(QDialog):
         speed_help = QLabel(
             "Project default follows your OpenAI project setting. Standard overrides it. "
             "Fast and Ultrafast cost more; availability depends on model and processing region. "
-            "Ultrafast supports GPT-6 Astra (global/US) and GPT-6.1 Sol (global/US/EU). "
             "This setting applies only to OpenAI API text requests."
         )
         speed_help.setWordWrap(True)

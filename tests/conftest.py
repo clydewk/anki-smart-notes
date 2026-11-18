@@ -19,6 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
 import sys
+from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
@@ -79,3 +80,13 @@ def mock_logger(monkeypatch: pytest.MonkeyPatch):
     logger = MagicMock()
     monkeypatch.setattr("src.migrations.logger", logger, raising=False)
     return logger
+
+
+@pytest.fixture
+def before_speech_retirements(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return cls(2026, 11, 18)
+
+    monkeypatch.setattr("src.models.date", FixedDate)

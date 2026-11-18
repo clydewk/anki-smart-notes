@@ -45,16 +45,24 @@ models.date = FrozenDate
 
 app = QApplication([])
 config_context.set(json.loads(Path("config.json").read_text()))
+speech.load_file = lambda name, **kwargs: Path(name).read_text()
+eleven = speech.get_eleven_voices()
+assert {v["model"] for v in eleven} == {"eleven_v4", "eleven_v4_turbo", "eleven_multilingual_v2"}
+assert not any(v["language"].startswith("Vietnamese") and v["model"] == "eleven_multilingual_v2" for v in eleven)
+assert not any(v["voice"] == "EXAVITQu4vr4xnSDxMaL" for v in eleven)
+assert any(v["voice"] == "OZ0L6eISlOejga3XjDFt" for v in eleven)
+assert any(v["voice"] == "ja-JP-Chirp3-HD-Achernar" and v["model"] == "chirp" for v in speech.get_google_voices())
 gemini = speech.get_gemini_voices()
 assert {voice["model"] for voice in gemini} == {
     "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts",
-    "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts",
 }
-assert len(gemini) == 150
+assert len(gemini) == 60
 assert len([voice for voice in speech.generate_openai_voices() if voice["model"] == "gpt-realtime-2.1-mini"]) == 10
-assert {voice["voice"] for voice in gemini if voice["model"] == "gemini-3.8-flash-tts"} == {voice["voice"] for voice in gemini if voice["model"] == "gemini-2.5-pro-preview-tts"}
+assert {voice["model"] for voice in speech.generate_openai_voices()} == {"gpt-realtime-2.1", "gpt-realtime-2.1-mini"}
+assert {voice["model"] for voice in speech.get_fish_voices()} == {"drama-3", "s2.1-pro", "s2.1-pro-free"}
+assert {voice["voice"] for voice in gemini if voice["model"] == "gemini-3.8-flash-tts"} == {voice["voice"] for voice in gemini if voice["model"] == "gemini-3.8-flash-lite-tts"}
 options = speech.TTSOptions({"tts_voice_pool": [
-    {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "marin", "enabled": True, "language": None},
+    {"provider": "openai", "model": "gpt-realtime-2.1-mini", "voice": "marin", "enabled": True, "language": None},
 ]})
 scroll = QScrollArea()
 scroll.setWidgetResizable(True)
@@ -68,7 +76,6 @@ assert options.minimumSizeHint().width() < 600
 assert options.pool_table.height() < 100
 assert "marin" in options.pool_table.item(0, 1).text().lower()
 assert "Voice ID: marin" in options.pool_table.item(0, 1).toolTip()
-assert "2027-01-06" in options.selected_voice_label.text()
 assert not options.remove_voice_button.isEnabled()
 options.pool_table.selectRow(0)
 assert options.remove_voice_button.isEnabled()
@@ -150,6 +157,23 @@ assert not options.pool_table.isVisible()
 assert not options.remove_voice_button.isEnabled()
 scroll.close()
 
+for provider, model, voice in [
+    ("fish", "s1", "original-reference"),
+    ("openai", "tts-1", "alloy"),
+    ("openai", "gpt-4o-mini-tts", "marin"),
+    ("google", "gemini-2.5-pro-preview-tts", "Kore"),
+    ("elevenLabs", "eleven_v3", "EXAVITQu4vr4xnSDxMaL"),
+]:
+    saved = {"provider": provider, "model": model, "voice": voice, "enabled": True, "language": None}
+    legacy = speech.TTSOptions({"tts_voice_pool": [saved]})
+    assert legacy.state.s["tts_voice_pool"] == [saved]
+    assert "outside catalog" in legacy.selected_voice_label.text()
+    assert legacy.test_button.isEnabled() and not legacy.add_voice_button.isEnabled()
+    if provider == "elevenLabs":
+        assert "2026-12-31" in legacy.selected_voice_label.text()
+    if provider == "openai":
+        assert "2027-01-06" in legacy.selected_voice_label.text()
+
 class RetiredDate(date):
     @classmethod
     def today(cls):
@@ -164,6 +188,12 @@ assert "unavailable" in retired.pool_table.item(0, 1).toolTip()
 assert all(voice["model"] != "tts-1" for voice in retired.get_visible_voice_filters())
 assert not retired.test_button.isEnabled() and not retired.add_voice_button.isEnabled()
 
+old_eleven = {"provider": "elevenLabs", "model": "eleven_v3", "voice": "EXAVITQu4vr4xnSDxMaL", "enabled": True, "language": "English"}
+retired_eleven = speech.TTSOptions({"tts_voice_pool": [old_eleven]})
+assert retired_eleven.state.s["tts_voice_pool"] == [old_eleven]
+assert "unavailable" in retired_eleven.pool_table.item(0, 1).toolTip()
+assert not retired_eleven.test_button.isEnabled()
+
 voice_ids = ["a1b2c3d4aaaaaaaaffff", "d4c3b2a1bbbbbbbbaaaa"]
 fish = speech.TTSOptions({"tts_voice_pool": [
     {"provider": "fish", "model": "s2.1-pro-free", "voice": voice, "enabled": True, "language": "Japanese"}
@@ -175,6 +205,8 @@ for row, voice_id in enumerate(voice_ids):
     assert voice_id[:8] in items[row][1].text()
     assert "Custom voice (S2.1 Pro Free)" in items[row][1].text()
     assert voice_id in items[row][1].toolTip()
+fish.pool_table.selectRow(1)
+assert fish.state.s["catalog_voice"] == voice_ids[1]
 fish.pool_table.selectRow(0)
 items[0][2].setText("ja")
 items[0][0].setCheckState(Qt.CheckState.Unchecked)

@@ -88,6 +88,7 @@ def audio_events(pcm: bytes = b"\x01\x00\x02\x00") -> list[dict[str, Any]]:
 @dataclass
 class SpeechPeer:
     events: list[dict[str, Any] | str]
+    model: TTSModels = "gpt-realtime-2.1-mini"
     stall: bool = False
     requests: list[dict[str, Any]] = field(default_factory=list)
     started: asyncio.Event = field(default_factory=asyncio.Event)
@@ -98,7 +99,7 @@ class SpeechPeer:
     async def handle(self, connection: ServerConnection) -> None:
         self.connections += 1
         assert connection.request is not None
-        assert connection.request.path == "/v1/realtime?model=gpt-realtime-2.1-mini"
+        assert connection.request.path == f"/v1/realtime?model={self.model}"
         assert connection.request.headers["Authorization"] == "Bearer synthetic"
         try:
             await connection.send(json.dumps({"type": "session.created"}))
@@ -138,11 +139,13 @@ async def realtime_peer(
 
 
 async def realtime_speech(
-    text: str = "Hello!", instructions: str | None = None
+    text: str = "Hello!",
+    instructions: str | None = None,
+    model: TTSModels = "gpt-realtime-2.1-mini",
 ) -> bytes:
     return await TTSProvider().async_get_tts_response(
         text,
-        "gpt-realtime-2.1-mini",
+        model,
         "openai",
         "cedar",
         False,
@@ -150,16 +153,18 @@ async def realtime_speech(
     )
 
 
+@pytest.mark.parametrize("model", ["gpt-realtime-2.1-mini", "gpt-realtime-2.1"])
 async def test_realtime_uses_isolated_verbatim_input_and_only_commits_completed_audio(
     monkeypatch: pytest.MonkeyPatch,
+    model: TTSModels,
 ) -> None:
-    peer = SpeechPeer(list(audio_events()))
+    peer = SpeechPeer(list(audio_events()), model=model)
     usage = RequestAccounting()
     token = request_accounting.set(usage)
     try:
         async with realtime_peer(monkeypatch, peer):
             result = await realtime_speech(
-                "Hello! What is 2+2?", "Warm and deliberate."
+                "こんにちは。2足す2はいくつですか？", "Warm and deliberate.", model
             )
     finally:
         request_accounting.reset(token)
@@ -175,7 +180,9 @@ async def test_realtime_uses_isolated_verbatim_input_and_only_commits_completed_
         {
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": "Hello! What is 2+2?"}],
+            "content": [
+                {"type": "input_text", "text": "こんにちは。2足す2はいくつですか？"}
+            ],
         }
     ]
     assert "Warm and deliberate." in response["instructions"]
@@ -341,6 +348,7 @@ async def test_realtime_bounds_audio_and_message_sizes(
     "model", ["tts-1", "gpt-4o-mini-tts", "gpt-4o-mini-tts-2025-12-15"]
 )
 @pytest.mark.parametrize("part", ["text", "instructions"])
+@pytest.mark.usefixtures("before_speech_retirements")
 async def test_speech_limits_before_network_and_supports_snapshot_instructions(
     monkeypatch: pytest.MonkeyPatch, model: TTSModels, part: str
 ) -> None:
@@ -377,21 +385,23 @@ async def test_speech_limits_before_network_and_supports_snapshot_instructions(
     request.assert_awaited_once()
 
 
+@pytest.mark.parametrize("model", ["gpt-realtime-2.1-mini", "gpt-realtime-2.1"])
 async def test_realtime_rejects_incompatible_saved_voice_without_substitution(
     monkeypatch: pytest.MonkeyPatch,
+    model: TTSModels,
 ) -> None:
     monkeypatch.setattr("src.tts_provider.config", SimpleNamespace(custom_providers=[]))
     with pytest.raises(ValueError, match="Choose another voice"):
         await TTSProvider().async_get_tts_response(
-            "Hello", "gpt-realtime-2.1-mini", "openai", "nova", False
+            "Hello", model, "openai", "nova", False
         )
-    assert len(openai_tts_voices("gpt-realtime-2.1-mini")) == 10
+    assert len(openai_tts_voices(model)) == 10
     assert len(openai_tts_voices("gpt-4o-mini-tts")) == 13
     assert (
         tts_audio_extension(
             {
                 "provider": "openai",
-                "model": "gpt-realtime-2.1-mini",
+                "model": model,
                 "voice": "cedar",
                 "enabled": True,
                 "language": None,

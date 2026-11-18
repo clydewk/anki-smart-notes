@@ -22,13 +22,17 @@ Enable only the built-in tools and MCP servers you intend providers to call. MCP
 
 The OpenAI token setting is an **estimated token guard**, not an exact billing ceiling. Actual usage may remain unknown when a dispatched request fails or is cancelled. Check provider billing for charges.
 
-## OpenAI models and processing
+## Text and image models
 
-The Text page includes GPT-6 Astra, GPT-6.1 Sol, GPT-6 Sol, and GPT-6 Luna alongside supported older models. Reasoning, temperature, and tool controls follow each model's capabilities. Existing selections are preserved. Models with announced shutdown dates display warnings; retired selections remain visible for correction and cannot generate.
+The Text page includes GPT-6.2 Astra, GPT-6.2 Sol, and GPT-6.1 Terra alongside supported older models. Reasoning, temperature, and tool controls follow each model's capabilities. Existing selections are preserved. Models with announced shutdown dates display warnings; retired selections remain visible for correction and cannot generate.
 
-Choose processing speed on **Providers → OpenAI text requests**. **Project default** follows the API project's setting, **Standard** explicitly requests standard processing, and **Fast** and **Ultrafast** request premium processing. Ultrafast supports Astra with global/US processing and 6.1 Sol with global/US/EU processing. Unsupported combinations fail before generation rather than switching tiers. These controls apply to API-key text requests; the native ChatGPT connection retains its account-provided models and options. See [OpenAI's speed documentation](https://developers.openai.com/api/docs/guides/ultrafast-mode) for availability and pricing.
+Choose processing speed on **Providers → OpenAI text requests**. **Project default** follows the API project's setting, **Standard** explicitly requests standard processing, and **Fast** and **Ultrafast** request premium processing. Ultrafast supports GPT-6.2 Astra, GPT-6.2 Sol and GPT-6 Astra with global/US processing. GPT-6.1 Sol also supports EU Ultrafast. Unsupported combinations fail before generation rather than switching tiers. These controls apply to API-key text requests; the native ChatGPT connection retains its account-provided models and options. See [OpenAI's speed documentation](https://developers.openai.com/api/docs/guides/ultrafast-mode) for availability and pricing.
 
-GPT Image 2.5 Sunburst and Flare support all six rendering qualities, including `xhigh` and `max`. Image size choices show the requested dimensions and aspect ratio; large sizes are experimental. GPT Image requests allow three minutes for a response. A network failure after possible submission is not automatically replayed, since the original generation may have succeeded.
+Claude offers Sonnet, Haiku and Opus 5.5. DeepSeek offers Flash and V4 Pro. Saved V4 Flash IDs still use DeepSeek’s compatibility route. Google offers Gemini 4 Hydrogen, Gemini 4 Carbon and Gemini 3.5 Flash-Lite. Choose a thinking level in Text settings. Hydrogen supports Extra High. [Google thinking levels](https://aistudio.google.com/docs/thinking)
+
+Google image choices include Nano Banana 2.1, Flash-Lite Image (1K), and Gemini 3 Pro Image. Replicate offers FLUX.2 Pro and FLUX Schnell.
+
+GPT Image 2.6 and 2.5 Sunburst and Flare support all six rendering qualities, including `xhigh` and `max`. Image size choices show the requested dimensions and aspect ratio; large sizes are experimental. GPT Image requests allow three minutes for a response. A network failure after possible submission is not automatically replayed, since the original generation may have succeeded.
 
 ## Speech delivery
 
@@ -42,9 +46,11 @@ Gemini 3.8 receives directions separately from the transcript using Google's [sp
 
 Automatic delivery has a 60-second deadline, a 4,096-character response bound, and a 1,024-output-token limit where the text provider supports it. Directions are limited to 400 characters. Reported text usage is recorded through the existing usage tracker; these bounds do not guarantee a billing ceiling. Automatic delivery is off by default. No model or voice is automatically upgraded or selected by the text model.
 
-OpenAI's **GPT Realtime 2.1 Mini** is available in the Speech voice catalog for Natural or Custom delivery. It reads the supplied text in an isolated audio response and produces a WAV file only after successful completion. Requests are bounded to five minutes, cancellation closes the connection, and interrupted requests are not automatically replayed. Existing Speech API models remain available until their announced shutdown dates; text and instructions are each limited to 4,096 characters after field substitution.
+OpenAI’s **GPT Realtime 2.1** and **GPT Realtime 2.1 Mini** are available in the Speech voice catalog for Natural or Custom delivery. Each reads the supplied text in an isolated audio response and produces a WAV file only after successful completion. Requests are bounded to five minutes, cancellation closes the connection, and interrupted requests are not automatically replayed. Existing Speech API models remain available until their announced shutdown dates; text and instructions are each limited to 4,096 characters after field substitution.
 
-OpenAI schedules `tts-1`, `tts-1-hd`, and the dated mini-TTS snapshots to shut down on **January 6, 2027**. The undated mini-TTS alias has no separately announced shutdown date, but its current snapshot is affected. Realtime voices differ: saved `fable`, `nova`, and `onyx` selections require an explicit replacement if changing to Realtime. See the [deprecation notice](https://developers.openai.com/api/docs/deprecations#2026-10-01-text-to-speech-models). No saved voice is automatically replaced.
+OpenAI schedules `tts-1`, `tts-1-hd`, the mini-TTS alias, and its dated snapshots to shut down on **January 6, 2027**. Realtime voices differ: saved `fable`, `nova`, and `onyx` selections require an explicit replacement if changing to Realtime. See the [deprecation notice](https://developers.openai.com/api/docs/deprecations#2026-10-01-text-to-speech-models). No saved voice is automatically replaced.
+
+The speech catalog also includes named Google Cloud Chirp 3 HD voices, ElevenLabs v4 and v4 Turbo, and Fish Audio Drama 3 with a reference voice. Existing voice pools and field overrides keep their saved provider, model, and voice IDs.
 
 ## ChatGPT connection
 

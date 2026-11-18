@@ -126,6 +126,7 @@ async def test_gemini_38_keeps_transcript_verbatim_and_separates_style(
     }
 
 
+@pytest.mark.usefixtures("before_speech_retirements")
 async def test_legacy_gemini_preserves_prompted_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

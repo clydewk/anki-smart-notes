@@ -17,6 +17,7 @@ You should have received a copy of the GNU General Public License
 along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -33,7 +34,14 @@ from tests.test_settings_layout import SETTINGS_SETUP
 
 
 @pytest.mark.parametrize(
-    "model", ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"]
+    "model",
+    [
+        "gpt-image-2",
+        "gpt-image-2.5-sunburst",
+        "gpt-image-2.5-flare",
+        "gpt-image-2.6-sunburst",
+        "gpt-image-2.6-flare",
+    ],
 )
 @pytest.mark.parametrize("ratio", get_args(ImageAspectRatio))
 @pytest.mark.parametrize("resolution", get_args(ImageResolution))
@@ -104,7 +112,7 @@ async def test_openai_image_generation_does_not_replay_ambiguous_requests(
     monkeypatch.setattr("src.image_provider.provider_runtime.request_bytes", request)
     result = await ImageProvider().async_get_image_response(
         "A cat",
-        "gpt-image-2.5-flare",
+        "gpt-image-2.6-flare",
         "openai",
         1,
         aspect_ratio="16:9",
@@ -118,6 +126,81 @@ async def test_openai_image_generation_does_not_replay_ambiguous_requests(
     assert payload["quality"] == "max"
     assert payload["output_format"] == "webp"
     assert "response_format" not in payload
+
+
+@pytest.mark.parametrize(
+    ("model", "size"),
+    [("gemini-nano-banana-2.1", "4K"), ("gemini-3.1-flash-lite-image", None)],
+)
+@pytest.mark.asyncio
+async def test_google_image_models_use_supported_size_and_final_image(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_config: Any,
+    model: ImageModels,
+    size: str | None,
+) -> None:
+    mock_config.google_api_key = "test"
+    parts = [
+        {"thought": True, "inlineData": {"data": "dGhvdWdodA=="}},
+        {"inlineData": {"data": "aW1hZ2U="}},
+    ]
+    request = AsyncMock(
+        return_value=json.dumps(
+            {"candidates": [{"content": {"parts": parts}}]}
+        ).encode()
+    )
+    monkeypatch.setattr("src.image_provider.config", mock_config)
+    monkeypatch.setattr("src.image_provider.provider_runtime.request_bytes", request)
+    assert (
+        await ImageProvider().async_get_image_response(
+            "Cat", model, "google", 1, aspect_ratio="4:3", resolution="4096x4096"
+        )
+        == b"image"
+    )
+    args = request.call_args.kwargs
+    assert args["url"].endswith(f"/v1/models/{model}:generateContent")
+    assert args["retry_ambiguous"] is False
+    expected = {"aspectRatio": "4:3"}
+    if size:
+        expected["imageSize"] = size
+    assert args["json_payload"]["generationConfig"]["imageConfig"] == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "poll"),
+    [("flux-2-pro", False), ("flux-2-pro", True), ("flux-dev", False)],
+)
+@pytest.mark.asyncio
+async def test_replicate_downloads_single_url_and_legacy_lists(
+    monkeypatch: pytest.MonkeyPatch, mock_config: Any, model: ImageModels, poll: bool
+) -> None:
+    mock_config.replicate_api_key = "test"
+    url = "https://example.test/cat.webp"
+    responses: list[dict[str, object]] = (
+        [{"status": "processing", "urls": {"get": "https://example.test/poll"}}]
+        if poll
+        else []
+    )
+    responses.append(
+        {"status": "succeeded", "output": url if model == "flux-2-pro" else [url]}
+    )
+    request = AsyncMock(side_effect=responses)
+    download = AsyncMock(return_value=b"image")
+    monkeypatch.setattr("src.image_provider.config", mock_config)
+    monkeypatch.setattr("src.image_provider.asyncio.sleep", AsyncMock())
+    monkeypatch.setattr("src.image_provider.provider_runtime.request_json", request)
+    monkeypatch.setattr("src.image_provider.provider_runtime.request_bytes", download)
+    assert (
+        await ImageProvider().async_get_image_response(
+            "Cat", model, "replicate", 1, quality=0
+        )
+        == b"image"
+    )
+    submitted = request.await_args_list[0].kwargs
+    assert submitted["url"].endswith(f"/models/black-forest-labs/{model}/predictions")
+    assert submitted["retry_ambiguous"] is False
+    assert submitted["json_payload"]["input"]["output_quality"] == 0
+    assert download.call_args.kwargs["url"] == url
 
 
 @pytest.mark.asyncio
@@ -167,6 +250,15 @@ assert "2026-10-23" in options.model_warning.text()
 assert "1536 × 1024 · landscape (saved 4:3)" == options.ratio_picker.currentText()
 assert len(options.ratio_picker.ui_to_state) == len(options.state.s["image_aspect_ratios"])
 assert options.state.s["image_aspect_ratio"] == "4:3"
+settings.update(image_provider="google", image_model="gemini-3.1-flash-lite-image", image_resolution="4096x4096")
+options = ImageOptions()
+assert options.resolution_picker.isHidden()
+assert "1K" in options.output_summary.text()
+assert options.state.s["image_resolution"] == "4096x4096"
+settings.update(image_provider="replicate", image_model="flux-dev")
+options = ImageOptions()
+assert options.state.s["image_model"] == "flux-dev"
+assert "flux-dev" not in options._provider_models["replicate"]
 collection.close()
 """
     )

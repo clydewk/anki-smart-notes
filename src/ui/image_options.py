@@ -31,6 +31,7 @@ from ..models import (
     ImageResolution,
     OverridableImageOptionsDict,
     image_generation_qualities,
+    openai_image_has_flexible_size,
     openai_image_size,
     provider_model_unavailable,
     provider_model_warning,
@@ -64,6 +65,11 @@ provider_labels = {
 }
 
 model_labels = {
+    "gpt-image-2.6-sunburst": "GPT Image 2.6 Sunburst",
+    "gpt-image-2.6-flare": "GPT Image 2.6 Flare",
+    "flux-2-pro": "FLUX.2 Pro",
+    "gemini-nano-banana-2.1": "Gemini Nano Banana 2.1",
+    "gemini-3.1-flash-lite-image": "Gemini 3.1 Flash Lite Image",
     "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
     "gpt-image-2.5-flare": "GPT Image 2.5 Flare",
     "flux-schnell": "Flux Schnell",
@@ -78,16 +84,17 @@ model_labels = {
 }
 
 provider_models: dict[ImageProviders, list[ImageModels]] = {
-    "replicate": ["flux-schnell", "flux-dev"],
-    "google": ["gemini-3-pro-image"],
+    "replicate": ["flux-schnell", "flux-2-pro"],
+    "google": [
+        "gemini-nano-banana-2.1",
+        "gemini-3.1-flash-lite-image",
+        "gemini-3-pro-image",
+    ],
     "openai": [
+        "gpt-image-2.6-flare",
+        "gpt-image-2.6-sunburst",
         "gpt-image-2.5-flare",
         "gpt-image-2.5-sunburst",
-        "gpt-image-2",
-        "gpt-image-1.5",
-        "gpt-image-1",
-        "gpt-image-1-mini",
-        "dall-e-3",
     ],
 }
 
@@ -114,6 +121,8 @@ def image_output_summary(
         preset = {"1024x1024": "1K", "2048x2048": "2K", "4096x4096": "4K"}.get(
             resolution, resolution
         )
+        if model == "gemini-3.1-flash-lite-image":
+            preset = "1K"
         dimensions = f"{aspect_ratio}, {preset} requested; pixel dimensions are selected by the provider"
     elif provider == "replicate":
         dimensions = f"{aspect_ratio}; pixel dimensions are selected by the provider"
@@ -382,8 +391,10 @@ class ImageOptions(QWidget):
         model = self.state.s["image_model"]
         resolution = self.state.s["image_resolution"]
         uses_openai_sizes = provider not in {"google", "replicate"}
-        flexible_size = model == "gpt-image-2" or model.startswith("gpt-image-2.5-")
-        uses_resolution = provider == "google" or (uses_openai_sizes and flexible_size)
+        flexible_size = openai_image_has_flexible_size(model)
+        uses_resolution = (
+            provider == "google" and model != "gemini-3.1-flash-lite-image"
+        ) or (uses_openai_sizes and flexible_size)
         self.resolution_picker.setVisible(uses_resolution)
         self.resolution_label.setVisible(uses_resolution)
         resolution_labels = (

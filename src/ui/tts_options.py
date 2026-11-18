@@ -49,6 +49,7 @@ from ..config import config, key_or_config_val
 from ..job_context import JobCancelledError
 from ..logger import redact_text
 from ..models import (
+    OPENAI_REALTIME_TTS_MODELS,
     OverrideableTTSOptionsDict,
     TTSModels,
     TTSProviders,
@@ -57,7 +58,8 @@ from ..models import (
     normalize_tts_voice_pool,
     openai_tts_voices,
     provider_model_unavailable,
-    provider_model_warning,
+    tts_voice_unavailable,
+    tts_voice_warning,
 )
 from ..sentry import run_async_in_background_with_sentry
 from ..settings import with_widget_settings
@@ -164,9 +166,9 @@ def generate_openai_voices() -> list[TTSMeta]:
             "friendly_voice": f"{voice.capitalize()} ({model})",
             "gender": OPENAI_VOICE_GENDERS[voice],
             "language": ALL,
-            "price_tier": "low" if model == "tts-1" else "standard",
+            "price_tier": "standard",
         }
-        for model in ("gpt-realtime-2.1-mini", "gpt-4o-mini-tts", "tts-1-hd", "tts-1")
+        for model in OPENAI_REALTIME_TTS_MODELS
         if not provider_model_unavailable("openai", model)
         for voice in openai_tts_voices(model)
     ]
@@ -211,35 +213,25 @@ def get_google_voices() -> list[TTSMeta]:
 def get_eleven_voices() -> list[TTSMeta]:
     s = load_file("eleven_voices.json", test_override="[]")
     eleven_voices = json.loads(s)
-    voices: list[TTSMeta] = []
-
-    models: list[dict[str, str]] = [
-        {"model": "eleven_v3", "price_tier": "ultra-high"},
-        {"model": "eleven_multilingual_v2", "price_tier": "ultra-high"},
-        {"model": "eleven_flash_v2_5", "price_tier": "high"},
+    models: list[tuple[str, str, PriceTiers]] = [
+        ("eleven_v4", "V4", "ultra-high"),
+        ("eleven_v4_turbo", "V4 Turbo", "high"),
+        ("eleven_multilingual_v2", "Multilingual V2", "ultra-high"),
     ]
-
-    friendly_models = {
-        "eleven_v3": "V3",
-        "eleven_multilingual_v2": "Multilingual V2",
-        "eleven_flash_v2_5": "Flash V2.5",
-    }
-
-    for voice in eleven_voices:
-        for model in models:
-            ttsMeta: TTSMeta = {
-                "tts_provider": "elevenLabs",
-                "language": voice["language"],
-                "voice": voice["voice_id"],
-                "model": model["model"],
-                "friendly_voice": f"{voice['name'].capitalize()} ({friendly_models[model['model']]})",
-                "gender": voice["gender"],
-                "price_tier": cast("PriceTiers", model["price_tier"]),
-            }
-
-            voices.append(ttsMeta)
-
-    return voices
+    return [
+        {
+            "tts_provider": "elevenLabs",
+            "language": voice["language"],
+            "voice": voice["voice_id"],
+            "model": model,
+            "friendly_voice": f"{voice['name']} ({label})",
+            "gender": voice["gender"].capitalize(),
+            "price_tier": tier,
+        }
+        for voice in eleven_voices
+        for model, label, tier in models
+        if model != "eleven_multilingual_v2" or voice["country"] != "vi"
+    ]
 
 
 class AzureVoice(TypedDict):
@@ -280,8 +272,7 @@ def get_fish_voices() -> list[TTSMeta]:
     models: list[tuple[str, str, PriceTiers]] = [
         ("s2.1-pro-free", "S2.1 Pro Free", "free"),
         ("s2.1-pro", "S2.1 Pro", "standard"),
-        ("s2-pro", "S2 Pro", "standard"),
-        ("s1", "S1", "standard"),
+        ("drama-3", "Drama 3", "standard"),
     ]
     return [
         {
@@ -335,9 +326,6 @@ def get_gemini_voices() -> list[TTSMeta]:
     models: list[tuple[str, str, PriceTiers]] = [
         ("gemini-3.8-flash-tts", "Gemini 3.8 Flash", "low"),
         ("gemini-3.8-flash-lite-tts", "Gemini 3.8 Flash Lite", "low"),
-        ("gemini-3.1-flash-tts-preview", "Gemini 3.1 Flash", "low"),
-        ("gemini-2.5-flash-preview-tts", "Gemini 2.5 Flash", "low"),
-        ("gemini-2.5-pro-preview-tts", "Gemini 2.5 Pro", "standard"),
     ]
 
     for name in gemini_voice_names:
@@ -438,7 +426,7 @@ class SelectedVoiceLabel(QLabel):
 
     def update_text(self, meta: TTSMeta, *, filtered: bool = False) -> None:
         prefix = "Selected (outside current filters)" if filtered else "Selected"
-        warning = provider_model_warning(meta["tts_provider"], meta["model"])
+        warning = tts_voice_warning(meta["tts_provider"], meta["model"], meta["voice"])
         self.setText(
             f"{prefix}: {format_voice(meta)}" + (f"\n{warning}" if warning else "")
         )
@@ -611,7 +599,17 @@ class TTSOptions(QWidget):
         return box
 
     def _update_pool_selection(self) -> None:
-        self.remove_voice_button.setEnabled(bool(self.pool_table.selectedItems()))
+        selected = self.pool_table.selectedItems()
+        self.remove_voice_button.setEnabled(bool(selected))
+        if selected:
+            target = self.state.s["tts_voice_pool"][selected[0].row()]
+            self.state.update(
+                {
+                    "catalog_provider": target["provider"],
+                    "catalog_model": target["model"],
+                    "catalog_voice": target["voice"],
+                }
+            )
 
     def render_fish_voice(self) -> QWidget:
         self.fish_voice_box = QGroupBox("Fish Audio voice")
@@ -762,7 +760,9 @@ class TTSOptions(QWidget):
             self._selected_voice() and self.state.s["catalog_voice"].strip()
         )
         self.add_voice_button.setEnabled(has_selection)
-        can_preview = has_selection and bool(self.state.s["test_text"].strip())
+        can_preview = (has_selection or self._can_preview_saved_voice()) and bool(
+            self.state.s["test_text"].strip()
+        )
         self.test_button.setEnabled(self.state.s["test_enabled"] and can_preview)
 
     def _selected_voice(self) -> TTSMeta | None:
@@ -782,6 +782,24 @@ class TTSOptions(QWidget):
                 )
             ),
             None,
+        )
+
+    def _can_preview_saved_voice(self) -> bool:
+        state = self.state.s
+        provider, model, voice = (
+            state["catalog_provider"],
+            state["catalog_model"],
+            state["catalog_voice"],
+        )
+        return (
+            provider in providers
+            and not tts_voice_unavailable(provider, model, voice)
+            and (provider != "openai" or voice in openai_tts_voices(model))
+            and any(
+                (item["provider"], item["model"], item["voice"])
+                == (provider, model, voice)
+                for item in state["tts_voice_pool"]
+            )
         )
 
     def update_list_ui(self) -> None:
@@ -809,12 +827,22 @@ class TTSOptions(QWidget):
         )
         selected = self._selected_voice()
         if selected is None:
-            self.selected_voice_label.setText(
-                f"Saved voice unavailable: {state['catalog_provider']} / "
-                f"{state['catalog_model']} / {state['catalog_voice']}. Choose a supported voice."
-                if state["catalog_voice"]
-                else "Select a voice to add or preview."
-            )
+            identity = f"{state['catalog_provider']} / {state['catalog_model']} / {state['catalog_voice']}"
+            label = "Select a voice to add or preview."
+            if self._can_preview_saved_voice():
+                label = f"Saved voice (outside catalog): {identity}"
+                warning = tts_voice_warning(
+                    state["catalog_provider"],
+                    state["catalog_model"],
+                    state["catalog_voice"],
+                )
+                if warning:
+                    label += f"\n{warning}"
+            elif state["catalog_voice"]:
+                label = (
+                    f"Saved voice unavailable: {identity}. Choose a supported voice."
+                )
+            self.selected_voice_label.setText(label)
             self.selected_voice_label.setToolTip("")
             selection_model = self.voices_list.selectionModel()
             if selection_model is not None:
@@ -875,7 +903,9 @@ class TTSOptions(QWidget):
             details = (
                 f"{identity}\nModel: {target['model']}\nVoice ID: {target['voice']}"
             )
-            warning = provider_model_warning(target["provider"], target["model"])
+            warning = tts_voice_warning(
+                target["provider"], target["model"], target["voice"]
+            )
             if warning:
                 details += f"\n{warning}"
             active = self.pool_table.item(row, 0)
@@ -929,7 +959,7 @@ class TTSOptions(QWidget):
             if pool
             else "No voices yet. Add one from the catalog below."
         )
-        self._update_pool_selection()
+        self.remove_voice_button.setEnabled(bool(self.pool_table.selectedItems()))
 
     def pool_item_changed(self, item: QTableWidgetItem) -> None:
         row = item.row()
@@ -1034,7 +1064,7 @@ class TTSOptions(QWidget):
         selected = self._selected_voice()
         if (
             not state["test_enabled"]
-            or selected is None
+            or (selected is None and not self._can_preview_saved_voice())
             or not state["catalog_voice"].strip()
             or not state["test_text"].strip()
         ):
@@ -1042,7 +1072,7 @@ class TTSOptions(QWidget):
         provider = state["catalog_provider"]
         voice = state["catalog_voice"]
         model = state["catalog_model"]
-        name = selected["friendly_voice"]
+        name = selected["friendly_voice"] if selected else voice
         provider_label = TTS_PROVIDER_LABELS.get(provider, provider)
         completed = False
 

@@ -70,6 +70,9 @@ if TYPE_CHECKING:
 def test_curated_openai_chat_models_are_ordered_and_labeled() -> None:
     assert DEFAULT_CHAT_MODEL == "gpt-5.6-sol"
     assert models.openai_chat_models == [
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
+        "gpt-6.1-terra",
         "gpt-6-astra",
         "gpt-6.1-sol",
         "gpt-6-sol",
@@ -77,8 +80,11 @@ def test_curated_openai_chat_models_are_ordered_and_labeled() -> None:
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
-        "gpt-5.5",
     ]
+    assert (
+        models.openai_chat_models_for_display([], current_model="gpt-5.5")[-1]
+        == "gpt-5.5"
+    )
     assert models.provider_model_map["openai"] == models.openai_chat_models
     assert models.openai_model_label("gpt-6-astra") == "GPT-6 Astra"
     assert filter_openai_text_models(["gpt-6-astra", "gpt-image-2.5-flare"]) == [
@@ -101,6 +107,7 @@ def test_google_tts_models_include_gemini_3_1_flash_preview() -> None:
 
 def test_fish_tts_models_match_api() -> None:
     assert get_args(models.FishTTSModels) == (
+        "drama-3",
         "s2.1-pro-free",
         "s2.1-pro",
         "s2-pro",
@@ -177,6 +184,10 @@ def test_openai_reasoning_efforts_match_model_family() -> None:
 @pytest.mark.parametrize(
     "model,effort,temperature,chat_tools",
     [
+        ("gpt-6.2-astra", "max", False, False),
+        ("gpt-6.2-sol", "low", False, False),
+        ("gpt-6.1-terra", "none", True, False),
+        ("gpt-6.1-terra", "high", False, False),
         ("gpt-6-astra", "low", False, False),
         ("gpt-6.1-sol", "high", False, False),
         ("gpt-6-sol", "none", True, True),
@@ -232,7 +243,11 @@ def test_retirement_warning_changes_to_failure_on_shutdown(
         ("opaque-model", "auto", None, True),
         ("opaque-model", "default", None, True),
         ("gpt-6-astra", "fast", "https://eu.api.openai.com/v1", False),
-        ("gpt-6-sol", "fast", "https://eu.api.openai.com/v1", True),
+        ("gpt-6-sol", "fast", "https://eu.api.openai.com/v1", False),
+        ("gpt-6.2-astra", "fast", "https://eu.api.openai.com/v1", True),
+        ("gpt-6.2-astra", "ultrafast", "https://eu.api.openai.com/v1", False),
+        ("gpt-6.2-sol", "ultrafast", None, True),
+        ("gpt-6.1-terra", "ultrafast", None, False),
         ("o3", "fast", None, True),
         ("o4-mini", "fast", None, True),
         ("gpt-5.3-codex", "fast", None, True),
@@ -348,8 +363,8 @@ def test_filter_openai_text_models_excludes_non_text_models() -> None:
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
-        "gpt-5.5",
         "gpt-5.6",
+        "gpt-5.5",
         "gpt-5.5-pro",
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -361,6 +376,9 @@ def test_openai_chat_models_for_display_merges_available_models() -> None:
     available_models = ["gpt-5.5-pro", "gpt-5.4-mini", "gpt-3.5-turbo"]
 
     assert models.openai_chat_models_for_display(available_models) == [
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
+        "gpt-6.1-terra",
         "gpt-6-astra",
         "gpt-6.1-sol",
         "gpt-6-sol",
@@ -368,12 +386,14 @@ def test_openai_chat_models_for_display_merges_available_models() -> None:
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
-        "gpt-5.5",
     ]
     assert models.openai_chat_models_for_display(
         available_models,
         include_available=True,
     ) == [
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
+        "gpt-6.1-terra",
         "gpt-6-astra",
         "gpt-6.1-sol",
         "gpt-6-sol",
@@ -381,7 +401,6 @@ def test_openai_chat_models_for_display_merges_available_models() -> None:
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
-        "gpt-5.5",
         "gpt-5.5-pro",
         "gpt-5.4-mini",
     ]
@@ -1064,6 +1083,7 @@ async def test_fetch_openai_chat_models_uses_http_endpoint(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("before_speech_retirements")
 async def test_openai_tts_uses_http_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1107,8 +1127,10 @@ async def test_openai_tts_uses_http_endpoint(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["drama-3", "s2.1-pro-free"])
 async def test_fish_tts_uses_model_header_and_reference_id(
     monkeypatch: pytest.MonkeyPatch,
+    model: models.FishTTSModels,
 ) -> None:
     provider = TTSProvider()
     captured: dict[str, Any] = {}
@@ -1133,8 +1155,8 @@ async def test_fish_tts_uses_model_header_and_reference_id(
     )
 
     data = await provider.async_get_tts_response(
-        input="hello",
-        model="s2.1-pro-free",
+        input="おはようございます。",
+        model=model,
         provider="fish",
         voice="  voice-model-id  ",
         strip_html=False,
@@ -1143,15 +1165,64 @@ async def test_fish_tts_uses_model_header_and_reference_id(
     assert data == b"fish-audio"
     assert captured["url"] == "https://api.fish.audio/v1/tts"
     assert captured["headers"]["Authorization"] == "Bearer fish-test-key"
-    assert captured["headers"]["model"] == "s2.1-pro-free"
+    assert captured["headers"]["model"] == model
     assert captured["payload"] == {
-        "text": "hello",
+        "text": "おはようございます。",
         "reference_id": "voice-model-id",
         "format": "mp3",
     }
 
 
+@pytest.mark.parametrize("model", ["eleven_v4", "eleven_v4_turbo"])
+async def test_elevenlabs_sends_selected_model_and_voice(
+    monkeypatch: pytest.MonkeyPatch,
+    model: models.ElevenTTSModels,
+) -> None:
+    monkeypatch.setattr(
+        "src.tts_provider.config",
+        SimpleNamespace(custom_providers=[], elevenlabs_api_key="test"),
+    )
+    request = AsyncMock(return_value=b"mp3")
+    monkeypatch.setattr("src.tts_provider.provider_runtime.request_bytes", request)
+    voice = "j210dv0vWm7fCknyQpbA"
+    audio = await TTSProvider().async_get_tts_response(
+        "こんにちは。", model, "elevenLabs", voice, False
+    )
+    assert audio == b"mp3"
+    assert request.call_args.kwargs["url"].endswith(f"/text-to-speech/{voice}")
+    assert request.call_args.kwargs["json_payload"] == {
+        "text": "こんにちは。",
+        "model_id": model,
+    }
+
+
+async def test_chirp_named_voice_uses_cloud_locale_and_mp3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.tts_provider.config",
+        SimpleNamespace(custom_providers=[], google_api_key="test"),
+    )
+    request = AsyncMock(return_value=b'{"audioContent":"bXAz"}')
+    monkeypatch.setattr("src.tts_provider.provider_runtime.request_bytes", request)
+    voice = "ja-JP-Chirp3-HD-Achernar"
+    audio = await TTSProvider().async_get_tts_response(
+        "こんにちは。", "chirp", "google", voice, False
+    )
+    assert audio == b"mp3"
+    assert (
+        request.call_args.kwargs["url"]
+        == "https://texttospeech.googleapis.com/v1/text:synthesize"
+    )
+    assert request.call_args.kwargs["json_payload"] == {
+        "input": {"text": "こんにちは。"},
+        "voice": {"languageCode": "ja-JP", "name": voice},
+        "audioConfig": {"audioEncoding": "MP3"},
+    }
+
+
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("before_speech_retirements")
 async def test_google_gemini_tts_uses_header_auth_and_wraps_pcm_as_wav(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1270,7 +1341,7 @@ async def test_openai_image_uses_http_endpoint(
 
     data = await provider.async_get_image_response(
         prompt="cat",
-        model="gpt-image-1",
+        model="gpt-image-2.6-flare",
         provider="openai",
         note_id=1,
     )
@@ -1278,12 +1349,18 @@ async def test_openai_image_uses_http_endpoint(
     assert data == b"image-bytes"
     assert captured["url"].endswith("/v1/images/generations")
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
-    assert captured["payload"]["model"] == "gpt-image-1"
+    assert captured["payload"]["model"] == "gpt-image-2.6-flare"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "model", ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"]
+    "model",
+    [
+        "gpt-image-2.5-sunburst",
+        "gpt-image-2.5-flare",
+        "gpt-image-2.6-sunburst",
+        "gpt-image-2.6-flare",
+    ],
 )
 async def test_openai_image_2_uses_supported_high_resolution_size(
     monkeypatch: pytest.MonkeyPatch,
@@ -1340,7 +1417,9 @@ async def test_openai_image_2_uses_supported_high_resolution_size(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["gpt-5.4", "gpt-6-astra"])
+@pytest.mark.parametrize(
+    "model", ["gpt-5.4", "gpt-6-astra", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra"]
+)
 async def test_openai_responses_tool_loop_executes_tool_calls(
     monkeypatch: pytest.MonkeyPatch,
     model: str,
@@ -1443,7 +1522,7 @@ async def test_openai_responses_tool_loop_executes_tool_calls(
 
     assert result.text == "tool-backed answer"
     assert result.usage == {"input_tokens": 2, "output_tokens": 3}
-    if model == "gpt-6-astra":
+    if model in {"gpt-6-astra", "gpt-6.2-sol", "gpt-6.2-astra"}:
         for payload in payloads:
             assert payload["reasoning"] == {"effort": "low"}
             assert "temperature" not in payload
@@ -2653,8 +2732,19 @@ async def test_failed_openai_response_records_measured_usage(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model,level",
+    [
+        ("gemini-3.1-pro-preview", None),
+        ("gemini-4-hydrogen", "xhigh"),
+        ("gemini-4-carbon", "medium"),
+        ("gemini-3.5-flash-lite", "minimal"),
+    ],
+)
 async def test_google_tool_history_preserves_opaque_content(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    level: str | None,
 ) -> None:
     monkeypatch.setattr(
         "src.chat_provider.config",
@@ -2687,14 +2777,19 @@ async def test_google_tool_history_preserves_opaque_content(
     result = await ChatProvider().generate_text(
         TextGenerationRequest(
             "hello",
-            "gemini-3.1-pro-preview",
+            model,
             "google",
             0.5,
-            None,
+            level,
             tools=[TextToolDefinition("echo", "Echo", {"type": "object"})],
         ),
         tool_executor=AsyncMock(return_value="hello"),
     )
+    for sent in requests:
+        options = sent["json_payload"]["generationConfig"]
+        assert ("temperature" in options) == (not model.startswith("gemini-4-"))
+        if level:
+            assert options["thinkingConfig"] == {"thinkingLevel": level.upper()}
     assert result.text == "answer"
     assert requests[1]["json_payload"]["contents"][1] == content
     assert (
@@ -2901,6 +2996,9 @@ def non_openai_response(
         ("google", "gemini-3.1-pro-preview"),
         ("anthropic", "claude-sonnet-4-6"),
         ("deepseek", "deepseek-v4-flash"),
+        ("deepseek", "deepseek-flash"),
+        ("google", "gemini-4-hydrogen"),
+        ("anthropic", "claude-haiku-5-5"),
     ],
 )
 async def test_failed_non_openai_usage_is_recorded_and_success_is_not_counted_twice(
@@ -2983,7 +3081,7 @@ async def test_failed_non_openai_usage_is_recorded_and_success_is_not_counted_tw
     "provider,model",
     [
         ("google", "gemini-3.1-pro-preview"),
-        ("anthropic", "claude-sonnet-4-6"),
+        ("anthropic", "claude-opus-5-5"),
         ("deepseek", "deepseek-v4-flash"),
     ],
 )
@@ -2999,14 +3097,24 @@ async def test_failed_tool_generation_keeps_usage_from_all_reported_turns(
     )
     monkeypatch.setattr("src.chat_provider.config", configuration)
     monkeypatch.setattr("src.chat_provider.chat_usage_tracker", tracker)
+    first = non_openai_response(provider, finish=True, tool_call=True)
+    if provider == "anthropic":
+        first["content"].insert(
+            0, {"type": "thinking", "thinking": "internal", "signature": "opaque"}
+        )
     responses = iter(
         [
-            non_openai_response(provider, finish=True, tool_call=True),
+            first,
             non_openai_response(provider, finish=False),
         ]
     )
 
     def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if provider == "anthropic":
+            assert "temperature" not in payload
+            if len(payload["messages"]) > 1:
+                assert payload["messages"][1]["content"] == first["content"]
         return httpx.Response(200, json=next(responses))
 
     runtime = ProviderRuntime()

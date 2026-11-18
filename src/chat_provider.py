@@ -36,6 +36,7 @@ from .config import config
 from .constants import DEFAULT_TEMPERATURE
 from .logger import logger, redact_text
 from .models import (
+    GOOGLE_THINKING_LEVELS,
     ChatGPTModel,
     ChatModels,
     CustomProvider,
@@ -44,6 +45,7 @@ from .models import (
     openai_reasoning_efforts_for_model,
     openai_supports_chat_tools,
     openai_supports_temperature,
+    supports_sampling_temperature,
     validate_openai_service_tier,
     validate_provider_model,
 )
@@ -606,7 +608,7 @@ class ChatProvider:
             temperature=temperature,
             reasoning_effort=(
                 reasoning_effort
-                if provider == "chatgpt"
+                if provider in {"chatgpt", "google"}
                 else choose_reasoning_effort(str(model), reasoning_effort)
             ),
             prompt_cache_key=(
@@ -731,12 +733,10 @@ class ChatProvider:
                 events = self._iterate_official_openai_events(request)
             elif request.provider == "chatgpt":
                 events = self._iterate_chatgpt_events(request)
-            elif request.provider == "anthropic":
-                events = self._iterate_anthropic_events(request)
+            elif request.provider in {"anthropic", "google"}:
+                events = self._iterate_message_events(request)
             elif request.provider == "deepseek":
                 events = self._iterate_deepseek_events(request)
-            elif request.provider == "google":
-                events = self._iterate_google_events(request)
             else:
                 raise ValueError(f"Unknown provider: {request.provider}")
 
@@ -2141,43 +2141,17 @@ class ChatProvider:
             yield TextGenerationEvent(type="usage_reported", usage=usage)
         yield TextGenerationEvent(type="response_completed", usage=usage)
 
-    async def _iterate_anthropic_events(
+    async def _iterate_message_events(
         self, request: TextGenerationRequest
     ) -> AsyncGenerator[TextGenerationEvent]:
-        api_key = config.anthropic_api_key
-        if not api_key:
-            raise Exception(
-                "Anthropic API key not found. Please set it in the settings."
-            )
-
-        payload = {
-            "model": request.model,
-            "messages": [{"role": "user", "content": request.prompt}],
-            "max_tokens": request.max_output_tokens,
-            "temperature": request.temperature,
-        }
-        response = await provider_runtime.request_json(
-            key=f"text:anthropic:{request.model}",
-            initial_window=text_initial_window("anthropic"),
-            method="POST",
-            url=ANTHROPIC_ENDPOINT,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json_payload=payload,
-            provider="anthropic",
-            model=request.model,
-            timeouts=json_timeouts(),
+        turn = await self._message_turn(
+            request, [TextConversationMessage(role="user", content=request.prompt)]
         )
-        text = self._extract_anthropic_text(response)
-        usage = self._extract_usage(response)
-        yield TextGenerationEvent(type="response_started")
-        yield TextGenerationEvent(type="text_delta", text=text)
-        if usage:
-            yield TextGenerationEvent(type="usage_reported", usage=usage)
-        yield TextGenerationEvent(type="response_completed", usage=usage)
+        yield TextGenerationEvent(type="response_started", response_id=turn.response_id)
+        yield TextGenerationEvent(type="text_delta", text=turn.text)
+        if turn.usage:
+            yield TextGenerationEvent(type="usage_reported", usage=turn.usage)
+        yield TextGenerationEvent(type="response_completed", usage=turn.usage)
 
     async def _iterate_deepseek_events(
         self, request: TextGenerationRequest
@@ -2210,42 +2184,6 @@ class ChatProvider:
             timeouts=json_timeouts(),
         )
         text = self._extract_openai_chat_text(response)
-        usage = self._extract_usage(response)
-        yield TextGenerationEvent(type="response_started")
-        yield TextGenerationEvent(type="text_delta", text=text)
-        if usage:
-            yield TextGenerationEvent(type="usage_reported", usage=usage)
-        yield TextGenerationEvent(type="response_completed", usage=usage)
-
-    async def _iterate_google_events(
-        self, request: TextGenerationRequest
-    ) -> AsyncGenerator[TextGenerationEvent]:
-        api_key = config.google_api_key
-        if not api_key:
-            raise Exception("Google API key not found. Please set it in the settings.")
-
-        response = await provider_runtime.request_json(
-            key=f"text:google:{request.model}",
-            initial_window=text_initial_window("google"),
-            method="POST",
-            url=f"{GOOGLE_ENDPOINT_BASE}/{request.model}:generateContent",
-            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-            json_payload={
-                "contents": [{"parts": [{"text": request.prompt}]}],
-                "generationConfig": {
-                    "temperature": request.temperature,
-                    "maxOutputTokens": request.max_output_tokens,
-                },
-            },
-            provider="google",
-            model=request.model,
-            timeouts=json_timeouts(),
-        )
-        error = response.get("error")
-        if error:
-            raise ResponseFormatError("Google returned an API error.")
-
-        text = self._extract_google_text(response)
         usage = self._extract_usage(response)
         yield TextGenerationEvent(type="response_started")
         yield TextGenerationEvent(type="text_delta", text=text)
@@ -2339,8 +2277,9 @@ class ChatProvider:
             "model": request.model,
             "messages": self._anthropic_messages_payload(messages),
             "max_tokens": request.max_output_tokens,
-            "temperature": request.temperature,
         }
+        if supports_sampling_temperature("anthropic", request.model):
+            payload["temperature"] = request.temperature
         if request.tools:
             payload["tools"] = self._anthropic_tools_payload(request.tools)
 
@@ -2370,11 +2309,19 @@ class ChatProvider:
 
         payload: dict[str, Any] = {
             "contents": self._google_contents_payload(messages),
-            "generationConfig": {
-                "temperature": request.temperature,
-                "maxOutputTokens": request.max_output_tokens,
-            },
+            "generationConfig": {"maxOutputTokens": request.max_output_tokens},
         }
+        levels = GOOGLE_THINKING_LEVELS.get(request.model)
+        if levels and request.reasoning_effort not in {None, "none"}:
+            if request.reasoning_effort not in levels:
+                raise ValueError(
+                    f"Choose a supported thinking level for {request.model}."
+                )
+            payload["generationConfig"]["thinkingConfig"] = {
+                "thinkingLevel": request.reasoning_effort.upper()
+            }
+        if supports_sampling_temperature("google", request.model):
+            payload["generationConfig"]["temperature"] = request.temperature
         if request.tools:
             payload["tools"] = [
                 {"functionDeclarations": self._google_tools_payload(request.tools)}
@@ -2504,6 +2451,9 @@ class ChatProvider:
     ) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
         for message in messages:
+            if message.provider_content is not None:
+                payload.append(deepcopy(message.provider_content))
+                continue
             if message.role == "tool":
                 payload.append(
                     {
@@ -2587,6 +2537,7 @@ class ChatProvider:
             tool_calls=tuple(tool_calls),
             usage=self._extract_usage(response),
             response_id=self._response_id(response),
+            provider_content={"role": "assistant", "content": deepcopy(content)},
         )
 
     def _google_contents_payload(
@@ -2982,12 +2933,6 @@ class ChatProvider:
                 and part.get("type") in {"text", "output_text"}
             )
         raise ResponseFormatError("OpenAI-compatible message content was invalid.")
-
-    def _extract_anthropic_text(self, response: Any) -> str:
-        return self._parse_anthropic_turn(response).text
-
-    def _extract_google_text(self, response: Any) -> str:
-        return self._parse_google_turn(response).text
 
     def _extract_usage(self, response: Any) -> dict[str, Any] | None:
         if not isinstance(response, dict):

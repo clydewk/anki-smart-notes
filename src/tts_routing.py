@@ -19,7 +19,7 @@ along with Smart Notes.  If not, see <https://www.gnu.org/licenses/>.
 
 import hashlib
 
-from .models import TTSVoiceTarget
+from .models import OPENAI_REALTIME_TTS_MODELS, TTSVoiceTarget
 
 LANGUAGE_ALIASES = {
     "arabic": "ar",
@@ -106,7 +106,7 @@ def tts_audio_extension(target: TTSVoiceTarget) -> str:
         if (target["provider"] == "google" and "gemini" in target["model"])
         or (
             target["provider"] == "openai"
-            and target["model"] == "gpt-realtime-2.1-mini"
+            and target["model"] in OPENAI_REALTIME_TTS_MODELS
         )
         else "mp3"
     )

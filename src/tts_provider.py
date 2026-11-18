@@ -42,8 +42,10 @@ from .config import config
 from .constants import MAX_RETRIES
 from .models import (
     GEMINI_METADATA_TTS_MODELS,
+    OPENAI_REALTIME_TTS_MODELS,
     openai_tts_voices,
-    validate_provider_model,
+    tts_voice_unavailable,
+    tts_voice_warning,
 )
 from .provider_runtime import (
     RequestTimeouts,
@@ -165,13 +167,14 @@ class TTSProvider:
                 provider_config=custom_provider,
             )
 
+        if tts_voice_unavailable(provider, model, voice):
+            raise ValueError(tts_voice_warning(provider, model, voice))
         if provider == "openai":
-            validate_provider_model(provider, model)
             if voice not in openai_tts_voices(model):
                 raise ValueError(
                     f"Voice '{voice}' is unavailable for {model}. Choose another voice in the voice pool."
                 )
-            if model == "gpt-realtime-2.1-mini":
+            if model in OPENAI_REALTIME_TTS_MODELS:
                 return await self._get_openai_realtime_tts(
                     text, model, voice, instructions
                 )

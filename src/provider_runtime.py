@@ -646,6 +646,7 @@ class ProviderRuntime:
         model: str,
         timeouts: RequestTimeouts,
         max_retries: int = MAX_RETRIES,
+        retry_ambiguous: bool = True,
     ) -> Any:
         response_bytes = await self.request_bytes(
             key=key,
@@ -660,6 +661,7 @@ class ProviderRuntime:
             model=model,
             timeouts=timeouts,
             max_retries=max_retries,
+            retry_ambiguous=retry_ambiguous,
         )
 
         try:

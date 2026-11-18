@@ -1695,6 +1695,20 @@
   },
   {
     "gender": "Female",
+    "languageCode": "en-US",
+    "language": "English (United States)",
+    "name": "en-US-Chirp3-HD-Aoede",
+    "type": "Chirp"
+  },
+  {
+    "gender": "Male",
+    "languageCode": "en-US",
+    "language": "English (United States)",
+    "name": "en-US-Chirp3-HD-Charon",
+    "type": "Chirp"
+  },
+  {
+    "gender": "Female",
     "languageCode": "fi-FI",
     "language": "Finnish",
     "name": "fi-FI-Chirp3-HD-Achernar",

@@ -132,7 +132,7 @@ settle()
 assert dialog.draft_settings()["openai_service_tier"] == "ultrafast"
 dialog.state.update({"openai_endpoint": "https://eu.api.openai.com/v1"})
 settle()
-assert "Ultrafast requires" in dialog.chat_options.model_warning.text()
+assert "Ultrafast is unavailable for gpt-6-astra on eu.api.openai.com" in dialog.chat_options.model_warning.text()
 assert settings.get("openai_service_tier") is None
 dialog.on_restore_defaults()
 assert dialog.state.s["openai_service_tier"] == "auto"

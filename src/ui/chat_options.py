@@ -38,6 +38,7 @@ from ..chatgpt_auth import ChatGPTAuthError, chatgpt_auth
 from ..config import config, key_or_config_val
 from ..logger import redact_text
 from ..models import (
+    GOOGLE_THINKING_LEVELS,
     ChatGPTModel,
     ChatModels,
     ChatProviders,
@@ -52,6 +53,7 @@ from ..models import (
     overridable_chat_options,
     provider_model_map,
     provider_model_warning,
+    supports_sampling_temperature,
     validate_openai_service_tier,
 )
 from ..sentry import run_async_in_background_with_sentry
@@ -79,6 +81,13 @@ class ChatOptionsState(TypedDict):
 
 
 models_map: dict[str, str] = {
+    "claude-haiku-5-5": "Claude Haiku 5.5",
+    "claude-opus-5-5": "Claude Opus 5.5",
+    "claude-sonnet-5-5": "Claude Sonnet 5.5",
+    "deepseek-flash": "DeepSeek Flash",
+    "gemini-4-hydrogen": "Gemini 4 Hydrogen",
+    "gemini-4-carbon": "Gemini 4 Carbon",
+    "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite",
     "claude-opus-4-8": "Claude Opus 4.8",
     "claude-sonnet-4-6": "Claude Sonnet 4.6",
     "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
@@ -366,13 +375,7 @@ class ChatOptions(QWidget):
     def _on_provider_change(self, text: str) -> None:
         is_custom = text not in all_chat_providers
         last_settings = self.state.s["provider_settings"].get(text)
-        current_model = (
-            last_settings["model"]
-            if last_settings
-            else ""
-            if text == "chatgpt"
-            else self.state.s["chat_model"]
-        )
+        current_model = last_settings["model"] if last_settings else ""
         models = self._models_for_provider(text, current_model=current_model)
         new_model = ""
         new_temp = self.state.s["chat_temperature"]
@@ -512,6 +515,8 @@ class ChatOptions(QWidget):
         return ret
 
     def _reasoning_efforts(self, provider: str, model: str) -> list[str]:
+        if provider == "google":
+            return list(GOOGLE_THINKING_LEVELS.get(model, ()))
         if provider != "chatgpt":
             return openai_reasoning_efforts_for_model(model)
         return next(
@@ -583,15 +588,22 @@ class ChatOptions(QWidget):
         model = self.state.s["chat_model"]
         effort = self.state.s["chat_reasoning_effort"]
         supports_reasoning = (
-            provider in {"openai", "chatgpt"} or provider not in all_chat_providers
+            provider in {"openai", "chatgpt"}
+            or provider not in all_chat_providers
+            or (provider == "google" and model in GOOGLE_THINKING_LEVELS)
         )
         self.chat_model.setToolTip(model)
         self.reasoning_effort.setEnabled(supports_reasoning)
-        supports_temperature = provider != "chatgpt" and (
-            not supports_reasoning or openai_supports_temperature(model, effort)
+        temperature_visible = provider != "chatgpt" and supports_sampling_temperature(
+            provider, model
         )
-        self.response_form.setRowVisible(self.temperature, provider != "chatgpt")
-        self.response_form.setRowVisible(self.temperature_help, provider != "chatgpt")
+        supports_temperature = temperature_visible and (
+            not supports_reasoning
+            or provider == "google"
+            or openai_supports_temperature(model, effort)
+        )
+        self.response_form.setRowVisible(self.temperature, temperature_visible)
+        self.response_form.setRowVisible(self.temperature_help, temperature_visible)
         self.temperature.setEnabled(supports_temperature)
         self.temperature_help.setText(
             "Higher values vary the wording more; lower values make responses more consistent (0–2)."
